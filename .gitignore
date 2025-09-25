@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.mypy_cache/
+.pytest_cache/
+.coverage
+
+# Env & virtualenv
+.env
+.env.*
+.venv/
+
+# App runtime data
+data/
+uvicorn.log
+.uvicorn.pid
+
+# OS/editor
+.DS_Store
+.vscode/
