@@ -1057,10 +1057,14 @@ def _run_summary_local(payload: dict) -> dict:
             conflicts = _extract_conflicts()
             if not conflicts:
                 return "# 反驳观点分析\n- 暂未发现确凿的对立观点，建议持续收集证据。"
-            md = ["# 反驳观点分析", f"总体：发现 {len(conflicts)} 个存在明显冲突的议题。", "\n| 主观点 | 冲突观点 |\n|---|---|"]
+            md = ["# 反驳观点分析", f"总体：发现 {len(conflicts)} 个存在明显冲突的议题。"]
             for item in conflicts:
-                md.append(f"| {item['positive']} | {item['negative']} |")
-            md.append("\n## 怀疑与结论\n- 针对上述议题，需核实关键数据来源，保持证据导向的讨论节奏。")
+                md.append(f"\n## 议题：{_short(item['theme'], 40)}")
+                md.append(f"- 观点：{item['positive']}")
+                md.append(f"- 证据：已在消息中体现（可核查）")
+                md.append(f"- 反驳要点：{item['negative']}")
+                md.append(f"- 结论/建议：建议继续核查关键数据并保持证据导向的讨论。")
+            md.append("\n## 总结\n- 上述议题仍存在分歧，建议按证据优先原则推进讨论，并跟踪高频联系人观点变动。")
             return "\n".join(md)
 
         def _build_contacts_md() -> str:
@@ -1073,11 +1077,10 @@ def _run_summary_local(payload: dict) -> dict:
                 sender = c.get("name") or c.get("alias") or c.get("sender")
                 rating = c.get("rating")
                 act = c.get("activity")
-                # pick latest message from this sender
                 latest = next((m for m in reversed(enriched_messages) if (m.get("sender") or m.get("sender_name")) == c.get("sender")), None)
                 summary = _short((latest or {}).get("summary") or (latest or {}).get("content") or "", 100)
-                lines.append(f"1. {sender}（评分 {rating:.1f} / 活跃 {act}）\n   - 核心观点：{summary or '—'}\n   - 跟进建议：需要针对其关注点准备问答并确认最新数据。")
-            lines.append("\n## 关注联系人\n- 近3天评分介于 80–85 的潜力对象建议提升触达频次。")
+                lines.append(f"### {sender}（评分 {rating:.1f} / 活跃 {act}）\n- 核心观点：{summary or '—'}\n- 最新动态：近期信息已记录于聊天摘要中\n- 跟进建议：针对其关注点准备问答并确认最新数据。")
+            lines.append("\n## 关注联系人\n- 近3天评分处于次高分段的潜力对象建议提升触达频次。")
             return "\n".join(lines)
 
         # === HTML 版本（用于更好的交互与排版） ===
