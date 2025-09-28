@@ -1,0 +1,4548 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>微信聊天记录分析系统 - 多功能版</title>
+    <style>
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+            background: #f5f7fa;
+            line-height: 1.2;
+            font-size: 12px;
+        }
+        
+        .container {
+            max-width: 1900px;
+            margin: 0 auto;
+            background: white;
+            min-height: 100vh;
+        }
+        
+        /* 紧凑型头部 */
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 1.2rem;
+            margin: 0;
+        }
+        
+        .header-stats {
+            display: flex;
+            gap: 15px;
+            font-size: 0.8rem;
+            opacity: 0.9;
+        }
+        
+        /* 筛选区域 - 优化为单行布局，合并分页控件 */
+        .filters {
+            padding: 8px 15px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            min-height: 36px;
+        }
+        
+        /* 添加分页组样式 */
+        .pagination-group {
+            border-left: 1px solid #d1d5db;
+            padding-left: 8px;
+            margin-left: 8px;
+        }
+        
+        .pagination-info {
+            font-size: 10px;
+            color: #666;
+            white-space: nowrap;
+            min-width: 60px;
+        }
+        
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        
+        .pagination-text {
+            font-size: 10px;
+            color: #666;
+            font-weight: 500;
+        }
+        
+        .pagination-buttons {
+            display: flex;
+            gap: 2px;
+        }
+        
+        .pagination-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 3px;
+            padding: 3px 6px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .pagination-btn:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 6px rgba(102, 126, 234, 0.4);
+        }
+        
+        .pagination-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+        }
+        
+        .filter-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: #374151;
+            min-width: 40px;
+        }
+        
+        .filter-input, .filter-select {
+            padding: 3px 5px;
+            border: 1px solid #d1d5db;
+            border-radius: 3px;
+            font-size: 11px;
+            height: 24px;
+        }
+        
+        .filter-input {
+            width: 100px;
+        }
+        
+        .filter-select {
+            min-width: 60px;
+        }
+        
+        /* Excel风格表格 - 增加自适应高度 */
+        .table-container {
+            overflow: auto;
+            height: calc(100vh - 110px);
+            border: 1px solid #d0d7de;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            table-layout: fixed;
+            background: white;
+        }
+        
+        th {
+            background: linear-gradient(180deg, #f6f8fa 0%, #e9ecef 100%);
+            padding: 4px 6px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 11px;
+            border: 1px solid #d0d7de;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            height: 22px;
+            user-select: none;
+            color: #24292f;
+        }
+        
+        /* 优化列宽 - 扩展消息内容列，增加操作列宽度 */
+        .sender { width: 100px; min-width: 100px; max-width: 100px; }
+        .time { width: 80px; min-width: 80px; max-width: 80px; }
+        .talker { width: 100px; min-width: 100px; max-width: 100px; }
+        .msg-type { width: 60px; min-width: 60px; max-width: 60px; }
+        .content-type { width: 80px; min-width: 80px; max-width: 80px; }
+        .key-info { width: 150px; min-width: 150px; max-width: 150px; }
+        .content { width: auto; min-width: 300px; }  /* 扩展消息内容列 */
+        .operations { width: 160px; min-width: 160px; max-width: 160px; }  /* 增加操作列宽度 */
+        
+        td {
+            padding: 2px 4px;
+            border: 1px solid #d0d7de;
+            vertical-align: middle;
+            height: 20px !important;  /* 固定行高 */
+            max-height: 20px !important;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            font-size: 10px !important;
+            line-height: 1.1;
+            background: white;
+        }
+        
+        tr:nth-child(even) {
+            background: #f6f8fa;
+        }
+        
+        tr:hover {
+            background: #fff8dc !important;
+        }
+        
+        /* 内容列特殊处理 */
+        .content {
+            cursor: pointer;
+            color: #0969da;
+        }
+        
+        .content:hover {
+            background: #ddf4ff !important;
+            text-decoration: underline;
+        }
+        
+        /* 操作列特殊处理 - 改为一行布局 */
+        td.operations {
+            overflow: visible !important;
+            white-space: nowrap !important;
+            padding: 2px !important;
+            text-align: center;
+            width: 160px;
+            min-width: 160px;
+            max-width: 160px;
+        }
+        
+        .op-buttons {
+            display: flex;
+            gap: 2px;
+            font-size: 8px;
+            height: 16px;
+            width: 155px;
+            margin: 0 auto;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .op-buttons label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            font-size: 8px;
+            cursor: pointer;
+            color: #24292f;
+            line-height: 1;
+            padding: 1px 2px;
+            border: 1px solid #e2e8f0;
+            border-radius: 3px;
+            background: #f8f9fa;
+            transition: all 0.1s ease;
+            min-height: 14px;
+            width: 28px;
+            flex-shrink: 0;
+            gap: 1px;
+        }
+        
+        .op-buttons label .op-text {
+            font-size: 8px;
+            line-height: 1;
+            margin-bottom: 1px;
+        }
+        
+        .op-checkbox {
+            width: 8px;
+            height: 8px;
+            margin: 0;
+            transform: scale(0.6);
+            flex-shrink: 0;
+        }
+        
+        .op-buttons label:hover {
+            background: #e3f2fd;
+            border-color: #2196f3;
+            transform: translateY(-1px);
+        }
+        
+        .op-checkbox {
+            width: 8px;
+            height: 8px;
+            margin: 0 2px 0 0;
+            transform: scale(0.7);
+            vertical-align: middle;
+            flex-shrink: 0;
+        }
+        
+        .op-buttons label[data-op="约"] {
+            background: #f0f9ff;
+            border-color: #0ea5e9;
+            color: #0c4a6e;
+        }
+        
+        .op-buttons label[data-op="问"] {
+            background: #fef3c7;
+            border-color: #f59e0b;
+            color: #92400e;
+        }
+        
+        .op-buttons label[data-op="答"] {
+            background: #ecfdf5;
+            border-color: #22c55e;
+            color: #14532d;
+        }
+        
+        .op-buttons label[data-op="顶"] {
+            background: #fee2e2;
+            border-color: #ef4444;
+            color: #991b1b;
+        }
+        
+        .op-buttons label[data-op="踩"] {
+            background: #dcfce7;
+            border-color: #10b981;
+            color: #065f46;
+        }
+        
+        /* 消息类型样式 */
+        .msg-type {
+            text-align: center;
+            font-weight: 500;
+        }
+        
+        .msg-type[data-type="文字"] { background: #e6f3ff; color: #0969da; }
+        .msg-type[data-type="图片"] { background: #fdf2f8; color: #be185d; }
+        .msg-type[data-type="链接"] { background: #f0f9ff; color: #0369a1; }
+        .msg-type[data-type="语音"] { background: #fffbeb; color: #d97706; }
+        .msg-type[data-type="视频"] { background: #f0fdf4; color: #15803d; }
+        .msg-type[data-type="表情"] { background: #fef7ff; color: #a21caf; }
+        
+        .content-type {
+            font-weight: 500;
+            text-align: center;
+        }
+        
+        .key-info {
+            color: #7c3aed;
+            font-size: 10px;
+        }
+        
+        .chatroom-badge {
+            background: #3b82f6;
+            color: white;
+            padding: 0px 2px;
+            border-radius: 2px;
+            font-size: 8px;
+            margin-left: 2px;
+        }
+        
+        /* 弹窗样式 - 可拖动 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 0;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 800px;
+            max-height: 80%;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            position: relative;
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 20px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            cursor: move;  /* 可拖动 */
+        }
+        
+        .modal-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin: 0;
+        }
+        
+        .close {
+            color: #aaa;
+            font-size: 24px;
+            font-weight: bold;
+            cursor: pointer;
+            padding: 0 5px;
+        }
+        
+        .close:hover {
+            color: #000;
+        }
+        
+        .modal-body {
+            padding: 20px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 13px;
+        }
+        
+        /* 媒体卡片样式 - 与标准行高度一致 */
+        .media-card {
+            display: inline-flex;
+            align-items: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 3px;
+            padding: 2px 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin: 1px;
+            height: 16px;
+            max-width: 280px;
+            box-shadow: 0 1px 2px rgba(102, 126, 234, 0.3);
+            font-size: 10px;
+            line-height: 1;
+        }
+        
+        .media-card:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 4px rgba(102, 126, 234, 0.4);
+        }
+        
+        .card-icon {
+            font-size: 11px;
+            margin-right: 4px;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        
+        .card-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+            font-size: 10px;
+            line-height: 1;
+        }
+        
+        /* 不同类型卡片的颜色 */
+        .image-card {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+        }
+        
+        .video-card {
+            background: linear-gradient(135deg, #5f27cd 0%, #341f97 100%);
+        }
+        
+        .file-card {
+            background: linear-gradient(135deg, #00d2d3 0%, #54a0ff 100%);
+        }
+        
+        .link-card {
+            background: linear-gradient(135deg, #2ed573 0%, #7bed9f 100%);
+        }
+        
+        /* 发送管理模块样式 */
+        .send-management-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        
+        .send-stats {
+            display: flex;
+            gap: 15px;
+        }
+        
+        .stat-badge {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .send-filters {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #f8fafc;
+            border-radius: 6px;
+            align-items: center;
+        }
+        
+        .action-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+        
+        .action-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.4);
+        }
+        
+        .action-btn.success {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        }
+        
+        .action-btn.secondary {
+            background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
+        }
+        
+        .action-btn.small {
+            padding: 4px 8px;
+            font-size: 10px;
+        }
+        
+        .action-btn.danger {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+        }
+        
+        .action-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .send-table-container {
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            overflow: hidden;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .send-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+        
+        .send-table th {
+            background: #f9fafb;
+            padding: 8px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 1px solid #e5e7eb;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }
+        
+        .send-table td {
+            padding: 8px;
+            border-bottom: 1px solid #f3f4f6;
+            vertical-align: top;
+            max-width: 200px;
+        }
+        
+        .send-table tr:hover {
+            background: #f9fafb;
+        }
+        
+        .reply-textarea {
+            width: 100%;
+            min-height: 60px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            padding: 4px;
+            font-size: 10px;
+            resize: vertical;
+            font-family: inherit;
+        }
+        
+        .reply-container {
+            width: 100%;
+            min-height: 60px;
+        }
+        
+        .reply-display {
+            width: 100%;
+            min-height: 60px;
+            padding: 8px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            background: #f9fafb;
+            cursor: pointer;
+            font-size: 11px;
+            line-height: 1.4;
+            word-wrap: break-word;
+            transition: all 0.2s;
+        }
+        
+        .reply-display:hover {
+            border-color: #6366f1;
+            background: #f0f9ff;
+        }
+        
+        .reply-display.empty {
+            color: #9ca3af;
+            font-style: italic;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .reply-textarea.hidden {
+            display: none;
+        }
+        
+        .clickable {
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .clickable:hover {
+            background: #f0f9ff;
+            color: #1d4ed8;
+        }
+        
+        .remarks-input {
+            width: 100%;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            padding: 4px;
+            font-size: 10px;
+            font-family: inherit;
+        }
+        
+        .op-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        
+        .op-约 {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        
+        .op-问 {
+            background: #fef3c7;
+            color: #d97706;
+        }
+        
+        .op-答 {
+            background: #dcfce7;
+            color: #16a34a;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        
+        .status-badge.pending {
+            background: #fef3c7;
+            color: #d97706;
+        }
+        
+        .status-badge.warning {
+            background: #fef3c7;
+            color: #d97706;
+        }
+        
+        .status-badge.success {
+            background: #dcfce7;
+            color: #16a34a;
+        }
+        
+        /* 动画效果 */
+        @keyframes fadeInOut {
+            0% { opacity: 0; transform: translateY(-10px); }
+            50% { opacity: 1; transform: translateY(0); }
+            100% { opacity: 0; transform: translateY(-10px); }
+        }
+        
+        /* 响应式设计 */
+        @media (max-width: 1200px) {
+            .header-stats {
+                gap: 10px;
+                font-size: 0.7rem;
+            }
+            
+            .filters {
+                gap: 8px;
+            }
+            
+            table {
+                font-size: 10px;
+            }
+            
+            td {
+                font-size: 9px !important;
+            }
+            
+            .media-card {
+                max-width: 150px;
+                padding: 6px 10px;
+            }
+            
+            .card-icon {
+                font-size: 16px;
+            }
+        }
+        
+        /* 模块标签样式 */
+        .module-tabs {
+            display: flex;
+            background: #f8fafc;
+            border-bottom: 1px solid #e2e8f0;
+            padding: 0 15px;
+        }
+        
+        .tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            color: #64748b;
+        }
+        
+        .tab:hover {
+            color: #3b82f6;
+            background: rgba(59, 130, 246, 0.1);
+        }
+        
+        .tab.active {
+            color: #3b82f6;
+            border-bottom-color: #3b82f6;
+            background: white;
+        }
+        
+        /* 模块内容样式 */
+        .module-content {
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        .module-panel {
+            display: none;
+            height: calc(100vh - 120px);
+            overflow: auto;
+        }
+        
+        .module-panel.active {
+            display: block;
+        }
+        
+        /* AI总结模块样式 */
+        .ai-summary-container {
+            padding: 20px;
+        }
+        
+        .time-filter-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            padding: 5px;
+            background: #f1f5f9;
+            border-radius: 8px;
+        }
+        
+        .time-tab {
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: all 0.2s ease;
+            color: #64748b;
+        }
+        
+        .time-tab:hover {
+            background: #e2e8f0;
+        }
+        
+        .time-tab.active {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .summary-sections {
+            display: grid;
+            gap: 20px;
+        }
+        
+        .summary-section {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .summary-section h3 {
+            margin: 0 0 15px 0;
+            color: #1e293b;
+            font-size: 1.1rem;
+        }
+        
+        .summary-content {
+            color: #64748b;
+            line-height: 1.6;
+        }
+        
+        /* 功能设置模块样式 */
+        .settings-container, .send-management-container {
+            padding: 20px;
+        }
+        
+        /* 发送管理模块样式 */
+        .send-management-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        
+        .send-stats {
+            display: flex;
+            gap: 15px;
+        }
+        
+        .stat-badge {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .send-filters {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #f8fafc;
+            border-radius: 6px;
+        }
+        
+        .action-btn {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        .action-btn.secondary {
+            background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
+        }
+        
+        .action-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        
+        .send-table-container {
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            overflow: auto;
+            max-height: 600px;
+        }
+        
+        .send-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        
+        .send-table th {
+            background: linear-gradient(180deg, #f6f8fa 0%, #e9ecef 100%);
+            padding: 8px 6px;
+            text-align: left;
+            font-weight: 600;
+            border: 1px solid #d0d7de;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        
+        .send-table td {
+            padding: 6px;
+            border: 1px solid #e5e7eb;
+            vertical-align: top;
+            font-size: 11px;
+        }
+        
+        .send-table .sender { width: 80px; }
+        .send-table .time { width: 80px; }
+        .send-table .talker { width: 80px; }
+        .send-table .msg-type { width: 60px; }
+        .send-table .content { width: 200px; }
+        .send-table .operation-type { width: 80px; }
+        .send-table .reply { width: 250px; }
+        .send-table .remarks { width: 150px; }
+        .send-table .status { width: 80px; }
+        .send-table .actions { width: 100px; }
+        
+        .operation-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+            color: white;
+        }
+        
+        .operation-badge.meeting {
+            background: #10b981;
+        }
+        
+        .operation-badge.question {
+            background: #3b82f6;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+            color: white;
+        }
+        
+        .status-badge.pending {
+            background: #f59e0b;
+        }
+        
+        .status-badge.generated {
+            background: #10b981;
+        }
+        
+        .status-badge.sent {
+            background: #6b7280;
+        }
+        
+        .reply-cell {
+            max-width: 250px;
+            word-wrap: break-word;
+            white-space: pre-wrap;
+            font-size: 10px;
+            line-height: 1.3;
+        }
+        
+        .remarks-cell {
+            max-width: 150px;
+            word-wrap: break-word;
+            font-size: 10px;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 2px;
+            flex-direction: column;
+        }
+        
+        .mini-btn {
+            padding: 2px 6px;
+            font-size: 9px;
+            border: none;
+            border-radius: 2px;
+            cursor: pointer;
+            color: white;
+        }
+        
+        .mini-btn.generate {
+            background: #10b981;
+        }
+        
+        .mini-btn.edit {
+            background: #3b82f6;
+        }
+        
+        .mini-btn.send {
+            background: #ef4444;
+        }
+        
+        .settings-group {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .settings-group label {
+            font-weight: 500;
+            color: #374151;
+        }
+        
+        .send-options {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .send-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .send-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        /* AI分析控制按钮样式 */
+        .analysis-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8fafc;
+            border-radius: 8px;
+        }
+        
+        .analysis-btn {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .analysis-btn.secondary {
+            background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
+        }
+        
+        .analysis-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+        }
+        
+        .analysis-btn:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .analysis-status {
+            font-size: 14px;
+            color: #6b7280;
+            margin-left: auto;
+        }
+        
+        /* AI分析结果样式 */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin-top: 10px;
+        }
+        
+        .stat-item {
+            text-align: center;
+            padding: 10px;
+            background: #f8fafc;
+            border-radius: 6px;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .stat-number {
+            display: block;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #3b82f6;
+        }
+        
+        .stat-label {
+            display: block;
+            font-size: 0.8rem;
+            color: #6b7280;
+            margin-top: 2px;
+        }
+        
+        .opinions-list {
+            margin-top: 10px;
+        }
+        
+        .opinion-item {
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #f9fafb;
+            border-left: 3px solid #3b82f6;
+            border-radius: 4px;
+        }
+        
+        .opinion-sender {
+            font-weight: bold;
+            color: #374151;
+            font-size: 0.9rem;
+        }
+        
+        .opinion-content {
+            margin-top: 4px;
+            color: #6b7280;
+            font-size: 0.85rem;
+            line-height: 1.4;
+        }
+        
+        .top-contacts-list {
+            margin-top: 10px;
+        }
+        
+        .contact-stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 10px;
+            margin-bottom: 5px;
+            background: #f3f4f6;
+            border-radius: 4px;
+        }
+        
+        .contact-name {
+            font-weight: 500;
+            color: #374151;
+        }
+        
+        .contact-count {
+            color: #6b7280;
+            font-size: 0.85rem;
+        }
+        
+        /* 配置管理样式 */
+        .settings-section {
+            margin-bottom: 30px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            background: white;
+        }
+        
+        .settings-section h3 {
+            margin: 0 0 20px 0;
+            color: #111827;
+            border-bottom: 2px solid #e5e7eb;
+            padding-bottom: 10px;
+        }
+        
+        .config-group, .prompt-field {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .config-group label, .prompt-field label {
+            min-width: 120px;
+            font-weight: 500;
+            color: #374151;
+        }
+        
+        .config-group input, .config-group select {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .prompt-field {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        
+        .prompt-field textarea {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: 'Courier New', monospace;
+            resize: vertical;
+        }
+        
+        .toggle-btn {
+            background: #f3f4f6;
+            border: 1px solid #d1d5db;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        .config-actions, .prompt-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .save-btn, .test-btn, .reset-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+        
+        .save-btn {
+            background: #10b981;
+            color: white;
+        }
+        
+        .test-btn {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .reset-btn {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .save-btn:hover, .test-btn:hover, .reset-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        
+        .prompt-tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .prompt-tab {
+            padding: 8px 16px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-size: 14px;
+            transition: all 0.2s ease;
+            color: #6b7280;
+        }
+        
+        .prompt-tab:hover {
+            color: #3b82f6;
+        }
+        
+        .prompt-tab.active {
+            color: #3b82f6;
+            border-bottom-color: #3b82f6;
+        }
+        
+        /* 黑白名单管理样式 */
+        .blacklist-whitelist-section {
+            background: #f8fafc;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        
+        .list-type-tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .list-tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            color: #6b7280;
+        }
+        
+        .list-tab:hover {
+            color: #3b82f6;
+            background: rgba(59, 130, 246, 0.1);
+        }
+        
+        .list-tab.active {
+            color: #3b82f6;
+            border-bottom-color: #3b82f6;
+        }
+        
+        .list-content {
+            min-height: 200px;
+        }
+        
+        .list-panel {
+            display: none;
+        }
+        
+        .list-panel.active {
+            display: block;
+        }
+        
+        .list-header {
+            margin-bottom: 15px;
+        }
+        
+        .list-header h4 {
+            margin: 0 0 5px 0;
+            color: #1f2937;
+        }
+        
+        .list-description {
+            margin: 0;
+            color: #6b7280;
+            font-size: 13px;
+        }
+        
+        .contact-input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+        
+        .contact-select {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .add-btn {
+            background: #10b981;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        .add-btn:hover {
+            background: #059669;
+            transform: translateY(-1px);
+        }
+        
+        .contact-list {
+            min-height: 120px;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            padding: 10px;
+            background: white;
+        }
+        
+        .contact-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            background: #f3f4f6;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .contact-name {
+            flex: 1;
+            color: #1f2937;
+        }
+        
+        .contact-username {
+            font-size: 12px;
+            color: #6b7280;
+            margin-right: 10px;
+        }
+        
+        .remove-btn {
+            background: #ef4444;
+            color: white;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .remove-btn:hover {
+            background: #dc2626;
+        }
+        
+        .list-actions {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        
+        .clear-btn, .export-btn, .import-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        .clear-btn {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .clear-btn:hover {
+            background: #dc2626;
+        }
+        
+        .export-btn {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .export-btn:hover {
+            background: #2563eb;
+        }
+        
+        .import-btn {
+            background: #059669;
+            color: white;
+        }
+        
+        .import-btn:hover {
+            background: #047857;
+        }
+        
+        .list-stats {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            padding: 15px;
+        }
+        
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .stat-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .stat-label {
+            font-weight: 500;
+            color: #374151;
+        }
+        
+        .stat-value {
+            color: #6b7280;
+            font-size: 14px;
+        }
+        
+        .filter-mode-select {
+            padding: 6px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        
+        /* ========== 联系人管理样式 ========== */
+        .contact-management-container {
+            padding: 20px;
+            background: white;
+            height: calc(100vh - 140px);
+            overflow: auto;
+        }
+        
+        .contact-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        .contact-header h2 {
+            color: #1f2937;
+            font-size: 1.5rem;
+            margin: 0;
+        }
+        
+        .contact-stats {
+            display: flex;
+            gap: 20px;
+        }
+        
+        .contact-stats .stat-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .contact-filters {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f8fafc;
+            border-radius: 8px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        
+        .contact-filters .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .contact-filters label {
+            font-weight: 500;
+            color: #374151;
+            white-space: nowrap;
+        }
+        
+        .contact-filters input,
+        .contact-filters select {
+            padding: 6px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        
+        .contact-filters input {
+            width: 200px;
+        }
+        
+        .contact-filters select {
+            min-width: 120px;
+        }
+        
+        .export-btn, .reset-all-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }
+        
+        .export-btn:hover, .reset-all-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+        
+        .reset-all-btn {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        }
+        
+        .contact-table-container {
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            overflow: auto;
+            max-height: 600px;
+            margin-bottom: 20px;
+        }
+        
+        .contact-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            background: white;
+        }
+        
+        .contact-table th {
+            background: linear-gradient(180deg, #f6f8fa 0%, #e9ecef 100%);
+            padding: 12px 8px;
+            text-align: left;
+            font-weight: 600;
+            border: 1px solid #d0d7de;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        .contact-table th:hover {
+            background: linear-gradient(180deg, #e9ecef 0%, #dee2e6 100%);
+        }
+        
+        .contact-table td {
+            padding: 8px;
+            border: 1px solid #e2e8f0;
+            vertical-align: middle;
+            font-size: 11px;
+        }
+        
+        .contact-table tr:nth-child(even) {
+            background: #f8f9fa;
+        }
+        
+        .contact-table tr:hover {
+            background: #e3f2fd !important;
+        }
+        
+        .contact-name {
+            font-weight: 500;
+            color: #1f2937;
+            max-width: 150px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .contact-username {
+            font-family: monospace;
+            color: #6b7280;
+            font-size: 10px;
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .contact-score {
+            font-weight: bold;
+            text-align: center;
+            min-width: 50px;
+        }
+        
+        .score-high {
+            background: #dcfce7;
+            color: #15803d;
+        }
+        
+        .score-medium {
+            background: #fef3c7;
+            color: #d97706;
+        }
+        
+        .score-low {
+            background: #fee2e2;
+            color: #dc2626;
+        }
+        
+        .contact-actions {
+            display: flex;
+            gap: 4px;
+            justify-content: center;
+            align-items: center;
+            min-width: 120px;
+        }
+        
+        .score-btn {
+            background: none;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            padding: 4px 6px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }
+        
+        .score-up:hover {
+            background: #dcfce7;
+            border-color: #15803d;
+            color: #15803d;
+        }
+        
+        .score-down:hover {
+            background: #fee2e2;
+            border-color: #dc2626;
+            color: #dc2626;
+        }
+        
+        .score-reset:hover {
+            background: #f3f4f6;
+            border-color: #6b7280;
+            color: #374151;
+        }
+        
+        .contact-help {
+            background: #f0f9ff;
+            border: 1px solid #bae6fd;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        
+        .contact-help h4 {
+            color: #0c4a6e;
+            margin-bottom: 10px;
+        }
+        
+        .contact-help ul {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .contact-help li {
+            margin-bottom: 8px;
+            padding-left: 20px;
+            position: relative;
+            color: #0c4a6e;
+            font-size: 12px;
+        }
+        
+        .contact-help li:before {
+            content: "•";
+            position: absolute;
+            left: 0;
+            color: #0ea5e9;
+            font-weight: bold;
+        }
+        
+        .sortable {
+            position: relative;
+        }
+        
+        .sortable:after {
+            content: "↕️";
+            position: absolute;
+            right: 4px;
+            opacity: 0.5;
+            font-size: 10px;
+        }
+        
+        .sortable.asc:after {
+            content: "↑";
+            opacity: 1;
+            color: #0ea5e9;
+        }
+        
+        .sortable.desc:after {
+            content: "↓";
+            opacity: 1;
+            color: #0ea5e9;
+        }
+        
+    </style>
+</head>
+<body>
+    <div class="container">
+        
+        <div class="header">
+            <h1>📊 微信聊天记录分析系统</h1>
+            <div class="header-stats">
+                <span>📱 0</span>
+                <span>👥 0</span>
+                <span>🕒 N/A</span>
+                <span>🔥 0</span>
+                <span>⭐ 0</span>
+                <span>💾 本地实时</span>
+            </div>
+        </div>
+        
+        
+        <div class="module-tabs">
+            <div class="tab active" data-module="ai-summary">AI总结</div>
+            <div class="tab" data-module="message-list">消息列表</div>
+            <div class="tab" data-module="contact-management">联系人管理</div>
+            <div class="tab" data-module="function-settings">功能设置</div>
+            <div class="tab" data-module="send-management">发送管理</div>
+        </div>
+        
+        
+        <div class="module-content">
+            <div id="ai-summary" class="module-panel active">
+                
+        <div class="ai-summary-container">
+            <div class="time-filter-tabs">
+                <div class="time-tab active" data-period="1day">近1天</div>
+                <div class="time-tab" data-period="3days">近3天</div>
+                <div class="time-tab" data-period="1week">近1周</div>
+                <div class="time-tab" data-period="1month">近1月</div>
+            </div>
+            
+            <div class="analysis-controls">
+                <button id="startAnalysisBtn" class="analysis-btn">🤖 开始AI分析</button>
+                <button id="refreshAnalysisBtn" class="analysis-btn secondary">🔄 刷新分析</button>
+                <button id="reportHistoryBtn" class="analysis-btn secondary">🗂️ 报告历史</button>
+                <label style="margin-left:8px;color:#6b7280;">每页:
+                    <select id="aiPageSize" class="filter-mode-select">
+                        <option value="200">200</option>
+                        <option value="500" selected>500</option>
+                        <option value="1000">1000</option>
+                    </select>
+                </label>
+                <label style="margin-left:8px;color:#6b7280;">
+                    <input type="checkbox" id="aiFollowFilters" checked /> 跟随消息列表筛选
+                </label>
+                <label style="margin-left:8px;color:#6b7280;">
+                    <input type="checkbox" id="aiOnlySelected" /> 仅看已勾选
+                </label>
+                <span style="margin-left:6px; color:#6b7280;">操作:</span>
+                <label style="margin-left:4px;color:#6b7280;"><input type="checkbox" class="aiOp" value="约"> 约</label>
+                <label style="margin-left:4px;color:#6b7280;"><input type="checkbox" class="aiOp" value="问"> 问</label>
+                <label style="margin-left:4px;color:#6b7280;"><input type="checkbox" class="aiOp" value="答"> 答</label>
+                <label style="margin-left:4px;color:#6b7280;"><input type="checkbox" class="aiOp" value="顶"> 顶</label>
+                <label style="margin-left:4px;color:#6b7280;"><input type="checkbox" class="aiOp" value="踩"> 踩</label>
+                <button id="aiPrevPage" class="analysis-btn secondary">上一页</button>
+                <button id="aiNextPage" class="analysis-btn secondary">下一页</button>
+                <span id="aiPageInfo" class="analysis-status" style="margin-left:8px;">第 1 页 / 共 1 页</span>
+                <button id="aiExportHtml" class="analysis-btn secondary" style="margin-left:auto;">⬇ 导出HTML</button>
+                <button id="aiExportCsv" class="analysis-btn secondary">⬇ 导出CSV</button>
+                <button id="aiExportXls" class="analysis-btn secondary">⬇ 导出Excel</button>
+                <button id="aiExportAllHtml" class="analysis-btn secondary">⬇ 全部导出HTML</button>
+                <button id="aiExportAllCsv" class="analysis-btn secondary">⬇ 全部导出CSV</button>
+                <button id="aiExportAllXls" class="analysis-btn secondary">⬇ 全部导出Excel</button>
+                <div class="analysis-status" id="analysisStatus" style="margin-left:8px;">准备就绪</div>
+            </div>
+            
+            <div class="summary-sections">
+                <div class="summary-section">
+                    <h3>📊 信息汇总统计</h3>
+                    <div id="info-statistics" class="summary-content">
+                        <p>点击"开始AI分析"按钮获取智能分析结果</p>
+                    </div>
+                </div>
+                
+                <div class="summary-section">
+                    <h3>📈 市场观点总结</h3>
+                    <div id="market-opinions" class="summary-content">
+                        <p>点击"开始AI分析"按钮获取智能分析结果</p>
+                    </div>
+                </div>
+                
+                <div class="summary-section">
+                    <h3>🎯 会议路演信息</h3>
+                    <div id="meeting-roadshows" class="summary-content">
+                        <p>点击"开始AI分析"按钮获取智能分析结果</p>
+                    </div>
+                </div>
+                
+                <div class="summary-section">
+                    <h3>🤔 反驳观点分析</h3>
+                    <div id="counter-arguments" class="summary-content">
+                        <p>点击"开始AI分析"按钮获取智能分析结果</p>
+                    </div>
+                </div>
+                
+                <div class="summary-section">
+                    <h3>⭐ 高评分联系人</h3>
+                    <div id="top-contacts" class="summary-content">
+                        <p>点击"开始AI分析"按钮获取智能分析结果</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 安全地存储JSON数据 -->
+            <script type="application/json" id="messagesDataJson">[]</script>
+        </div>
+        
+            </div>
+            <div id="message-list" class="module-panel">
+                
+        <div class="filters">
+            <div class="filter-group">
+                <label class="filter-label">搜索:</label>
+                <input type="text" id="searchInput" class="filter-input" placeholder="搜索内容...">
+            </div>
+            
+            <div class="filter-group">
+                <label class="filter-label">类型:</label>
+                <select id="messageTypeFilter" class="filter-select">
+                    <option value="">全部</option>
+                    <option value="文字">文字</option>
+                    <option value="图片">图片</option>
+                    <option value="链接">链接</option>
+                    <option value="视频">视频</option>
+                    <option value="语音">语音</option>
+                </select>
+            </div>
+            
+            <div class="filter-group">
+                <label class="filter-label">分类:</label>
+                <select id="contentTypeFilter" class="filter-select">
+                    <option value="">全部</option>
+                    <option value="会议路演">会议</option>
+                    <option value="市场观点">观点</option>
+                    <option value="通知公告">通知</option>
+                    <option value="普通消息">普通</option>
+                </select>
+            </div>
+            
+            <div class="filter-group">
+                <label class="filter-label">垃圾:</label>
+                <select id="spamFilter" class="filter-select">
+                    <option value="">全部</option>
+                    <option value="false">无垃圾</option>
+                    <option value="true">垃圾</option>
+                </select>
+            </div>
+            
+            <div class="filter-group">
+                <label class="filter-label">发送人:</label>
+                <select id="senderFilter" class="filter-select">
+                    <option value="">全部</option>
+                    
+                </select>
+            </div>
+            
+            <div class="filter-group">
+                <label class="filter-label">重要度:</label>
+                <select id="importanceFilter" class="filter-select">
+                    <option value="">全部</option>
+                    <option value="high">高</option>
+                    <option value="medium">中</option>
+                    <option value="low">低</option>
+                </select>
+            </div>
+            
+            <!-- 分页控件合并到筛选栏 -->
+            <div class="filter-group pagination-group">
+                <label class="filter-label">每页:</label>
+                <select id="pageSizeSelect" class="filter-select">
+                    <option value="1000">1000条</option>
+                    <option value="5000" selected>5000条</option>
+                    <option value="10000">10000条</option>
+                    <option value="20000">20000条</option>
+                </select>
+            </div>
+            
+            <div class="filter-group pagination-group">
+                <div class="pagination-info" id="paginationInfo">第1页，共1页</div>
+            </div>
+            
+            <div class="filter-group pagination-group">
+                <div class="pagination-buttons">
+                    <button id="prevPage" class="pagination-btn">上一页</button>
+                    <button id="nextPage" class="pagination-btn">下一页</button>
+                </div>
+            </div>
+        </div>
+        
+                
+        <div class="table-container">
+            <table id="messageTable">
+                <thead>
+                    <tr>
+                        <th class="sender">发送人</th>
+                        <th class="time">时间</th>
+                        <th class="talker">聊天对象</th>
+                        <th class="msg-type">类型</th>
+                        <th class="content-type">分类</th>
+                        <th class="key-info">关键信息</th>
+                        <th class="content">消息内容</th>
+                        <th class="operations">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    
+                </tbody>
+            </table>
+        </div>
+        
+            </div>
+            <div id="contact-management" class="module-panel">
+                
+        <div class="contact-management-container">
+            <div class="contact-header">
+                <h2>👥 联系人管理 (0人)</h2>
+                <div class="contact-stats">
+                    <span class="stat-item">高分 (≥70): 0</span>
+                    <span class="stat-item">中分 (40-69): 0</span>
+                    <span class="stat-item">低分 (<40): 0</span>
+                </div>
+            </div>
+            
+            <div class="contact-filters">
+                <div class="filter-group">
+                    <label>搜索联系人:</label>
+                    <input type="text" id="contactSearchInput" placeholder="搜索姓名、备注...">
+                </div>
+                <div class="filter-group">
+                    <label>评分筛选:</label>
+                    <select id="contactScoreFilter">
+                        <option value="">全部评分</option>
+                        <option value="high">高分 (≥70)</option>
+                        <option value="medium">中分 (40-69)</option>
+                        <option value="low">低分 (<40)</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>来源筛选:</label>
+                    <select id="contactSourceFilter">
+                        <option value="">全部来源</option>
+                        <option value="contact">联系人</option>
+                        <option value="group_member">群成员</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <button onclick="exportContactData()" class="export-btn">📊 导出数据</button>
+                    <button onclick="resetAllScores()" class="reset-all-btn">🔄 重置全部</button>
+                </div>
+            </div>
+            
+            <div class="contact-table-container">
+                <table id="contactTable" class="contact-table">
+                    <thead>
+                        <tr>
+                            <th class="sortable" data-column="display_name">显示名称</th>
+                            <th class="sortable" data-column="username">用户名</th>
+                            <th class="sortable" data-column="nickname">昵称</th>
+                            <th class="sortable" data-column="remark">备注</th>
+                            <th class="sortable" data-column="source">来源</th>
+                            <th class="sortable" data-column="score">评分</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="contact-help">
+                <h4>💡 使用说明</h4>
+                <ul>
+                    <li><strong>评分系统</strong>: 每个联系人默认50分，顶+1分，踩-1分，影响消息重要度</li>
+                    <li><strong>重要度影响</strong>: 联系人评分高于50分时，其消息重要度会获得加成</li>
+                    <li><strong>批量操作</strong>: 可以导出数据或重置所有评分到默认值</li>
+                    <li><strong>实时更新</strong>: 评分修改会立即保存到本地存储</li>
+                </ul>
+            </div>
+        </div>
+        
+            </div>
+            <div id="function-settings" class="module-panel">
+                
+        <div class="settings-container">
+            <div class="settings-section">
+                <h3>🔌 n8n 工作流配置</h3>
+                <div class="config-group">
+                    <label>Reply Webhook:</label>
+                    <input type="text" id="n8nReply" placeholder="例如 http://localhost:5678/webhook/reply">
+                </div>
+                <div class="config-group">
+                    <label>Summary Webhook:</label>
+                    <input type="text" id="n8nSummary" placeholder="例如 http://localhost:5678/webhook/summary">
+                </div>
+                <div class="config-group">
+                    <label>Contact Webhook:</label>
+                    <input type="text" id="n8nContact" placeholder="例如 http://localhost:5678/webhook/contact">
+                </div>
+                <div class="config-group">
+                    <label>Send Webhook:</label>
+                    <input type="text" id="n8nSend" placeholder="例如 http://localhost:5678/webhook/send">
+                </div>
+                <div class="config-group">
+                    <label>Auth Token:</label>
+                    <input type="password" id="n8nAuth" placeholder="用于 Authorization: Bearer"> 
+                    <button onclick="toggleVisibility('n8nAuth')" class="toggle-btn">👁️</button>
+                </div>
+                <div class="config-actions">
+                    <button onclick="loadN8NConfig()" class="test-btn">↺ 刷新配置</button>
+                    <button onclick="testN8NConnectivity()" class="test-btn">🔍 测试连通</button>
+                    <span style="color:#6b7280; padding-left:8px;">提示：修改请到后端 .env，前端保存仅本地缓存</span>
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>📝 提示词管理</h3>
+                <div class="prompt-tabs">
+                    <div class="prompt-tab active" data-type="info_statistics">信息统计</div>
+                    <div class="prompt-tab" data-type="market_opinions">市场观点</div>
+                    <div class="prompt-tab" data-type="meeting_roadshows">会议路演</div>
+                    <div class="prompt-tab" data-type="counter_arguments">反驳观点</div>
+                    <div class="prompt-tab" data-type="top_contacts">高评分联系人</div>
+                    <div class="prompt-tab" data-type="reply_meeting">AI回复-约</div>
+                    <div class="prompt-tab" data-type="reply_question">AI回复-问</div>
+                    <div class="prompt-tab" data-type="reply_answer">AI回复-答</div>
+                </div>
+                <div class="prompt-editor">
+                    <div class="prompt-field">
+                        <label>系统提示词:</label>
+                        <textarea id="systemPrompt" rows="3" placeholder="定义AI的角色和专业背景"></textarea>
+                    </div>
+                    <div class="prompt-field">
+                        <label>用户提示词模板:</label>
+                        <textarea id="userPromptTemplate" rows="6" placeholder="使用 {time_period} 和 {messages_data} 作为变量"></textarea>
+                    </div>
+                    <div class="prompt-actions">
+                        <button onclick="savePromptConfig()" class="save-btn">💾 保存提示词</button>
+                        <button onclick="resetPromptConfig()" class="reset-btn">🔄 重置默认</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>⚙️ 系统设置</h3>
+                <div class="settings-group">
+                    <label>垃圾信息过滤:</label>
+                    <input type="checkbox" id="enableSpamFilter" checked> 启用垃圾信息自动过滤
+                </div>
+                <div class="settings-group">
+                    <label>AI总结功能:</label>
+                    <input type="checkbox" id="enableAiSummary" checked> 启用AI自动总结
+                </div>
+                <div class="settings-group">
+                    <label>重要性评分:</label>
+                    <input type="checkbox" id="enableImportanceScore" checked> 启用消息重要性评分
+                </div>
+                <div class="settings-group">
+                    <label>实时分析:</label>
+                    <input type="checkbox" id="enableRealTimeAnalysis" checked> 启用实时AI分析
+                </div>
+                <div class="settings-group">
+                    <label>分析结果缓存:</label>
+                    <input type="checkbox" id="enableAnalysisCache" checked> 缓存分析结果(24小时)
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3>👥 黑白名单管理</h3>
+                <div class="blacklist-whitelist-section">
+                    <div class="list-management">
+                        <div class="list-type-tabs">
+                            <div class="list-tab active" data-list="whitelist">白名单 <span id="whitelistCount">(0)</span></div>
+                            <div class="list-tab" data-list="blacklist">黑名单 <span id="blacklistCount">(0)</span></div>
+                        </div>
+                        
+                        <div class="list-content">
+                            <div id="whitelist-panel" class="list-panel active">
+                                <div class="list-header">
+                                    <h4>🎯 白名单联系人</h4>
+                                    <p class="list-description">只显示这些联系人的消息，优先级最高</p>
+                                </div>
+                                <div class="contact-input-group">
+                                    <select id="availableContacts" class="contact-select">
+                                        <option value="">选择联系人...</option>
+                                    </select>
+                                    <button onclick="addToWhitelist()" class="add-btn">➕ 添加到白名单</button>
+                                </div>
+                                <div id="whitelistItems" class="contact-list"></div>
+                            </div>
+                            
+                            <div id="blacklist-panel" class="list-panel">
+                                <div class="list-header">
+                                    <h4>🚫 黑名单联系人</h4>
+                                    <p class="list-description">永不显示这些联系人的消息</p>
+                                </div>
+                                <div class="contact-input-group">
+                                    <select id="availableContactsBlack" class="contact-select">
+                                        <option value="">选择联系人...</option>
+                                    </select>
+                                    <button onclick="addToBlacklist()" class="add-btn">➕ 添加到黑名单</button>
+                                </div>
+                                <div id="blacklistItems" class="contact-list"></div>
+                            </div>
+                        </div>
+                        
+                        <div class="list-actions">
+                            <button onclick="clearWhitelist()" class="clear-btn">🗑️ 清空白名单</button>
+                            <button onclick="clearBlacklist()" class="clear-btn">🗑️ 清空黑名单</button>
+                            <button onclick="exportLists()" class="export-btn">📤 导出名单</button>
+                            <button onclick="importLists()" class="import-btn">📥 导入名单</button>
+                        </div>
+                        
+                        <div class="list-stats">
+                            <div class="stat-item">
+                                <span class="stat-label">白名单:</span>
+                                <span id="whitelistStat" class="stat-value">0 个联系人</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">黑名单:</span>
+                                <span id="blacklistStat" class="stat-value">0 个联系人</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">筛选模式:</span>
+                                <select id="filterMode" class="filter-mode-select" onchange="updateFilterMode()">
+                                    <option value="none">不筛选</option>
+                                    <option value="whitelist">仅白名单</option>
+                                    <option value="blacklist">排除黑名单</option>
+                                    <option value="both">白名单优先+排除黑名单</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+            </div>
+            <div id="send-management" class="module-panel">
+                
+        <div class="send-management-container">
+            <div class="send-management-header">
+                <h3>📮 发送管理</h3>
+                <div class="send-stats">
+                    <span id="pendingCount" class="stat-badge">待发送: 0</span>
+                    <span id="meetingCount" class="stat-badge">会议约定: 0</span>
+                    <span id="questionCount" class="stat-badge">分析提问: 0</span>
+                </div>
+            </div>
+            
+            <div class="send-filters">
+                <div class="filter-group">
+                    <label class="filter-label">发送类型:</label>
+                    <select id="sendTypeFilter" class="filter-select">
+                        <option value="">全部</option>
+                        <option value="约">会议约定</option>
+                        <option value="问">分析提问</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">状态:</label>
+                    <select id="sendStatusFilter" class="filter-select">
+                        <option value="">全部</option>
+                        <option value="pending">待处理</option>
+                        <option value="generated">已生成</option>
+                        <option value="sent">已发送</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <button id="generateAllReplies" class="action-btn">🤖 批量生成回复</button>
+                    <button id="exportSendList" class="action-btn secondary">📤 导出发送列表</button>
+                </div>
+            </div>
+            
+            <div class="send-table-container">
+                <table id="sendTable" class="send-table">
+                    <thead>
+                        <tr>
+                            <th class="sender">发送人</th>
+                            <th class="time">时间</th>
+                            <th class="talker">聊天对象</th>
+                            <th class="msg-type">类型</th>
+                            <th class="content">消息内容</th>
+                            <th class="operation-type">操作类型</th>
+                            <th class="reply">AI回复</th>
+                            <th class="remarks">备注</th>
+                            <th class="status">状态</th>
+                            <th class="actions">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="sendTableBody">
+                        <tr class="empty-state">
+                            <td colspan="10" style="text-align: center; padding: 40px; color: #9ca3af;">
+                                暂无待发送消息，请在消息列表中选择"约"或"问"标记
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+            </div>
+        </div>
+        
+    </div>
+    
+        <!-- 消息详情弹出框 -->
+        <div id="contentModal" class="modal">
+            <div class="modal-content" id="modalContent">
+                <div class="modal-header" id="modalHeader">
+                    <h3 class="modal-title" id="modalTitle">消息详情</h3>
+                    <span class="close">&times;</span>
+                </div>
+                <div class="modal-body" id="modalBody"></div>
+            </div>
+        </div>
+        
+    <script>
+        
+        // 全局状态变量
+        let currentPage = 1;
+        let totalPages = 1;
+        let pageSize = 5000;
+        let filteredMessages = [];
+        let allMessages = [];
+        let operationMemory = JSON.parse(localStorage.getItem('operationMemory') || '{}');
+        let filterMemory = JSON.parse(localStorage.getItem('filterMemory') || '{}');
+        
+        // 页面初始化功能 - 已合并到统一的DOMContentLoaded中
+
+        // 模块切换功能
+        function initModuleTabs() {
+            const tabs = document.querySelectorAll('.tab');
+            const panels = document.querySelectorAll('.module-panel');
+
+            if (tabs.length > 0 && panels.length > 0) {
+                // 设置默认激活状态
+                tabs[0].classList.add('active');
+                panels[0].classList.add('active');
+
+                tabs.forEach(tab => {
+                    tab.addEventListener('click', function() {
+                        // 移除所有激活状态
+                        tabs.forEach(t => t.classList.remove('active'));
+                        panels.forEach(p => p.classList.remove('active'));
+
+                        // 激活当前选中的标签页
+                        this.classList.add('active');
+
+                        // 激活对应的面板
+                        const targetPanelId = this.dataset.module;
+                        const targetPanel = document.getElementById(targetPanelId);
+                        if (targetPanel) {
+                            targetPanel.classList.add('active');
+                        }
+                    });
+                });
+            }
+        }
+
+        // 初始化消息数据
+        function initMessageData() {
+            const messageRows = document.querySelectorAll('#messageTable tbody tr');
+            allMessages = Array.from(messageRows);
+            filteredMessages = [...allMessages];
+            console.log(`加载了 ${allMessages.length} 条消息`);
+        }
+
+        // 初始化筛选功能
+        function initFilters() {
+            const searchInput = document.getElementById('searchInput');
+            const messageTypeFilter = document.getElementById('messageTypeFilter');
+            const contentTypeFilter = document.getElementById('contentTypeFilter');
+            const spamFilter = document.getElementById('spamFilter');
+            const senderFilter = document.getElementById('senderFilter');
+            const importanceFilter = document.getElementById('importanceFilter');
+
+            // 添加事件监听器
+            [searchInput, messageTypeFilter, contentTypeFilter, spamFilter, senderFilter, importanceFilter].forEach(element => {
+                if (element) {
+                    element.addEventListener('change', applyFilters);
+                    element.addEventListener('input', applyFilters);
+                }
+            });
+        }
+
+        // 应用筛选
+        function applyFilters() {
+            const searchText = document.getElementById('searchInput')?.value.toLowerCase() || '';
+            const messageType = document.getElementById('messageTypeFilter')?.value || '';
+            const contentType = document.getElementById('contentTypeFilter')?.value || '';
+            const spamFilter = document.getElementById('spamFilter')?.value || '';
+            const sender = document.getElementById('senderFilter')?.value || '';
+            const importance = document.getElementById('importanceFilter')?.value || '';
+
+            // 保存筛选记忆
+            filterMemory = {
+                searchText, messageType, contentType, spamFilter, sender, importance
+            };
+            localStorage.setItem('filterMemory', JSON.stringify(filterMemory));
+
+            // 如果所有筛选条件都为空，显示所有消息
+            const hasAnyFilter = searchText || messageType || contentType || spamFilter || sender || importance;
+            
+            if (!hasAnyFilter) {
+                // 没有任何筛选条件时，恢复所有消息的显示
+                allMessages.forEach(row => {
+                    if (row) row.style.display = '';
+                });
+                filteredMessages = [...allMessages];
+            } else {
+                // 有筛选条件时，先隐藏所有行再筛选
+                allMessages.forEach(row => {
+                    if (row) row.style.display = 'none';
+                });
+                
+                filteredMessages = allMessages.filter(row => {
+                    if (!row) return false;
+
+                    // 搜索筛选
+                    if (searchText) {
+                        const content = row.textContent.toLowerCase();
+                        if (!content.includes(searchText)) return false;
+                    }
+
+                    // 消息类型筛选
+                    if (messageType) {
+                        const msgType = row.dataset.messageType || '';
+                        if (msgType !== messageType) return false;
+                    }
+
+                    // 内容类型筛选
+                    if (contentType) {
+                        const cType = row.dataset.contentType || '';
+                        if (cType !== contentType) return false;
+                    }
+
+                    // 垃圾信息筛选
+                    if (spamFilter) {
+                        const isSpam = row.dataset.isSpam || '';
+                        if (isSpam !== spamFilter) return false;
+                    }
+
+                    // 发送人筛选
+                    if (sender) {
+                        const msgSender = row.dataset.sender || '';
+                        if (msgSender !== sender) return false;
+                    }
+
+                    // 重要度筛选
+                    if (importance) {
+                        const importanceScore = parseInt(row.dataset.importance || '0');
+                        if (importance === 'high' && importanceScore < 70) return false;
+                        if (importance === 'medium' && (importanceScore < 40 || importanceScore >= 70)) return false;
+                        if (importance === 'low' && importanceScore >= 40) return false;
+                    }
+
+                    return true;
+                });
+            }
+
+            currentPage = 1;
+            updateDisplay();
+            updatePagination();
+        }
+
+        // 初始化分页功能
+        function initPagination() {
+            const pageSizeSelect = document.getElementById('pageSizeSelect');
+            const prevBtn = document.getElementById('prevPage');
+            const nextBtn = document.getElementById('nextPage');
+
+            if (pageSizeSelect) {
+                pageSizeSelect.addEventListener('change', function() {
+                    pageSize = parseInt(this.value);
+                    currentPage = 1;
+                    updateDisplay();
+                    updatePagination();
+                });
+            }
+
+            if (prevBtn) {
+                prevBtn.addEventListener('click', function() {
+                    if (currentPage > 1) {
+                        currentPage--;
+                        updateDisplay();
+                        updatePagination();
+                    }
+                });
+            }
+
+            if (nextBtn) {
+                nextBtn.addEventListener('click', function() {
+                    if (currentPage < totalPages) {
+                        currentPage++;
+                        updateDisplay();
+                        updatePagination();
+                    }
+                });
+            }
+
+            updatePagination();
+        }
+
+        // 更新分页信息
+        function updatePagination() {
+            totalPages = Math.ceil(filteredMessages.length / pageSize);
+            const paginationInfo = document.getElementById('paginationInfo');
+            const prevBtn = document.getElementById('prevPage');
+            const nextBtn = document.getElementById('nextPage');
+
+            if (paginationInfo) {
+                paginationInfo.textContent = `第${currentPage}页，共${totalPages}页`;
+            }
+
+            if (prevBtn) prevBtn.disabled = currentPage <= 1;
+            if (nextBtn) nextBtn.disabled = currentPage >= totalPages;
+        }
+
+        // 更新显示
+        function updateDisplay() {
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = startIndex + pageSize;
+
+            // 隐藏所有行
+            allMessages.forEach(row => {
+                if (row) row.style.display = 'none';
+            });
+
+            // 显示当前页的行
+            filteredMessages.slice(startIndex, endIndex).forEach(row => {
+                if (row) row.style.display = '';
+            });
+        }
+
+        // 初始化操作功能
+        function initOperations() {
+            document.addEventListener('change', function(e) {
+                if (e.target.classList.contains('op-checkbox')) {
+                    const messageId = e.target.dataset.id;
+                    const operation = e.target.dataset.op;
+                    const isChecked = e.target.checked;
+
+                    // 保存操作记忆
+                    if (!operationMemory[messageId]) {
+                        operationMemory[messageId] = {};
+                    }
+                    operationMemory[messageId][operation] = isChecked;
+                    localStorage.setItem('operationMemory', JSON.stringify(operationMemory));
+
+                    console.log(`消息 ${messageId} 的操作 ${operation} 设置为 ${isChecked}`);
+                }
+            });
+        }
+
+        // 恢复筛选记忆
+        function restoreFilterMemory() {
+            Object.entries(filterMemory).forEach(([key, value]) => {
+                const element = document.getElementById(key === 'searchText' ? 'searchInput' : key + 'Filter');
+                if (element && value) {
+                    element.value = value;
+                }
+            });
+
+            if (Object.keys(filterMemory).length > 0) {
+                applyFilters();
+            }
+        }
+
+        // 恢复操作记忆
+        function restoreOperationMemory() {
+            Object.entries(operationMemory).forEach(([messageId, operations]) => {
+                Object.entries(operations).forEach(([operation, isChecked]) => {
+                    const checkbox = document.querySelector(`input[data-id="${messageId}"][data-op="${operation}"]`);
+                    if (checkbox) {
+                        checkbox.checked = isChecked;
+                    }
+                });
+            });
+        }
+
+        // 初始化AI功能
+        function initAIFeatures() {
+            const startAnalysisBtn = document.getElementById('startAnalysisBtn');
+            const refreshAnalysisBtn = document.getElementById('refreshAnalysisBtn');
+            
+            // 初始化时间筛选标签
+            initTimeFilterTabs();
+            
+            // 初始化提示词标签
+            initPromptTabs();
+            
+            // 初始化联系人管理标签
+            initContactManagementTabs();
+            
+            // 初始化黑白名单标签
+            initBlackWhiteListTabs();
+
+            if (startAnalysisBtn) {
+                startAnalysisBtn.addEventListener('click', async function() {
+                    console.log('开始AI分析...');
+                    this.disabled = true;
+                    this.textContent = '🤖 分析中...';
+                    const activeTimeTab = document.querySelector('.time-tab.active');
+                    const timePeriod = activeTimeTab ? activeTimeTab.dataset.period : '1day';
+                    try {
+                        await requestAISummary(timePeriod);
+                    } finally {
+                        this.disabled = false;
+                        this.textContent = '🤖 开始AI分析';
+                    }
+                });
+            }
+
+            if (refreshAnalysisBtn) {
+                refreshAnalysisBtn.addEventListener('click', async function() {
+                    console.log('刷新AI分析...');
+                    const activeTimeTab = document.querySelector('.time-tab.active');
+                    const timePeriod = activeTimeTab ? activeTimeTab.dataset.period : '1day';
+                    await requestAISummary(timePeriod);
+                });
+            }
+            const reportHistoryBtn = document.getElementById('reportHistoryBtn');
+            if (reportHistoryBtn) {
+                reportHistoryBtn.addEventListener('click', async function() {
+                    try {
+                        const res = await fetch('/api/reports');
+                        const list = await res.json();
+                        const w = window.open('', '_blank');
+                        w.document.write('<h2>报告历史</h2>');
+                        if (!list || !list.length) { w.document.write('<p>暂无报告</p>'); return; }
+                        w.document.write('<ul>');
+                        list.forEach(r => {
+                            const url = `/api/reports/${r.id}/export?format=html`;
+                            w.document.write(`<li><a href="${url}" target="_blank">#${r.id} ${r.title} (${r.created_at})</a></li>`);
+                        });
+                        w.document.write('</ul>');
+                        w.document.close();
+                    } catch (e) {
+                        alert('获取报告历史失败');
+                    }
+                });
+            }
+        }
+        
+        // 初始化时间筛选标签
+        function initTimeFilterTabs() {
+            const timeTabs = document.querySelectorAll('.time-tab');
+            timeTabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    timeTabs.forEach(t => t.classList.remove('active'));
+                    this.classList.add('active');
+                });
+            });
+        }
+        
+        // 初始化提示词标签
+        function initPromptTabs() {
+            const promptTabs = document.querySelectorAll('.prompt-tab');
+            promptTabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    promptTabs.forEach(t => t.classList.remove('active'));
+                    this.classList.add('active');
+                    
+                    const promptType = this.dataset.type;
+                    loadPromptTemplate(promptType);
+                });
+            });
+        }
+        
+        // 初始化联系人管理标签
+        function initContactManagementTabs() {
+            const contactFilters = document.querySelectorAll('#contactSearchInput, #contactScoreFilter, #contactSourceFilter');
+            contactFilters.forEach(filter => {
+                if (filter) {
+                    filter.addEventListener('input', filterContacts);
+                    filter.addEventListener('change', filterContacts);
+                }
+            });
+            
+            // 初始化排序功能
+            const sortableHeaders = document.querySelectorAll('#contactTable .sortable');
+            sortableHeaders.forEach(header => {
+                header.addEventListener('click', function() {
+                    sortContactTable(this.dataset.column);
+                });
+            });
+        }
+        
+        // 初始化黑白名单标签
+        function initBlackWhiteListTabs() {
+            const listTabs = document.querySelectorAll('.list-tab');
+            const listPanels = document.querySelectorAll('.list-panel');
+            
+            listTabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    listTabs.forEach(t => t.classList.remove('active'));
+                    listPanels.forEach(p => p.classList.remove('active'));
+                    
+                    this.classList.add('active');
+                    const targetList = this.dataset.list;
+                    const targetPanel = document.getElementById(targetList + '-panel');
+                    if (targetPanel) {
+                        targetPanel.classList.add('active');
+                    }
+                });
+            });
+        }
+        
+        // 执行AI分析
+        function performAIAnalysis(timePeriod) {
+            console.log('执行AI分析，时间段:', timePeriod);
+            
+            // 获取消息数据
+            const messagesDataElement = document.getElementById('messagesDataJson');
+            if (!messagesDataElement) {
+                console.error('未找到消息数据');
+                return;
+            }
+            
+            try {
+                const messagesData = JSON.parse(messagesDataElement.textContent);
+                console.log('加载了消息数据:', messagesData.length);
+                
+                // 根据时间段筛选数据
+                const filteredData = filterMessagesByTimePeriod(messagesData, timePeriod);
+                
+                // 更新各个分析区域
+                updateInfoStatistics(filteredData);
+                updateMarketOpinions(filteredData);
+                updateMeetingRoadshows(filteredData);
+                updateCounterArguments(filteredData);
+                updateTopContacts(filteredData);
+                
+            } catch (error) {
+                console.error('解析消息数据失败:', error);
+            }
+        }
+        
+        // 根据时间段筛选消息
+        function filterMessagesByTimePeriod(messages, period) {
+            const now = new Date();
+            let cutoffDate;
+            
+            switch(period) {
+                case '1day':
+                    cutoffDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+                    break;
+                case '3days':
+                    cutoffDate = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+                    break;
+                case '1week':
+                    cutoffDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                    break;
+                case '1month':
+                    cutoffDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+                    break;
+                default:
+                    return messages;
+            }
+            
+            return messages.filter(msg => {
+                const msgDate = new Date(msg.time);
+                return msgDate >= cutoffDate;
+            });
+        }
+        
+        // 更新信息统计
+        function updateInfoStatistics(messages) {
+            const infoElement = document.getElementById('info-statistics');
+            if (!infoElement) return;
+            
+            const stats = {
+                total: messages.length,
+                highImportance: messages.filter(m => m.importance_score >= 70).length,
+                meetings: messages.filter(m => m.content_type === '会议路演').length,
+                marketViews: messages.filter(m => m.content_type === '市场观点').length,
+                spam: messages.filter(m => m.is_spam).length
+            };
+            
+            infoElement.innerHTML = `
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-number">${stats.total}</span>
+                        <span class="stat-label">总消息数</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-number">${stats.highImportance}</span>
+                        <span class="stat-label">高重要度</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-number">${stats.meetings}</span>
+                        <span class="stat-label">会议路演</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-number">${stats.marketViews}</span>
+                        <span class="stat-label">市场观点</span>
+                    </div>
+                </div>
+            `;
+        }
+        
+        // 更新市场观点总结
+        function updateMarketOpinions(messages) {
+            const opinionsElement = document.getElementById('market-opinions');
+            if (!opinionsElement) return;
+            
+            const marketMessages = messages.filter(m => m.content_type === '市场观点');
+            
+            if (marketMessages.length === 0) {
+                opinionsElement.innerHTML = '<p>当前时间段内没有市场观点消息</p>';
+                return;
+            }
+            
+            const sampleOpinions = marketMessages.slice(0, 3).map(msg => 
+                `<div class="opinion-item">
+                    <div class="opinion-sender">${msg.sender_name}</div>
+                    <div class="opinion-content">${msg.content.substring(0, 100)}...</div>
+                </div>`
+            ).join('');
+            
+            opinionsElement.innerHTML = `
+                <p>发现 ${marketMessages.length} 条市场观点消息</p>
+                <div class="opinions-list">${sampleOpinions}</div>
+            `;
+        }
+        
+        // 更新会议路演信息
+        function updateMeetingRoadshows(messages) {
+            const meetingsElement = document.getElementById('meeting-roadshows');
+            if (!meetingsElement) return;
+            
+            const meetingMessages = messages.filter(m => m.content_type === '会议路演');
+            
+            if (meetingMessages.length === 0) {
+                meetingsElement.innerHTML = '<p>当前时间段内没有会议路演消息</p>';
+                return;
+            }
+            
+            meetingsElement.innerHTML = `
+                <p>发现 ${meetingMessages.length} 条会议路演消息</p>
+                <p>主要来源: ${[...new Set(meetingMessages.map(m => m.sender_name))].join(', ')}</p>
+            `;
+        }
+        
+        // 更新反驳观点分析
+        function updateCounterArguments(messages) {
+            const counterElement = document.getElementById('counter-arguments');
+            if (!counterElement) return;
+            
+            // 简单的反驳观点识别（包含否定词汇的消息）
+            const counterKeywords = ['不同意', '反对', '错误', '不对', '问题是', '但是', '然而', '不过'];
+            const counterMessages = messages.filter(msg => 
+                counterKeywords.some(keyword => msg.content.includes(keyword))
+            );
+            
+            counterElement.innerHTML = `
+                <p>识别到 ${counterMessages.length} 条可能包含反驳观点的消息</p>
+                ${counterMessages.length > 0 ? '<p>建议重点关注这些不同观点，有助于全面了解市场态度</p>' : ''}
+            `;
+        }
+
+        // ========== 通过后端 API 生成AI总结（调用 n8n） ==========
+        function getPeriodRange(period) {
+            const now = new Date();
+            let from = new Date();
+            switch(period) {
+                case '1day': from = new Date(now.getTime() - 24*60*60*1000); break;
+                case '3days': from = new Date(now.getTime() - 3*24*60*60*1000); break;
+                case '1week': from = new Date(now.getTime() - 7*24*60*60*1000); break;
+                case '1month': from = new Date(now.getTime() - 30*24*60*60*1000); break;
+                default: from = new Date(now.getTime() - 24*60*60*1000);
+            }
+            return { from: from.toISOString(), to: now.toISOString() };
+        }
+
+        let aiSummaryState = { period: '1day', page: 1, size: 500, total: 0, items: [] };
+
+        async function requestAISummary(period) {
+            // 根据用户要求：不做分区总结，直接按时间段提取消息并展示
+            const statusEl = document.getElementById('analysisStatus');
+            if (statusEl) statusEl.textContent = '提取中...';
+            try {
+                const range = getPeriodRange(period);
+                const sizeSel = document.getElementById('aiPageSize');
+                const size = sizeSel ? parseInt(sizeSel.value) : (aiSummaryState.size || 500);
+                const page = aiSummaryState.page || 1;
+                aiSummaryState.period = period; aiSummaryState.size = size;
+                const params = new URLSearchParams({ page: String(page), size: String(size), time_from: range.from, time_to: range.to });
+                const resp = await fetch(`/api/messages?${params.toString()}`);
+                const data = await resp.json();
+                let items = data.items || [];
+                // 如启用“跟随消息列表筛选”，在前端进行同样条件过滤
+                const follow = document.getElementById('aiFollowFilters');
+                if (follow && follow.checked) {
+                    const searchEl = document.getElementById('searchInput');
+                    const typeEl = document.getElementById('messageTypeFilter');
+                    const senderEl = document.getElementById('senderFilter');
+                    const importanceEl = document.getElementById('importanceFilter');
+                    const searchText = (searchEl?.value || '').toLowerCase();
+                    const typeSel = typeEl?.value || '';
+                    const senderSel = senderEl?.value || '';
+                    const importance = importanceEl?.value || '';
+                    items = items.filter(m => {
+                        if (typeSel) {
+                            if (mapMsgType(m.type) !== typeSel) return false;
+                        }
+                        if (senderSel) {
+                            if ((m.sender_name || m.sender_id || '') !== senderSel) return false;
+                        }
+                        if (importance) {
+                            const s = parseInt(m.importance_score || 0);
+                            if (importance === 'high' && s < 70) return false;
+                            if (importance === 'medium' && (s < 40 || s >= 70)) return false;
+                            if (importance === 'low' && s >= 40) return false;
+                        }
+                        if (searchText) {
+                            const hay = `${m.content_text||''} ${m.sender_name||''} ${m.talker_name||m.chat_id||''}`.toLowerCase();
+                            if (!hay.includes(searchText)) return false;
+                        }
+                        return true;
+                    });
+                }
+                // 仅看已勾选 + 操作过滤
+                const onlySelectedEl = document.getElementById('aiOnlySelected');
+                const opBoxes = Array.from(document.querySelectorAll('.aiOp'));
+                const selectedOps = opBoxes.filter(b => b.checked).map(b => b.value);
+                if (onlySelectedEl && onlySelectedEl.checked) {
+                    try {
+                        const memory = JSON.parse(localStorage.getItem('operationMemory') || '{}');
+                        items = items.filter(m => {
+                            const ops = memory[String(m.id)] || {};
+                            if (selectedOps.length === 0) {
+                                // 仅要求存在任一被勾选操作
+                                return Object.values(ops).some(Boolean);
+                            }
+                            return selectedOps.some(op => ops[op]);
+                        });
+                    } catch (e) {
+                        // 忽略解析错误
+                    }
+                }
+                aiSummaryState.items = items;
+                aiSummaryState.total = data.total || items.length;
+                const info = document.getElementById('info-statistics');
+                if (info) {
+                    const rows = items.map(m => {
+                        const t = (m.timestamp || '').replace('T',' ').replace('Z','');
+                        const type = mapMsgType(m.type);
+                        const talker = m.talker_name || m.chat_id || '';
+                        const sender = m.sender_name || m.sender_id || '';
+                        const content = (m.content_text || '').replace(/</g,'&lt;');
+                        return `<tr>
+                            <td class="sender">${sender}</td>
+                            <td class="time">${t}</td>
+                            <td class="talker">${talker}</td>
+                            <td class="msg-type" data-type="${type}">${type}</td>
+                            <td class="content-type"></td>
+                            <td class="key-info"></td>
+                            <td class="content" title="${content}">${content.length>80?content.slice(0,80)+'...':content}</td>
+                        </tr>`;
+                    }).join('');
+                    info.innerHTML = `
+                        <div style="margin:6px 0;color:#64748b;">提取到 ${items.length} 条消息（${period}）</div>
+                        <div class="table-container" style="height:60vh;">
+                          <table>
+                            <thead>
+                                <tr>
+                                  <th class="sender">发送人</th>
+                                  <th class="time">时间</th>
+                                  <th class="talker">聊天对象</th>
+                                  <th class="msg-type">类型</th>
+                                  <th class="content-type">分类</th>
+                                  <th class="key-info">关键信息</th>
+                                  <th class="content">消息内容</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                          </table>
+                        </div>
+                    `;
+                    updateAiSummaryPageInfo();
+                }
+            } catch (e) {
+                console.error('消息提取失败:', e);
+                const info = document.getElementById('info-statistics');
+                if (info) info.innerHTML = '<p>提取失败，请重试</p>';
+            } finally {
+                if (statusEl) statusEl.textContent = '完成';
+            }
+        }
+
+        function updateAiSummaryPageInfo() {
+            const info = document.getElementById('aiPageInfo');
+            const totalPages = Math.max(1, Math.ceil((aiSummaryState.total || 0) / (aiSummaryState.size || 1)));
+            if (info) info.textContent = `第 ${aiSummaryState.page} 页 / 共 ${totalPages} 页`;
+            const prev = document.getElementById('aiPrevPage');
+            const next = document.getElementById('aiNextPage');
+            if (prev) prev.disabled = aiSummaryState.page <= 1;
+            if (next) next.disabled = aiSummaryState.page >= totalPages;
+        }
+
+        function buildCsv(items) {
+            const header = ['发送人','时间','聊天对象','类型','分类','关键信息','消息内容'];
+            const rows = items.map(m => [
+                (m.sender_name || m.sender_id || '').replace(/\n/g,' '),
+                (m.timestamp || '').replace('T',' ').replace('Z',''),
+                (m.talker_name || m.chat_id || '').replace(/\n/g,' '),
+                mapMsgType(m.type),
+                '',
+                '',
+                (m.content_text || '').replace(/\n/g,' ').replace(/"/g,'""')
+            ]);
+            const csv = [header, ...rows].map(r => r.map(v => `"${v}"`).join(',')).join('\n');
+            return csv;
+        }
+
+        function downloadBlob(content, mime, filename) {
+            const blob = new Blob([content], { type: mime });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+        }
+
+        // 收集当前表格消息（用于回退到本地统计）
+        function collectCurrentMessages() {
+            const rows = Array.from(document.querySelectorAll('#messageTable tbody tr'));
+            return rows.map(row => ({
+                content: row.querySelector('.content')?.textContent || '',
+                sender_name: row.querySelector('.sender')?.textContent || '',
+                time: row.querySelector('.time')?.textContent || '',
+                content_type: row.dataset.contentType || '',
+                importance_score: parseInt(row.dataset.importance || '0')
+            }));
+        }
+        
+        // 更新高评分联系人
+        function updateTopContacts(messages) {
+            const contactsElement = document.getElementById('top-contacts');
+            if (!contactsElement) return;
+            
+            // 统计发送人消息数量
+            const senderStats = {};
+            messages.forEach(msg => {
+                if (senderStats[msg.sender_name]) {
+                    senderStats[msg.sender_name]++;
+                } else {
+                    senderStats[msg.sender_name] = 1;
+                }
+            });
+            
+            // 排序并取前5名
+            const topSenders = Object.entries(senderStats)
+                .sort(([,a], [,b]) => b - a)
+                .slice(0, 5);
+            
+            const topContactsList = topSenders.map(([name, count]) => 
+                `<div class="contact-stat">
+                    <span class="contact-name">${name}</span>
+                    <span class="contact-count">${count} 条消息</span>
+                </div>`
+            ).join('');
+            
+            contactsElement.innerHTML = `
+                <div class="top-contacts-list">${topContactsList}</div>
+            `;
+        }
+        
+        // 清空AI分析结果
+        function clearAIAnalysisResults() {
+            const sections = ['info-statistics', 'market-opinions', 'meeting-roadshows', 'counter-arguments', 'top-contacts'];
+            sections.forEach(sectionId => {
+                const element = document.getElementById(sectionId);
+                if (element) {
+                    element.innerHTML = '<p>点击"开始AI分析"按钮获取智能分析结果</p>';
+                }
+            });
+        }
+        
+        // 加载提示词模板
+        function loadPromptTemplate(promptType) {
+            const systemPrompt = document.getElementById('systemPrompt');
+            const userPromptTemplate = document.getElementById('userPromptTemplate');
+            
+            if (!systemPrompt || !userPromptTemplate) return;
+            
+            // 根据提示词类型加载不同的模板
+            const templates = {
+                info_statistics: {
+                    system: "你是一名专业的数据分析师，擅长从大量信息中提取关键统计数据。",
+                    user: "请分析以下时间段的消息数据：{{time_period}}\n\n消息数据：{{messages_data}}\n\n请提供详细的统计分析。"
+                },
+                market_opinions: {
+                    system: "你是一名金融市场分析专家，能够识别和总结各种市场观点。",
+                    user: "请分析以下市场观点消息：{{messages_data}}\n\n请总结主要的市场观点和趋势。"
+                },
+                meeting_roadshows: {
+                    system: "你是一名会议组织专家，擅长整理和分析会议相关信息。",
+                    user: "请整理以下会议路演信息：{{messages_data}}\n\n请提供会议时间、地点和主要内容的总结。"
+                }
+            };
+            
+            const template = templates[promptType] || templates.info_statistics;
+            systemPrompt.value = template.system;
+            userPromptTemplate.value = template.user;
+        }
+        
+        // 联系人筛选功能
+        function filterContacts() {
+            const searchTerm = document.getElementById('contactSearchInput')?.value.toLowerCase() || '';
+            const scoreFilter = document.getElementById('contactScoreFilter')?.value || '';
+            const sourceFilter = document.getElementById('contactSourceFilter')?.value || '';
+            
+            const rows = document.querySelectorAll('#contactTable tbody tr');
+            rows.forEach(row => {
+                const name = row.querySelector('.contact-name')?.textContent.toLowerCase() || '';
+                const score = parseInt(row.querySelector('.contact-score')?.dataset.score || '0');
+                const source = row.querySelector('.contact-source')?.textContent || '';
+                
+                let show = true;
+                
+                // 搜索筛选
+                if (searchTerm && !name.includes(searchTerm)) {
+                    show = false;
+                }
+                
+                // 评分筛选
+                if (scoreFilter) {
+                    if (scoreFilter === 'high' && score < 70) show = false;
+                    if (scoreFilter === 'medium' && (score < 40 || score >= 70)) show = false;
+                    if (scoreFilter === 'low' && score >= 40) show = false;
+                }
+                
+                // 来源筛选
+                if (sourceFilter && source !== sourceFilter) {
+                    show = false;
+                }
+                
+                row.style.display = show ? '' : 'none';
+            });
+        }
+        
+        // 联系人表格排序
+        function sortContactTable(column) {
+            const table = document.getElementById('contactTable');
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            // 移除其他列的排序状态
+            table.querySelectorAll('.sortable').forEach(header => {
+                header.classList.remove('asc', 'desc');
+            });
+            
+            // 确定排序方向
+            const header = table.querySelector(`[data-column="${column}"]`);
+            const isAsc = header.classList.contains('desc');
+            header.classList.add(isAsc ? 'asc' : 'desc');
+            
+            // 排序
+            rows.sort((a, b) => {
+                let aVal, bVal;
+                
+                switch(column) {
+                    case 'score':
+                        aVal = parseInt(a.querySelector('.contact-score')?.dataset.score || '0');
+                        bVal = parseInt(b.querySelector('.contact-score')?.dataset.score || '0');
+                        break;
+                    case 'display_name':
+                        aVal = a.querySelector('.contact-name')?.textContent || '';
+                        bVal = b.querySelector('.contact-name')?.textContent || '';
+                        break;
+                    default:
+                        aVal = a.querySelector(`.contact-${column}`)?.textContent || '';
+                        bVal = b.querySelector(`.contact-${column}`)?.textContent || '';
+                }
+                
+                if (typeof aVal === 'string') {
+                    return isAsc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+                } else {
+                    return isAsc ? aVal - bVal : bVal - aVal;
+                }
+            });
+            
+            // 重新插入排序后的行
+            rows.forEach(row => tbody.appendChild(row));
+        }
+
+        // 全局函数：显示完整内容
+        window.showFullContent = function(element) {
+            const fullContent = element.dataset.fullContent || element.textContent;
+            const modal = document.getElementById('contentModal');
+            const modalBody = document.getElementById('modalBody');
+            const modalTitle = document.getElementById('modalTitle');
+
+            if (modal && modalBody && modalTitle) {
+                modalTitle.textContent = '消息详情';
+                modalBody.textContent = fullContent;
+                modal.style.display = 'block';
+            }
+        };
+
+        // 统一的DOMContentLoaded处理
+        document.addEventListener('DOMContentLoaded', function() {
+            // 消息详情弹窗处理
+            const modal = document.getElementById('contentModal');
+            if (modal) {
+                const closeBtn = modal.querySelector('.close');
+                if (closeBtn) {
+                    closeBtn.onclick = function() {
+                        modal.style.display = 'none';
+                    };
+                }
+                // 使用更安全的addEventListener替代全局onclick
+                window.addEventListener('click', function(event) {
+                    if (event.target === modal) {
+                        modal.style.display = 'none';
+                    }
+                });
+            }
+
+            // 监听操作复选框的变化
+            document.addEventListener('change', function(event) {
+                if (event.target.classList.contains('send-action')) {
+                    const checkbox = event.target;
+                    const messageId = checkbox.dataset.id;
+                    const operationType = checkbox.dataset.op;
+                    
+                    const messageRow = checkbox.closest('tr');
+                    const messageData = {
+                        id: messageId,
+                        sender_name: messageRow.querySelector('.sender').textContent.trim(),
+                        time: messageRow.querySelector('.time').textContent.trim(),
+                        talker_name: messageRow.querySelector('.talker').textContent.trim(),
+                        message_type: messageRow.querySelector('.msg-type').textContent.trim(),
+                        content: messageRow.querySelector('.content').dataset.fullContent || messageRow.querySelector('.content').textContent.trim()
+                    };
+                    
+                    if (checkbox.checked) {
+                        addToSendManagement(messageId, operationType, messageData);
+                        if (operationType === '顶') {
+                            fetch(`/api/messages/${messageId}/upvote`, { method: 'POST' }).catch(()=>{});
+                        } else if (operationType === '踩') {
+                            fetch(`/api/messages/${messageId}/downvote`, { method: 'POST' }).catch(()=>{});
+                        }
+                    } else {
+                        removeFromSendManagement(messageId, operationType);
+                    }
+                }
+                
+                if (event.target.classList.contains('contact-score')) {
+                    const checkbox = event.target;
+                    const operationType = checkbox.dataset.op;
+                    const senderUsername = checkbox.dataset.sender;
+                    
+                    if (checkbox.checked && senderUsername) {
+                        const scoreChange = operationType === '顶' ? 1 : -1;
+                        updateContactScore(senderUsername, scoreChange);
+                        
+                        const feedback = operationType === '顶' ? '+1分' : '-1分';
+                        showScoreFeedback(checkbox, feedback);
+                        
+                        setTimeout(() => {
+                            checkbox.checked = false;
+                        }, 1000);
+                    }
+                }
+            });
+
+            // 模块切换事件处理
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    tabs.forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.module-panel').forEach(panel => {
+                        panel.classList.remove('active');
+                    });
+                    
+                    this.classList.add('active');
+                    const targetModule = this.dataset.module;
+                    const targetPanel = document.getElementById(targetModule);
+                    if (targetPanel) {
+                        targetPanel.classList.add('active');
+                        if (targetModule === 'send-management') {
+                            updateSendManagementDisplay();
+                            updateSendStats();
+                        }
+                    }
+                });
+            });
+
+            // 批量生成回复
+            const generateAllBtn = document.getElementById('generateAllReplies');
+            if (generateAllBtn) {
+                generateAllBtn.addEventListener('click', function() {
+                    const pendingItems = sendManagementData.filter(item => item.status === 'pending');
+                    
+                    if (pendingItems.length === 0) {
+                        alert('没有待处理的消息');
+                        return;
+                    }
+                    
+                    this.textContent = '生成中...';
+                    this.disabled = true;
+                    
+                    Promise.all(pendingItems.map(item => 
+                        generateAIReply(item.messageData, item.operationType)
+                            .then(reply => {
+                                item.aiReply = reply;
+                                item.status = 'generated';
+                            })
+                    )).then(() => {
+                        updateSendManagementDisplay();
+                        updateSendStats();
+                        alert(`成功生成 ${pendingItems.length} 条回复`);
+                    }).catch(error => {
+                        console.error('批量生成失败:', error);
+                        alert('批量生成失败: ' + error.message);
+                    }).finally(() => {
+                        this.textContent = '🤖 批量生成回复';
+                        this.disabled = false;
+                    });
+                });
+            }
+            
+            // 批量发送
+            const sendAllBtn = document.getElementById('sendAllMessages');
+            if (sendAllBtn) {
+                sendAllBtn.addEventListener('click', function() {
+                    const readyItems = sendManagementData.filter(item => 
+                        item.status === 'generated' && item.aiReply
+                    );
+                    
+                    if (readyItems.length === 0) {
+                        alert('没有可发送的消息（请先生成AI回复）');
+                        return;
+                    }
+                    
+                    if (!confirm(`确定要发送 ${readyItems.length} 条消息吗？`)) {
+                        return;
+                    }
+                    
+                    this.textContent = '发送中...';
+                    this.disabled = true;
+                    
+                    Promise.all(readyItems.map(item => sendToN8nWorkflow(item)
+                        .then(() => {
+                            item.status = 'sent';
+                        })
+                    )).then(() => {
+                        updateSendManagementDisplay();
+                        updateSendStats();
+                        alert(`成功发送 ${readyItems.length} 条消息`);
+                    }).catch(error => {
+                        console.error('批量发送失败:', error);
+                        alert('批量发送失败: ' + error.message);
+                    }).finally(() => {
+                        this.textContent = '📤 批量发送';
+                        this.disabled = false;
+                    });
+                });
+            }
+        });
+
+        // 媒体相关的全局函数
+        window.showImagePreview = function(imagePath) {
+            console.log('显示图片预览:', imagePath);
+        };
+
+        window.playVideo = function(videoPath) {
+            console.log('播放视频:', videoPath);
+        };
+
+        window.downloadFile = function(filePath) {
+            console.log('下载文件:', filePath);
+        };
+
+        window.openLink = function(url) {
+            if (url && url !== '#') {
+                window.open(url, '_blank');
+            }
+        };
+        
+        // 发送管理相关功能
+        let sendManagementData = [];
+        
+        // 添加到发送管理列表
+        function addToSendManagement(messageId, operationType, messageData) {
+            // 检查是否已存在
+            const existingIndex = sendManagementData.findIndex(item => 
+                item.messageId === messageId && item.operationType === operationType
+            );
+            
+            if (existingIndex === -1) {
+                const sendItem = {
+                    messageId: messageId,
+                    operationType: operationType,
+                    messageData: messageData,
+                    aiReply: '',
+                    status: 'pending',
+                    remarks: '',
+                    addedTime: new Date()
+                };
+                sendManagementData.push(sendItem);
+            }
+            
+            updateSendManagementDisplay();
+            updateSendStats();
+        }
+        
+        // 从发送管理列表移除
+        function removeFromSendManagement(messageId, operationType) {
+            sendManagementData = sendManagementData.filter(item => 
+                !(item.messageId === messageId && item.operationType === operationType)
+            );
+            updateSendManagementDisplay();
+            updateSendStats();
+        }
+        
+        // 更新发送管理显示
+        function updateSendManagementDisplay() {
+            const tableBody = document.getElementById('sendTableBody');
+            if (!tableBody) return;
+            
+            if (sendManagementData.length === 0) {
+                tableBody.innerHTML = `
+                    <tr class="empty-state">
+                        <td colspan="10" style="text-align: center; padding: 40px; color: #9ca3af;">
+                            暂无待发送消息，请在消息列表中选择"约"、"问"或"答"标记
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+            
+            const rows = sendManagementData.map(item => {
+                const msg = item.messageData;
+                const statusClass = item.status === 'sent' ? 'success' : 
+                                   item.status === 'generated' ? 'warning' : 'pending';
+                
+                return `
+                    <tr data-message-id="${item.messageId}" data-operation="${item.operationType}">
+                        <td class="sender">${msg.sender_name}</td>
+                        <td class="time">${msg.time}</td>
+                        <td class="talker">${msg.talker_name}</td>
+                        <td class="msg-type">${msg.message_type}</td>
+                        <td class="content clickable" onclick="showFullContent(this)" data-full-content="${msg.content.replace(/"/g, '&quot;')}" title="点击查看完整内容">${msg.content.length > 50 ? msg.content.substring(0, 50) + '...' : msg.content}</td>
+                        <td class="operation-type">
+                            <span class="op-badge op-${item.operationType}">${item.operationType}</span>
+                        </td>
+                        <td class="reply">
+                            <div class="reply-container">
+                                <div class="reply-display ${item.aiReply ? '' : 'empty'}" onclick="editReply('${item.messageId}', '${item.operationType}')" title="点击编辑回复">
+                                    ${item.aiReply ? (item.aiReply.length > 80 ? item.aiReply.substring(0, 80) + '...' : item.aiReply) : '点击生成AI回复'}
+                                </div>
+                                <textarea class="reply-textarea hidden" onblur="saveReply('${item.messageId}', '${item.operationType}', this.value)" placeholder="输入回复内容...">${item.aiReply || ''}</textarea>
+                            </div>
+                        </td>
+                        <td class="remarks">
+                            <input type="text" class="remarks-input" value="${item.remarks}" placeholder="备注">
+                        </td>
+                        <td class="status">
+                            <span class="status-badge ${statusClass}">${getStatusText(item.status)}</span>
+                        </td>
+                        <td class="actions">
+                            <button class="action-btn small" onclick="generateSingleReply('${item.messageId}', '${item.operationType}')">🤖 生成</button>
+                            <button class="action-btn small success" onclick="sendSingleMessage('${item.messageId}', '${item.operationType}')">📤 发送</button>
+                            <button class="action-btn small danger" onclick="removeSendItem('${item.messageId}', '${item.operationType}')">🗑️ 删除</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+            
+            tableBody.innerHTML = rows;
+        }
+        
+        // 获取状态文本
+        function getStatusText(status) {
+            const statusMap = {
+                'pending': '待处理',
+                'generated': '已生成',
+                'sent': '已发送'
+            };
+            return statusMap[status] || status;
+        }
+        
+        // 更新发送统计
+        function updateSendStats() {
+            const pendingCount = sendManagementData.filter(item => item.status === 'pending').length;
+            const meetingCount = sendManagementData.filter(item => item.operationType === '约').length;
+            const questionCount = sendManagementData.filter(item => item.operationType === '问').length;
+            const answerCount = sendManagementData.filter(item => item.operationType === '答').length;
+            
+            document.getElementById('pendingCount').textContent = `待发送: ${pendingCount}`;
+            document.getElementById('meetingCount').textContent = `会议约定: ${meetingCount}`;
+            document.getElementById('questionCount').textContent = `分析提问: ${questionCount}`;
+            document.getElementById('answerCount').textContent = `回答消息: ${answerCount}`;
+        }
+        
+        // 生成单个回复
+        window.generateSingleReply = function(messageId, operationType) {
+            const item = sendManagementData.find(item => 
+                item.messageId === messageId && item.operationType === operationType
+            );
+            
+            if (!item) return;
+            
+            // 这里调用AI API生成回复
+            generateAIReply(item.messageData, operationType).then(reply => {
+                item.aiReply = reply;
+                item.status = 'generated';
+                updateSendManagementDisplay();
+                updateSendStats();
+            }).catch(error => {
+                console.error('生成回复失败:', error);
+                alert('生成回复失败: ' + error.message);
+            });
+        };
+        
+        // 发送单个消息
+        window.sendSingleMessage = function(messageId, operationType) {
+            const item = sendManagementData.find(item => 
+                item.messageId === messageId && item.operationType === operationType
+            );
+            
+            if (!item || !item.aiReply) {
+                alert('请先生成AI回复');
+                return;
+            }
+            
+            // 发送到n8n工作流
+            sendToN8nWorkflow(item).then(() => {
+                item.status = 'sent';
+                updateSendManagementDisplay();
+                updateSendStats();
+                alert('消息发送成功');
+            }).catch(error => {
+                console.error('发送消息失败:', error);
+                alert('发送消息失败: ' + error.message);
+            });
+        };
+        
+        // 删除发送项
+        window.removeSendItem = function(messageId, operationType) {
+            if (confirm('确定要删除这条发送项吗？')) {
+                removeFromSendManagement(messageId, operationType);
+            }
+        };
+        
+        // 编辑回复
+        window.editReply = function(messageId, operationType) {
+            const item = sendManagementData.find(item => 
+                item.messageId === messageId && item.operationType === operationType
+            );
+            
+            if (!item) return;
+            
+            // 找到对应的DOM元素
+            const row = document.querySelector(`tr[data-message-id="${messageId}"][data-operation="${operationType}"]`);
+            if (!row) return;
+            
+            const replyDisplay = row.querySelector('.reply-display');
+            const replyTextarea = row.querySelector('.reply-textarea');
+            
+            if (replyDisplay && replyTextarea) {
+                replyDisplay.classList.add('hidden');
+                replyTextarea.classList.remove('hidden');
+                replyTextarea.focus();
+            }
+        };
+        
+        // 保存回复
+        window.saveReply = function(messageId, operationType, newValue) {
+            const item = sendManagementData.find(item => 
+                item.messageId === messageId && item.operationType === operationType
+            );
+            
+            if (!item) return;
+            
+            // 更新数据
+            item.aiReply = newValue;
+            if (newValue && item.status === 'pending') {
+                item.status = 'generated';
+            }
+            
+            // 重新显示
+            updateSendManagementDisplay();
+            updateSendStats();
+        };
+        
+        // AI回复生成函数
+        async function generateAIReply(messageData, operationType) {
+            const promptTemplates = {
+                '约': {
+                    system: '你是一名专业的商务助理，擅长安排会议和约见。请根据消息内容生成合适的约见回复。',
+                    user: `请为以下消息生成约见回复：
+
+发送人：${messageData.sender_name}
+内容：${messageData.content}
+
+请生成一个礼貌、专业的约见回复。`
+                },
+                '问': {
+                    system: '你是一名金融分析专家，擅长回答投资和市场相关问题。请根据消息内容生成专业的分析回复。',
+                    user: `请为以下消息生成分析回复：
+
+发送人：${messageData.sender_name}
+内容：${messageData.content}
+
+请提供专业、详细的分析回复。`
+                },
+                '答': {
+                    system: '你是一名专业的客服助理，擅长回答各种问题。请根据消息内容生成合适的回复。',
+                    user: `请为以下消息生成回复：
+
+发送人：${messageData.sender_name}
+内容：${messageData.content}
+
+请生成一个有帮助、友好的回复。`
+                }
+            };
+            
+            const template = promptTemplates[operationType] || promptTemplates['答'];
+            
+            // 这里应该调用实际的AI API，暂时返回模拟回复
+            return new Promise((resolve) => {
+                setTimeout(() => {
+                    let reply = '';
+                    if (operationType === '约') {
+                        reply = `感谢您的消息。关于您提到的事项，我认为我们可以安排一个时间进行详细讨论。建议我们在本周内找个合适的时间面谈，这样可以更好地了解具体需求和合作可能性。请告知您方便的时间，我会尽快安排。期待与您的交流。`;
+                    } else if (operationType === '问') {
+                        reply = `针对您的问题，从市场分析角度来看，这确实是一个值得深入研究的话题。基于当前的行业趋势和数据表现，我建议从以下几个维度来考虑：1）基本面分析显示该领域仍有增长潜力；2）技术指标方面需要关注关键支撑位；3）政策环境整体偏向支持。建议保持谨慎乐观的态度，做好风险控制的同时把握机会。`;
+                    } else {
+                        reply = `收到您的消息，我理解您的关切。基于目前的情况，我认为这个问题需要综合考虑多个因素。建议我们采取稳健的策略，既要把握市场机会，也要注意风险控制。如果您需要更详细的分析或有其他问题，随时可以进一步交流。`;
+                    }
+                    resolve(reply);
+                }, 1000);
+            });
+        }
+        
+        // 发送到n8n工作流
+        async function sendToN8nWorkflow(sendItem) {
+            const webhookUrl = 'http://localhost:5678/webhook/wechat-response'; // n8n webhook地址
+            
+            const payload = {
+                messageId: sendItem.messageId,
+                operationType: sendItem.operationType,
+                originalMessage: {
+                    sender: sendItem.messageData.sender_name,
+                    content: sendItem.messageData.content,
+                    time: sendItem.messageData.time,
+                    talker: sendItem.messageData.talker_name
+                },
+                aiReply: sendItem.aiReply,
+                remarks: sendItem.remarks,
+                timestamp: new Date().toISOString()
+            };
+            
+            try {
+                const response = await fetch(webhookUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                return await response.json();
+            } catch (error) {
+                console.error('发送到n8n失败:', error);
+                throw error;
+            }
+        }
+        
+        
+        // 发送管理功能
+        let sendQueue = [];
+        
+        function updateOperationType(checkbox, messageId) {
+            if (checkbox.checked) {
+                const operationType = checkbox.value;
+                const row = checkbox.closest('tr');
+                const messageData = extractMessageData(row, messageId, operationType);
+                
+                // 添加到发送队列
+                addToSendQueue(messageData);
+                
+                // 取消其他选项
+                const otherCheckboxes = row.querySelectorAll('.op-buttons input[type="checkbox"]');
+                otherCheckboxes.forEach(cb => {
+                    if (cb !== checkbox) cb.checked = false;
+                });
+            } else {
+                // 从发送队列移除
+                removeFromSendQueue(messageId);
+            }
+            
+            updateSendStats();
+        }
+        
+        function extractMessageData(row, messageId, operationType) {
+            const cells = row.querySelectorAll('td');
+            return {
+                id: messageId,
+                sender_name: cells[1]?.textContent || '',
+                time: cells[2]?.textContent || '',
+                talker_name: cells[3]?.textContent || '',
+                message_type: cells[4]?.textContent || '',
+                content: cells[5]?.textContent || '',
+                chat_id: row?.dataset?.chatId || '',
+                operation_type: operationType,
+                ai_reply: '',
+                remarks: '',
+                status: 'pending',
+                created_at: new Date().toISOString()
+            };
+        
+        // 操作复选框事件处理
+        document.addEventListener('DOMContentLoaded', function() {
+            // 监听操作复选框的变化
+            document.addEventListener('change', function(event) {
+                if (event.target.classList.contains('send-action')) {
+                    const checkbox = event.target;
+                    const messageId = checkbox.dataset.id;
+                    const operationType = checkbox.dataset.op;
+                    
+                    // 获取消息数据
+                    const messageRow = checkbox.closest('tr');
+                    const messageData = {
+                        id: messageId,
+                        sender_name: messageRow.querySelector('.sender').textContent.trim(),
+                        time: messageRow.querySelector('.time').textContent.trim(),
+                        talker_name: messageRow.querySelector('.talker').textContent.trim(),
+                        message_type: messageRow.querySelector('.msg-type').textContent.trim(),
+                        content: messageRow.querySelector('.content').dataset.fullContent || messageRow.querySelector('.content').textContent.trim()
+                    };
+                    
+                    console.log('操作选择:', {
+                        checked: checkbox.checked,
+                        messageId: messageId,
+                        operationType: operationType,
+                        messageData: messageData
+                    });
+                    
+                    if (checkbox.checked) {
+                        addToSendManagement(messageId, operationType, messageData);
+                        console.log('已添加到发送管理:', sendManagementData.length);
+                        if (operationType === '顶') {
+                            fetch(`/api/messages/${messageId}/upvote`, { method: 'POST' }).catch(()=>{});
+                        } else if (operationType === '踩') {
+                            fetch(`/api/messages/${messageId}/downvote`, { method: 'POST' }).catch(()=>{});
+                        }
+                    } else {
+                        removeFromSendManagement(messageId, operationType);
+                        console.log('已从发送管理移除:', sendManagementData.length);
+                    }
+                }
+                
+                // 处理联系人评分操作
+                if (event.target.classList.contains('contact-score')) {
+                    const checkbox = event.target;
+                    const operationType = checkbox.dataset.op;
+                    const senderUsername = checkbox.dataset.sender;
+                    
+                    if (checkbox.checked && senderUsername) {
+                        const scoreChange = operationType === '顶' ? 1 : -1;
+                        updateContactScore(senderUsername, scoreChange);
+                        
+                        // 显示反馈
+                        const feedback = operationType === '顶' ? '+1分' : '-1分';
+                        showScoreFeedback(checkbox, feedback);
+                        
+                        // 自动取消勾选
+                        setTimeout(() => {
+                            checkbox.checked = false;
+                        }, 1000);
+                    }
+                }
+            });
+            
+            // 模块切换事件处理
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => {
+                tab.addEventListener('click', function() {
+                    // 移除所有活动标签
+                    tabs.forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.module-panel').forEach(panel => {
+                        panel.classList.remove('active');
+                    });
+                    
+                    // 激活当前标签
+                    this.classList.add('active');
+                    const targetModule = this.dataset.module;
+                    const targetPanel = document.getElementById(targetModule);
+                    if (targetPanel) {
+                        targetPanel.classList.add('active');
+                        
+                        // 如果切换到发送管理，刷新显示
+                        if (targetModule === 'send-management') {
+                            console.log('切换到发送管理，当前数据:', sendManagementData);
+                            updateSendManagementDisplay();
+                            updateSendStats();
+                        }
+                    }
+                });
+            });
+        });
+        
+        // 发送管理数据存储
+        let sendManagementData = [];
+        
+        // 添加到发送管理
+        function addToSendManagement(messageId, operationType, messageData) {
+            // 检查是否已存在相同的消息和操作类型
+            const existingIndex = sendManagementData.findIndex(item => 
+                item.id === messageId && item.operation === operationType
+            );
+            
+            if (existingIndex === -1) {
+                sendManagementData.push({
+                    id: messageId,
+                    operation: operationType,
+                    data: messageData,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        }
+        
+        // 从发送管理移除
+        function removeFromSendManagement(messageId, operationType) {
+            sendManagementData = sendManagementData.filter(item => 
+                !(item.id === messageId && item.operation === operationType)
+            );
+        }
+        
+        // 更新发送管理显示
+        function updateSendManagementDisplay() {
+            const container = document.getElementById('send-management-list');
+            if (!container) {
+                console.error('发送管理容器未找到');
+                return;
+            }
+            
+            if (sendManagementData.length === 0) {
+                container.innerHTML = '<div class="no-data">暂无选择的消息</div>';
+                return;
+            }
+            
+            let html = '<div class="send-list">';
+            sendManagementData.forEach((item, index) => {
+                html += `
+                    <div class="send-item" data-index="${index}">
+                        <div class="item-header">
+                            <span class="operation-type op-${item.operation}">${item.operation}</span>
+                            <span class="sender">${item.data.sender_name}</span>
+                            <span class="time">${item.data.time}</span>
+                            <button class="remove-btn" onclick="removeSendItem(${index})">×</button>
+                        </div>
+                        <div class="item-content">${item.data.content}</div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            
+            container.innerHTML = html;
+        }
+
+        // 移除发送项目
+        function removeSendItem(index) {
+            if (index >= 0 && index < sendManagementData.length) {
+                const item = sendManagementData[index];
+                
+                // 取消对应的复选框
+                const checkbox = document.querySelector(`input[data-id="${item.id}"][data-op="${item.operation}"]`);
+                if (checkbox) {
+                    checkbox.checked = false;
+                }
+                
+                // 从数据中移除
+                sendManagementData.splice(index, 1);
+                
+                // 更新显示
+                updateSendManagementDisplay();
+                updateSendStats();
+            }
+        }
+
+        // 更新发送统计
+        function updateSendStats() {
+            const stats = {
+                '约': sendManagementData.filter(item => item.operation === '约').length,
+                '问': sendManagementData.filter(item => item.operation === '问').length,
+                '答': sendManagementData.filter(item => item.operation === '答').length,
+                '顶': sendManagementData.filter(item => item.operation === '顶').length,
+                '踩': sendManagementData.filter(item => item.operation === '踩').length
+            };
+            
+            const statsContainer = document.getElementById('send-stats');
+            if (statsContainer) {
+                let html = '<div class="stats-grid">';
+                Object.entries(stats).forEach(([op, count]) => {
+                    html += `<div class="stat-item">
+                        <span class="stat-op">${op}</span>
+                        <span class="stat-count">${count}</span>
+                    </div>`;
+                });
+                html += '</div>';
+                statsContainer.innerHTML = html;
+            }
+        }
+
+        // ========== 联系人管理：接入后端 /api/contacts ==========
+        async function loadContacts() {
+            try {
+                const res = await fetch('/api/contacts');
+                const contacts = await res.json();
+                const tbody = document.querySelector('#contactTable tbody');
+                if (!tbody) return;
+                tbody.innerHTML = '';
+                const frag = document.createDocumentFragment();
+                contacts.forEach(c => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td class="contact-name contact-display_name">${c.name || c.alias || c.id}</td>
+                        <td class="contact-username">${c.id}</td>
+                        <td class="contact-nickname">${c.name || ''}</td>
+                        <td class="contact-remark">${c.alias || ''}</td>
+                        <td class="contact-source">contact</td>
+                        <td class="contact-score ${c.rating>=70?'score-high':c.rating>=40?'score-medium':'score-low'}" data-score="${c.rating}">${c.rating}</td>
+                        <td>
+                            <div class="contact-actions">
+                                <button class="score-btn score-up" onclick="updateContactScore('${c.id}', 1)">+1</button>
+                                <button class="score-btn score-down" onclick="updateContactScore('${c.id}', -1)">-1</button>
+                                <button class="score-btn score-reset" onclick="updateContactScore('${c.id}', ${50 - (c.rating||50)})">重置</button>
+                            </div>
+                        </td>
+                    `;
+                    frag.appendChild(tr);
+                });
+                tbody.appendChild(frag);
+                // 更新统计角标
+                const high = contacts.filter(c => (c.rating||50) >= 70).length;
+                const med = contacts.filter(c => (c.rating||50) >= 40 && (c.rating||50) < 70).length;
+                const low = contacts.filter(c => (c.rating||50) < 40).length;
+                const header = document.querySelector('.contact-header .contact-stats');
+                if (header) header.innerHTML = `<span class="stat-item">高分 (≥70): ${high}</span><span class="stat-item">中分 (40-69): ${med}</span><span class="stat-item">低分 (<40): ${low}</span>`;
+                const title = document.querySelector('.contact-header h2');
+                if (title) title.textContent = `👥 联系人管理 (${contacts.length}人)`;
+            } catch (e) {
+                console.error('加载联系人失败:', e);
+            }
+        }
+        
+        // 显示评分反馈
+        function showScoreFeedback(element, text) {
+            const feedback = document.createElement('div');
+            feedback.textContent = text;
+            feedback.style.cssText = `
+                position: absolute;
+                background: #4ade80;
+                color: white;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 10px;
+                z-index: 1000;
+                pointer-events: none;
+                animation: fadeInOut 1s ease-in-out;
+            `;
+            
+            const rect = element.getBoundingClientRect();
+            feedback.style.left = (rect.left + rect.width / 2 - 15) + 'px';
+            feedback.style.top = (rect.top - 25) + 'px';
+            
+            document.body.appendChild(feedback);
+            
+            setTimeout(() => {
+                document.body.removeChild(feedback);
+            }, 1000);
+        }
+        
+        // 更新联系人评分（本地存储）
+        async function updateContactScore(username, delta) {
+            try {
+                const res = await fetch(`/api/contacts/${encodeURIComponent(username)}/rating?delta=${delta}`, { method: 'POST' });
+                const data = await res.json();
+                console.log('联系人评分更新:', data);
+                // 刷新联系人列表
+                await loadContacts();
+            } catch (e) {
+                console.error('更新联系人评分失败:', e);
+            }
+        }
+        }
+        
+        function addToSendQueue(messageData) {
+            const existingIndex = sendQueue.findIndex(item => item.id === messageData.id);
+            if (existingIndex >= 0) {
+                sendQueue[existingIndex] = messageData;
+            } else {
+                sendQueue.push(messageData);
+            }
+            
+            // 保存到本地存储
+            localStorage.setItem('sendQueue', JSON.stringify(sendQueue));
+            updateSendManagementTable();
+        }
+        
+        function removeFromSendQueue(messageId) {
+            sendQueue = sendQueue.filter(item => item.id !== messageId);
+            localStorage.setItem('sendQueue', JSON.stringify(sendQueue));
+            updateSendManagementTable();
+        }
+        
+        function updateSendStats() {
+            const statsElement = document.getElementById('sendStats');
+            if (statsElement) {
+                const pendingCount = sendQueue.filter(item => item.status === 'pending').length;
+                const sentCount = sendQueue.filter(item => item.status === 'sent').length;
+                statsElement.textContent = `待发送: ${pendingCount}, 已发送: ${sentCount}`;
+            }
+        }
+        
+        function updateSendManagementTable() {
+            const sendTableBody = document.getElementById('sendTableBody');
+            if (!sendTableBody) return;
+            
+            sendTableBody.innerHTML = '';
+            
+            if (sendQueue.length === 0) {
+                sendTableBody.innerHTML = `
+                    <tr class="empty-state">
+                        <td colspan="10" style="text-align: center; padding: 40px; color: #9ca3af;">
+                            暂无待发送消息，请在消息列表中选择"约"、"问"或"答"标记
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+            
+            sendQueue.forEach((item, index) => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td class="sender">${item.sender_name}</td>
+                    <td class="time">${item.time}</td>
+                    <td class="talker">${item.talker_name}</td>
+                    <td class="msg-type">${item.message_type}</td>
+                    <td class="content" title="${item.content}">${item.content.substring(0, 50)}...</td>
+                    <td class="operation-type">
+                        <span class="operation-badge ${getOperationClass(item.operation_type)}">
+                            ${getOperationText(item.operation_type)}
+                        </span>
+                    </td>
+                    <td class="reply">
+                        <div class="reply-cell" id="reply-${index}">
+                            ${item.ai_reply || '未生成'}
+                        </div>
+                    </td>
+                    <td class="remarks">
+                        <input type="text" class="remarks-input" value="${item.remarks}" 
+                               onchange="updateRemarks(${index}, this.value)" placeholder="添加备注">
+                    </td>
+                    <td class="status">
+                        <span class="status-badge ${item.status}">${getStatusText(item.status)}</span>
+                    </td>
+                    <td class="actions">
+                        <div class="action-buttons">
+                            <button class="mini-btn generate" onclick="generateSingleReplyByIndex(${index})" 
+                                    ${item.ai_reply ? 'title="重新生成"' : 'title="生成回复"'}>
+                                ${item.ai_reply ? '🔄' : '🤖'}
+                            </button>
+                            <button class="mini-btn send" onclick="sendToN8N(${index})" 
+                                    ${!item.ai_reply ? 'disabled' : ''} title="发送到n8n">
+                                📤
+                            </button>
+                        </div>
+                    </td>
+                `;
+                sendTableBody.appendChild(row);
+            });
+        }
+        
+        function getOperationClass(operationType) {
+            const classes = {
+                '约': 'operation-yue',
+                '问': 'operation-wen', 
+                '答': 'operation-da',
+                '顶': 'operation-ding',
+                '踩': 'operation-cai'
+            };
+            return classes[operationType] || '';
+        }
+        
+        function getOperationText(operationType) {
+            const texts = {
+                '约': '约',
+                '问': '问',
+                '答': '答', 
+                '顶': '👍',
+                '踩': '👎'
+            };
+            return texts[operationType] || operationType;
+        }
+        
+        function getStatusText(status) {
+            const texts = {
+                'pending': '待处理',
+                'generated': '已生成',
+                'sent': '已发送',
+                'error': '错误'
+            };
+            return texts[status] || status;
+        }
+        
+        function updateRemarks(index, value) {
+            if (sendQueue[index]) {
+                sendQueue[index].remarks = value;
+                localStorage.setItem('sendQueue', JSON.stringify(sendQueue));
+            }
+        }
+        
+        // 页面加载时恢复发送队列 - 已合并到统一的DOMContentLoaded中
+        
+        // 批量生成AI回复
+        async function generateBatchReplies() {
+            const pendingItems = sendQueue.filter(item => item.status === 'pending' && !item.ai_reply);
+            
+            if (pendingItems.length === 0) {
+                alert('没有需要生成回复的消息');
+                return;
+            }
+            
+            const button = event.target;
+            button.disabled = true;
+            button.textContent = '生成中...';
+            
+            try {
+                for (const item of pendingItems) {
+                    await generateSingleReplyByIndex(sendQueue.indexOf(item));
+                    await new Promise(resolve => setTimeout(resolve, 1000)); // 间隔1秒
+                }
+            } finally {
+                button.disabled = false;
+                button.textContent = '批量生成回复';
+            }
+        }
+        
+        // 生成单条AI回复
+        async function generateSingleReplyByIndex(index) {
+            const item = sendQueue[index];
+            if (!item) return;
+            const prompts = {
+                '约': '请为这条关于约见面的消息生成一个礼貌、专业的回复。',
+                '问': '请为这条询问消息生成一个详细、有帮助的回复。',
+                '答': '请为这条需要回答的消息生成一个准确、清晰的回复。',
+                '顶': '请对这条消息表示赞同并给出支持性回复。',
+                '踩': '请对这条消息提出建设性的不同观点。'
+            };
+            const prompt = prompts[item.operation_type] || '请为这条消息生成合适的回复。';
+            try {
+                const resp = await fetch('/api/ai/suggest-replies', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message_ids: [parseInt(item.id || item.messageId || 0)], prompt_hint: prompt })
+                });
+                const data = await resp.json();
+                const first = data?.result?.suggestions?.[0]?.text || data?.result?.suggestions?.[0] || '';
+                if (first) {
+                    item.ai_reply = first;
+                    item.status = 'generated';
+                    localStorage.setItem('sendQueue', JSON.stringify(sendQueue));
+                    updateSendManagementTable();
+                    updateSendStats();
+                } else {
+                    alert('未获取到候选回复');
+                }
+            } catch (error) {
+                console.error('生成AI回复失败:', error);
+                alert('生成AI回复失败，请重试');
+            }
+        }
+        
+        // 发送到n8n工作流
+        async function sendToN8N(index) {
+            const item = sendQueue[index];
+            if (!item || !item.ai_reply) {
+                alert('请先生成AI回复');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/send_to_n8n', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(item)
+                });
+                
+                if (response.ok) {
+                    item.status = 'sent';
+                    item.sent_at = new Date().toISOString();
+                    localStorage.setItem('sendQueue', JSON.stringify(sendQueue));
+                    updateSendManagementTable();
+                    updateSendStats();
+                    alert('消息已发送到n8n工作流');
+                } else {
+                    alert('发送失败，请重试');
+                }
+            } catch (error) {
+                console.error('发送到n8n失败:', error);
+                alert('发送失败，请检查网络连接');
+            }
+        }
+
+        // ========== n8n 配置读取与连通性测试 ==========
+        async function loadN8NConfig() {
+            try {
+                const res = await fetch('/api/config');
+                const cfg = await res.json();
+                document.getElementById('n8nReply').value = cfg?.n8n?.reply || '';
+                document.getElementById('n8nSummary').value = cfg?.n8n?.summary || '';
+                document.getElementById('n8nContact').value = cfg?.n8n?.contact || '';
+                document.getElementById('n8nSend').value = cfg?.n8n?.send || '';
+                document.getElementById('n8nAuth').value = cfg?.n8n?.auth ? '*** 已配置 ***' : '';
+            } catch (e) {
+                console.error('加载后端配置失败:', e);
+            }
+        }
+
+        async function testN8NConnectivity() {
+            try {
+                const res = await fetch('/api/config/test');
+                const data = await res.json();
+                alert('连通性：\n' + JSON.stringify(data, null, 2));
+            } catch (e) {
+                alert('测试失败：' + e);
+            }
+        }
+
+        function toggleVisibility(id) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.type = el.type === 'password' ? 'text' : 'password';
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            loadN8NConfig();
+        });
+
+        // 为发送管理（sendManagementData）提供的封装 API
+        async function generateSingleReply(messageId, operationType) {
+            try {
+                const item = sendManagementData.find(it => it.messageId === String(messageId) && it.operationType === operationType) ||
+                              sendManagementData.find(it => it.id === String(messageId) && it.operation === operationType);
+                if (!item) return alert('未找到待生成项');
+                const prompts = { '约': '请为这条关于约见面的消息生成一个礼貌、专业的回复。', '问': '请为这条询问消息生成一个详细、有帮助的回复。', '答': '请为这条需要回答的消息生成一个准确、清晰的回复。', '顶': '请对这条消息表示赞同并给出支持性回复。', '踩': '请对这条消息提出建设性的不同观点。' };
+                const prompt = prompts[operationType] || '请为这条消息生成合适的回复。';
+                const mid = parseInt(messageId);
+                const resp = await fetch('/api/ai/suggest-replies', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ message_ids:[mid], prompt_hint: prompt })});
+                const data = await resp.json();
+                const first = data?.result?.suggestions?.[0]?.text || data?.result?.suggestions?.[0] || '';
+                if (first) {
+                    if (item.aiReply !== undefined) item.aiReply = first; // 结构1
+                    if (item.data) item.data.ai_reply = first;            // 结构2
+                    item.status = 'generated';
+                    if (typeof updateSendManagementDisplay === 'function') updateSendManagementDisplay();
+                    if (typeof updateSendStats === 'function') updateSendStats();
+                } else {
+                    alert('未获取到候选回复');
+                }
+            } catch (e) {
+                console.error('生成AI回复失败:', e);
+                alert('生成AI回复失败，请重试');
+            }
+        }
+
+        async function sendSingleMessage(messageId, operationType) {
+            try {
+                const item = sendManagementData.find(it => it.messageId === String(messageId) && it.operationType === operationType) ||
+                              sendManagementData.find(it => it.id === String(messageId) && it.operation === operationType);
+                if (!item) return alert('未找到待发送项');
+                const aiText = item.aiReply || (item.data && item.data.ai_reply) || '';
+                if (!aiText) return alert('请先生成AI回复');
+                const chatId = (item.messageData && item.messageData.chat_id) || (item.data && item.data.chat_id) || '';
+                const target = chatId || (item.messageData && item.messageData.talker_name) || (item.data && item.data.talker_name) || '';
+                const resp = await fetch('/api/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ items: [{ target, text: aiText }] })});
+                const data = await resp.json();
+                if (data?.status || data?.result) {
+                    item.status = 'sent';
+                    if (typeof updateSendManagementDisplay === 'function') updateSendManagementDisplay();
+                    if (typeof updateSendStats === 'function') updateSendStats();
+                } else {
+                    alert('发送失败，请检查 n8n 配置');
+                }
+            } catch (e) {
+                console.error('发送失败:', e);
+                alert('发送失败，请检查网络连接');
+            }
+        }
+        
+        // ================== 接入后端 API：加载消息并填充表格 ==================
+        async function apiListMessages(page=1, size=5000, q='') {
+            try {
+                const params = new URLSearchParams({ page: String(page), size: String(size) });
+                if (q) params.set('q', q);
+                const res = await fetch(`/api/messages?${params.toString()}`);
+                if (!res.ok) throw new Error('加载消息失败');
+                return await res.json();
+            } catch (e) {
+                console.error('apiListMessages error:', e);
+                return { total: 0, items: [] };
+            }
+        }
+
+        function mapMsgType(t) {
+            if (!t) return '文字';
+            const s = String(t).toLowerCase();
+            if (s.includes('text') || s === '1') return '文字';
+            if (s.includes('image') || s === '3') return '图片';
+            if (s.includes('link')) return '链接';
+            if (s.includes('video')) return '视频';
+            if (s.includes('voice') || s.includes('audio')) return '语音';
+            return '文字';
+        }
+
+        function buildOperationButtons(id) {
+            const ops = ['约','问','答','顶','踩'];
+            const wrapper = document.createElement('div');
+            wrapper.className = 'op-buttons';
+            ops.forEach(op => {
+                const label = document.createElement('label');
+                label.dataset.op = op;
+                const span = document.createElement('span');
+                span.className = 'op-text';
+                span.textContent = op;
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.className = 'op-checkbox send-action';
+                input.dataset.id = String(id);
+                input.dataset.op = op;
+                label.appendChild(span);
+                label.appendChild(input);
+                wrapper.appendChild(label);
+            });
+            return wrapper;
+        }
+
+        function clearTable() {
+            const tbody = document.querySelector('#messageTable tbody');
+            if (tbody) tbody.innerHTML = '';
+        }
+
+        function appendRows(items) {
+            const tbody = document.querySelector('#messageTable tbody');
+            if (!tbody) return;
+            const frag = document.createDocumentFragment();
+            const senders = new Set();
+            items.forEach(m => {
+                const tr = document.createElement('tr');
+                const typeLabel = mapMsgType(m.type);
+                const sender = m.sender_name || m.sender_id || '';
+                tr.dataset.messageType = typeLabel;
+                tr.dataset.contentType = '';
+                tr.dataset.isSpam = 'false';
+                tr.dataset.sender = sender;
+                tr.dataset.importance = String(m.importance_score || 0);
+                tr.dataset.chatId = m.chat_id || '';
+
+                const tdSender = document.createElement('td'); tdSender.className = 'sender'; tdSender.textContent = sender;
+                const tdTime = document.createElement('td'); tdTime.className = 'time'; tdTime.textContent = m.timestamp || '';
+                const tdTalker = document.createElement('td'); tdTalker.className = 'talker'; tdTalker.textContent = m.talker_name || m.chat_id || '';
+                const tdType = document.createElement('td'); tdType.className = 'msg-type'; tdType.dataset.type = typeLabel; tdType.textContent = typeLabel;
+                const tdCtype = document.createElement('td'); tdCtype.className = 'content-type'; tdCtype.textContent = '';
+                const tdKey = document.createElement('td'); tdKey.className = 'key-info'; tdKey.textContent = '';
+                const tdContent = document.createElement('td'); tdContent.className = 'content'; tdContent.textContent = m.content_text || ''; tdContent.dataset.fullContent = m.content_text || '';
+                const tdOps = document.createElement('td'); tdOps.className = 'operations'; tdOps.appendChild(buildOperationButtons(m.id));
+
+                tr.appendChild(tdSender);
+                tr.appendChild(tdTime);
+                tr.appendChild(tdTalker);
+                tr.appendChild(tdType);
+                tr.appendChild(tdCtype);
+                tr.appendChild(tdKey);
+                tr.appendChild(tdContent);
+                tr.appendChild(tdOps);
+                frag.appendChild(tr);
+                if (sender) senders.add(sender);
+            });
+            tbody.appendChild(frag);
+            const senderFilter = document.getElementById('senderFilter');
+            if (senderFilter && senderFilter.children.length <= 1) {
+                [...senders].sort().forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s; opt.textContent = s;
+                    senderFilter.appendChild(opt);
+                });
+            }
+        }
+
+        async function bootstrapLoadFromAPI() {
+            try {
+                const pageSizeSelect = document.getElementById('pageSizeSelect');
+                const size = pageSizeSelect ? parseInt(pageSizeSelect.value) : 5000;
+                const qInput = document.getElementById('searchInput');
+                const q = qInput ? (qInput.value || '') : '';
+                clearTable();
+                const data = await apiListMessages(1, size, q);
+                appendRows(data.items || []);
+                // 初始化/刷新本页逻辑
+                if (typeof initMessageData === 'function') initMessageData();
+                if (typeof initFilters === 'function') initFilters();
+                if (typeof initPagination === 'function') initPagination();
+                if (typeof restoreFilterMemory === 'function') restoreFilterMemory();
+                if (typeof restoreOperationMemory === 'function') restoreOperationMemory();
+                if (typeof updateDisplay === 'function') updateDisplay();
+                if (typeof updatePagination === 'function') updatePagination();
+            } catch (e) {
+                console.error('加载消息失败:', e);
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            bootstrapLoadFromAPI();
+            loadContacts();
+            // AI总结页控件事件
+            const sizeSel = document.getElementById('aiPageSize');
+            if (sizeSel) sizeSel.addEventListener('change', async function(){ aiSummaryState.page = 1; await requestAISummary(aiSummaryState.period || '1day'); });
+            const prev = document.getElementById('aiPrevPage');
+            if (prev) prev.addEventListener('click', async function(){ if (aiSummaryState.page>1){ aiSummaryState.page--; await requestAISummary(aiSummaryState.period || '1day'); }});
+            const next = document.getElementById('aiNextPage');
+            if (next) next.addEventListener('click', async function(){ const totalPages=Math.max(1,Math.ceil((aiSummaryState.total||0)/(aiSummaryState.size||1))); if (aiSummaryState.page<totalPages){ aiSummaryState.page++; await requestAISummary(aiSummaryState.period || '1day'); }});
+            const expHtml = document.getElementById('aiExportHtml');
+            if (expHtml) expHtml.addEventListener('click', function(){
+                const htmlRows = (aiSummaryState.items||[]).map(m => {
+                    const t=(m.timestamp||'').replace('T',' ').replace('Z','');
+                    const type=mapMsgType(m.type);
+                    const talker=m.talker_name||m.chat_id||'';
+                    const sender=m.sender_name||m.sender_id||'';
+                    const content=(m.content_text||'').replace(/</g,'&lt;');
+                    return `<tr><td>${sender}</td><td>${t}</td><td>${talker}</td><td>${type}</td><td></td><td></td><td>${content}</td></tr>`;
+                }).join('');
+                const doc = `<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>消息提取</title></head><body><table border=\"1\" cellspacing=\"0\" cellpadding=\"4\"><thead><tr><th>发送人</th><th>时间</th><th>聊天对象</th><th>类型</th><th>分类</th><th>关键信息</th><th>消息内容</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
+                downloadBlob(doc, 'text/html;charset=utf-8', `messages_${aiSummaryState.period}_p${aiSummaryState.page}.html`);
+            });
+            const expCsv = document.getElementById('aiExportCsv');
+            if (expCsv) expCsv.addEventListener('click', function(){
+                const csv = buildCsv(aiSummaryState.items||[]);
+                downloadBlob(csv, 'text/csv;charset=utf-8', `messages_${aiSummaryState.period}_p${aiSummaryState.page}.csv`);
+            });
+            const expXls = document.getElementById('aiExportXls');
+            if (expXls) expXls.addEventListener('click', function(){
+                const htmlRows = (aiSummaryState.items||[]).map(m => {
+                    const t=(m.timestamp||'').replace('T',' ').replace('Z','');
+                    const type=mapMsgType(m.type);
+                    const talker=m.talker_name||m.chat_id||'';
+                    const sender=m.sender_name||m.sender_id||'';
+                    const content=(m.content_text||'').replace(/</g,'&lt;');
+                    return `<tr><td>${sender}</td><td>${t}</td><td>${talker}</td><td>${type}</td><td></td><td></td><td>${content}</td></tr>`;
+                }).join('');
+                const doc = `<html xmlns:o=\"urn:schemas-microsoft-com:office:office\" xmlns:x=\"urn:schemas-microsoft-com:office:excel\" xmlns=\"http://www.w3.org/TR/REC-html40\"><head><meta charset=\"utf-8\"></head><body><table border=\"1\"><thead><tr><th>发送人</th><th>时间</th><th>聊天对象</th><th>类型</th><th>分类</th><th>关键信息</th><th>消息内容</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
+                downloadBlob(doc, 'application/vnd.ms-excel', `messages_${aiSummaryState.period}_p${aiSummaryState.page}.xls`);
+            });
+
+            // 全部导出：自动分页获取直至全部
+            const expAllHtml = document.getElementById('aiExportAllHtml');
+            if (expAllHtml) expAllHtml.addEventListener('click', async function(){
+                await exportAll('html');
+            });
+            const expAllCsv = document.getElementById('aiExportAllCsv');
+            if (expAllCsv) expAllCsv.addEventListener('click', async function(){
+                await exportAll('csv');
+            });
+            const expAllXls = document.getElementById('aiExportAllXls');
+            if (expAllXls) expAllXls.addEventListener('click', async function(){
+                await exportAll('xls');
+            });
+        });
+
+        async function exportAll(fmt) {
+            const statusEl = document.getElementById('analysisStatus');
+            if (statusEl) statusEl.textContent = '导出中...';
+            try {
+                const range = getPeriodRange(aiSummaryState.period || '1day');
+                const size = aiSummaryState.size || 500;
+                let page = 1;
+                let total = 0;
+                const follow = document.getElementById('aiFollowFilters');
+                const searchEl = document.getElementById('searchInput');
+                const typeEl = document.getElementById('messageTypeFilter');
+                const senderEl = document.getElementById('senderFilter');
+                const importanceEl = document.getElementById('importanceFilter');
+                const searchText = (searchEl?.value || '').toLowerCase();
+                const typeSel = typeEl?.value || '';
+                const senderSel = senderEl?.value || '';
+                const importance = importanceEl?.value || '';
+                let all = [];
+                while (true) {
+                    const params = new URLSearchParams({ page: String(page), size: String(size), time_from: range.from, time_to: range.to });
+                    const resp = await fetch(`/api/messages?${params.toString()}`);
+                    const data = await resp.json();
+                    total = data.total || 0;
+                    let items = data.items || [];
+                    if (follow && follow.checked) {
+                        items = items.filter(m => {
+                            if (typeSel && mapMsgType(m.type) !== typeSel) return false;
+                            if (senderSel && (m.sender_name||m.sender_id||'') !== senderSel) return false;
+                            if (importance) {
+                                const s = parseInt(m.importance_score || 0);
+                                if (importance === 'high' && s < 70) return false;
+                                if (importance === 'medium' && (s < 40 || s >= 70)) return false;
+                                if (importance === 'low' && s >= 40) return false;
+                            }
+                            if (searchText) {
+                                const hay = `${m.content_text||''} ${m.sender_name||''} ${m.talker_name||m.chat_id||''}`.toLowerCase();
+                                if (!hay.includes(searchText)) return false;
+                            }
+                            return true;
+                        });
+                    }
+                    all = all.concat(items);
+                    const totalPages = Math.max(1, Math.ceil(total / size));
+                    if (page >= totalPages) break;
+                    page++;
+                }
+                if (fmt === 'csv') {
+                    const csv = buildCsv(all);
+                    downloadBlob(csv, 'text/csv;charset=utf-8', `messages_${aiSummaryState.period}_all.csv`);
+                } else if (fmt === 'html') {
+                    const htmlRows = all.map(m => {
+                        const t=(m.timestamp||'').replace('T',' ').replace('Z','');
+                        const type=mapMsgType(m.type);
+                        const talker=m.talker_name||m.chat_id||'';
+                        const sender=m.sender_name||m.sender_id||'';
+                        const content=(m.content_text||'').replace(/</g,'&lt;');
+                        return `<tr><td>${sender}</td><td>${t}</td><td>${talker}</td><td>${type}</td><td></td><td></td><td>${content}</td></tr>`;
+                    }).join('');
+                    const doc = `<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>消息提取-全部</title></head><body><table border=\"1\" cellspacing=\"0\" cellpadding=\"4\"><thead><tr><th>发送人</th><th>时间</th><th>聊天对象</th><th>类型</th><th>分类</th><th>关键信息</th><th>消息内容</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
+                    downloadBlob(doc, 'text/html;charset=utf-8', `messages_${aiSummaryState.period}_all.html`);
+                } else if (fmt === 'xls') {
+                    const htmlRows = all.map(m => {
+                        const t=(m.timestamp||'').replace('T',' ').replace('Z','');
+                        const type=mapMsgType(m.type);
+                        const talker=m.talker_name||m.chat_id||'';
+                        const sender=m.sender_name||m.sender_id||'';
+                        const content=(m.content_text||'').replace(/</g,'&lt;');
+                        return `<tr><td>${sender}</td><td>${t}</td><td>${talker}</td><td>${type}</td><td></td><td></td><td>${content}</td></tr>`;
+                    }).join('');
+                    const doc = `<html xmlns:o=\"urn:schemas-microsoft-com:office:office\" xmlns:x=\"urn:schemas-microsoft-com:office:excel\" xmlns=\"http://www.w3.org/TR/REC-html40\"><head><meta charset=\"utf-8\"></head><body><table border=\"1\"><thead><tr><th>发送人</th><th>时间</th><th>聊天对象</th><th>类型</th><th>分类</th><th>关键信息</th><th>消息内容</th></tr></thead><tbody>${htmlRows}</tbody></table></body></html>`;
+                    downloadBlob(doc, 'application/vnd.ms-excel', `messages_${aiSummaryState.period}_all.xls`);
+                }
+            } catch (e) {
+                alert('导出失败：' + e);
+            } finally {
+                if (statusEl) statusEl.textContent = '完成';
+            }
+        }
+
+    </script>
+</body>
+</html>
+        

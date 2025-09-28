@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any
+from datetime import datetime
+
+
+class MessageOut(BaseModel):
+    id: int
+    chat_id: Optional[str]
+    sender_id: Optional[str]
+    sender_name: Optional[str]
+    talker_name: Optional[str]
+    timestamp: Optional[datetime]
+    direction: Optional[str]
+    type: Optional[str]
+    content_text: Optional[str]
+    media_url: Optional[str]
+    meta: Optional[dict]  # include raw metadata (e.g., contents for links/images)
+    tags: Optional[dict]
+    derived: Optional[dict]
+    importance_score: int
+    upvotes: int
+    downvotes: int
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedMessages(BaseModel):
+    total: int
+    items: List[MessageOut]
+
+
+class ContactOut(BaseModel):
+    id: str
+    name: Optional[str]
+    alias: Optional[str]
+    rating: int
+    labels: Optional[dict]
+
+    class Config:
+        from_attributes = True
+
+
+class ChatOut(BaseModel):
+    id: str
+    title: Optional[str]
+    type: Optional[str]
+    is_chatroom: bool
+    last_message_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class UpDownVoteResult(BaseModel):
+    id: int
+    upvotes: int
+    downvotes: int
+
+
+class TagUpdateIn(BaseModel):
+    tags: dict
+
+
+class AIReplyRequest(BaseModel):
+    message_ids: List[int]
+    prompt_hint: Optional[str] = None
+
+
+class AISummaryRequest(BaseModel):
+    message_ids: Optional[List[int]] = None
+    filters: Optional[dict] = None
+    options: Optional[dict] = None
+    prompts: Optional[dict] = None
+
+
+class MessageDeriveRequest(BaseModel):
+    message_ids: Optional[List[int]] = None
+    period: Optional[str] = None
+    limit: Optional[int] = None
+    batch_size: int = Field(default=30, ge=1, le=200)
+    concurrency: int = Field(default=32, ge=1, le=128)
+    temperature: float = Field(default=0.1, ge=0, le=1)
+    force: bool = False
+
+
+class SendItem(BaseModel):
+    target: str  # chat_id or talker
+    text: str
+
+
+class SendRequest(BaseModel):
+    items: List[SendItem]
+
+
+class TaskOut(BaseModel):
+    id: int
+    type: str
+    status: str
+    result: Optional[Any]
+
+
+class Health(BaseModel):
+    status: str
+    chatlog_http_base: Optional[str]
+    chatlog_dir: Optional[str]
+
+
+class ChatlogWebhookMessage(BaseModel):
+    seq: int
+    time: str
+    talker: str
+    talkerName: Optional[str] = None
+    isChatRoom: bool
+    sender: str
+    senderName: Optional[str] = None
+    isSelf: bool
+    type: int
+    subType: int
+    content: Optional[str] = None
+    contents: Optional[dict] = None
+
+
+class ChatlogWebhookBody(BaseModel):
+    keyword: str | None = None
+    lastTime: str | None = None
+    length: int
+    messages: List[ChatlogWebhookMessage]
+    sender: str | None = None
+    talker: str
+
+
+class ReportOut(BaseModel):
+    id: int
+    title: str
+    time_range: Optional[str]
+    status: str
+    result_type: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReportArtifactOut(BaseModel):
+    id: int
+    report_id: int
+    module: str
+    title: Optional[str]
+    content_type: Optional[str]
+    sequence: int
+    data_json: Optional[dict]
+    data_text: Optional[str]
+    meta: Optional[dict]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReportDetailOut(ReportOut):
+    filters: Optional[dict]
+    result_body: Optional[str]
+    artifacts: List[ReportArtifactOut] = []
