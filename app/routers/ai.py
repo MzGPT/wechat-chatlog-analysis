@@ -611,8 +611,8 @@ def _run_summary_local(payload: dict) -> dict:
         high_contacts = []
         for sender in set(list(activity.keys()) + list(norm_ratings.keys())):
             rating = norm_ratings.get(sender)
-            if rating is None or rating < 70:
-                continue
+            if rating is None:
+                rating = 50.0
             active = activity.get(sender, 0)
             if active <= 0:
                 continue
@@ -629,6 +629,10 @@ def _run_summary_local(payload: dict) -> dict:
                     record["alias"] = detail.get("alias")
             high_contacts.append(record)
         high_contacts.sort(key=lambda x: (x["rating"], x["activity"]), reverse=True)
+        # 若严格阈值导致为空，则以活跃度Top补足，避免“高评分联系人”卡片空白
+        if not high_contacts:
+            tmp = sorted(({"sender": s, "rating": norm_ratings.get(s, 50.0), "activity": a, **(contacts_raw.get(s) or {})} for s, a in activity.items()), key=lambda x:(x["activity"], x.get("rating",50.0)), reverse=True)
+            high_contacts = [{"sender": t.get("sender"), "rating": float(t.get("rating",50.0)), "activity": t.get("activity",0), "name": t.get("name"), "alias": t.get("alias")} for t in tmp[:10]]
 
         time_min = min((m.get("time") for m in enriched_messages if m.get("time")), default=None)
         time_max = max((m.get("time") for m in enriched_messages if m.get("time")), default=None)
@@ -992,8 +996,9 @@ def _run_summary_local(payload: dict) -> dict:
                     key_info = (m.get("key_info") or m.get("summary") or m.get("content") or "").strip()
                     shown_time = _extract_time_from_text(text) or _fmt_meeting_time(m.get("time"))
                     items.append({
-                        "time": shown_time,
-                        "platform": _abbr_platform(platform),
+                \"id\": m.get(\"id\") or m.get(\"message_id\"),
+                \"time\": shown_time,
+                \"platform\": _abbr_platform(platform),
                         "number": meeting_no or "待确认",
                         "speaker": m.get("sender") or m.get("sender_name") or "-",
                         "topic": _short_cn(key_info, 10) or "-",
@@ -1009,7 +1014,7 @@ def _run_summary_local(payload: dict) -> dict:
             md = ["# 会议路演信息", f"- 记录到会议/路演：{len(items)} 场"]
             md.append("\n| 时间 | 形式 | 会议号 | 主讲人/机构 | 主题要点 |\n|---|---|---|---|---|")
             for it in items:
-                md.append(f"| {it['time']} | {it['platform']} | {it['number']} | {it['speaker']} | {it['topic']} |")
+                md.append(f"| {it['time']} | {it['number']} | {it['speaker']} | {it['topic']} |")
             md.append("\n## 待处理事项\n- 核对会议号与参会方式，提前准备提问要点和资料。")
             return "\n".join(md)
 
@@ -1047,10 +1052,12 @@ def _run_summary_local(payload: dict) -> dict:
             for theme, bucket in topics.items():
                 if bucket["positive"] and bucket["negative"]:
                     conflicts.append({
-                        "theme": theme,
-                        "positive": bucket["positive"][0],
-                        "negative": bucket["negative"][0],
-                    })
+                    "theme": theme,
+                    "positive": bucket["positive"][0],
+                    "negative": bucket["negative"][0],
+                    "positive_id": ids_map.get(theme, {}).get("positive", [""])[0] if ids_map.get(theme, {}).get("positive") else "",
+                    "negative_id": ids_map.get(theme, {}).get("negative", [""])[0] if ids_map.get(theme, {}).get("negative") else "",
+                })
             return conflicts[:6]
 
         def _build_counter_md() -> str:
@@ -1062,8 +1069,8 @@ def _run_summary_local(payload: dict) -> dict:
                 md.append(f"\n## 议题：{_short(item['theme'], 40)}")
                 md.append(f"- 观点：{item['positive']}")
                 md.append(f"- 证据：已在消息中体现（可核查）")
-                md.append(f"- 反驳要点：{item['negative']}")
-                md.append(f"- 结论/建议：建议继续核查关键数据并保持证据导向的讨论。")
+                md.append(f"- 矛盾要点：{item['negative']}")
+                md.append(f"- <span class=\"ask\">建议提问</span>：继续核查关键数据并保持证据导向的讨论。")
             md.append("\n## 总结\n- 上述议题仍存在分歧，建议按证据优先原则推进讨论，并跟踪高频联系人观点变动。")
             return "\n".join(md)
 
@@ -1091,13 +1098,13 @@ def _run_summary_local(payload: dict) -> dict:
             rows = []
             for it in items:
                 rows.append(
-                    f"<tr><td>{html.escape(it['time'])}</td><td>{html.escape(it['platform'])}</td><td>{html.escape(it['number'])}</td>"
-                    f"<td>{html.escape(it['speaker'])}</td><td>{html.escape(it['topic'])}</td></tr>"
+                    f"<tr data-msg-id=\"{html.escape(str(it.get('id') or ''))}\"><td>{html.escape(it['time'])}</td><td>{html.escape(it['number'])}</td>"
+                    f"<td>{html.escape(it['speaker'])}</td><td><span class=\"msg-badge\" data-msg-id=\"{html.escape(str(it.get('id') or ''))}\">源</span> {html.escape(it['topic'])}</td></tr>"
                 )
             table = """
             <h1>会议路演信息</h1>
             <p>记录到会议/路演：{n} 场</p>
-            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>形式</th><th>会议号</th><th>主讲人/机构</th><th>主题要点</th></tr></thead>
+            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>会议号</th><th>主讲人/机构</th><th>主题要点</th></tr></thead>
             <tbody>{rows}</tbody></table>
             <h2>待处理事项</h2>
             <ul><li>核对会议号与参会方式，提前准备提问要点和资料。</li></ul>
@@ -1107,14 +1114,14 @@ def _run_summary_local(payload: dict) -> dict:
         def _build_counter_html() -> str:
             conflicts = _extract_conflicts()
             if not conflicts:
-                return "<h1>反驳观点分析</h1><p>暂无明确冲突。建议继续跟踪关键数据与风险点。</p>"
+                return "<h1>矛盾观点分析</h1><p>暂无明确冲突。建议继续跟踪关键数据与风险点。</p>"
             rows = []
             for item in conflicts:
                 rows.append(
                     f"<tr><td>{html.escape(item['positive'])}</td><td>{html.escape(item['negative'])}</td></tr>"
                 )
             table = """
-            <h1>反驳观点分析</h1>
+            <h1>矛盾观点分析</h1>
             <p>发现 {n} 个存在实质分歧的议题。</p>
             <table class=\"counter-table\"><thead><tr><th>主观点</th><th>冲突观点</th></tr></thead><tbody>{rows}</tbody></table>
             <h2>怀疑与结论</h2>
@@ -1132,7 +1139,7 @@ def _run_summary_local(payload: dict) -> dict:
                 act = c.get("activity")
                 latest = next((m for m in reversed(enriched_messages) if (m.get("sender") or m.get("sender_name")) == c.get("sender")), None)
                 summary = _short((latest or {}).get("summary") or (latest or {}).get("content") or "", 120)
-                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f} / 活跃 {act}）<br><em>核心观点：</em>{html.escape(summary)}</li>")
+                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f} / 活跃 {act}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(str((latest or {}).get('id') or (latest or {}).get('message_id') or ''))}\">源</span> {html.escape(summary)}</li>")
             return "<h1>高评分联系人摘要</h1><ol>" + "".join(items) + "</ol>"
 
         if "market" in module_filter and not result.get("market_markdown"):
