@@ -265,6 +265,10 @@ def get_ai_config():
         "tool_model": conf.get("tool_model"),
         "max_tokens": conf.get("max_tokens"),
         "model_temperature": conf.get("model_temperature"),
+        # Send (WeChatPadPro) config surface for UI
+        "wechatpad_http_base": conf.get("wechatpad_http_base"),
+        "wechatpad_text_path": conf.get("wechatpad_text_path"),
+        "wechatpad_ws_url": conf.get("wechatpad_ws_url"),
         "message_filters": conf.get("message_filters", {}),
         "module_prompts": conf.get("module_prompts", {}),
         "default_module_prompts": DEFAULT_MODULE_PROMPTS,
@@ -289,6 +293,14 @@ def set_ai_config(conf: dict):
     for key in ("api_key", "api_url", "model", "tool_model"):
         if key in conf and conf[key] is not None:
             merged[key] = conf[key]
+    # Allow frontend to configure WeChatPadPro endpoint without editing .env
+    if "wechatpad_http_base" in conf and conf["wechatpad_http_base"] is not None:
+        merged["wechatpad_http_base"] = conf["wechatpad_http_base"].strip()
+    if "wechatpad_text_path" in conf and conf["wechatpad_text_path"] is not None:
+        p = conf["wechatpad_text_path"].strip() or "/api/v1/message/sendText"
+        merged["wechatpad_text_path"] = p if p.startswith("/") else "/" + p
+    if "wechatpad_ws_url" in conf and conf["wechatpad_ws_url"] is not None:
+        merged["wechatpad_ws_url"] = conf["wechatpad_ws_url"].strip()
 
     # optional runtime LLM params
     if "max_tokens" in conf and conf["max_tokens"] is not None:
@@ -996,9 +1008,9 @@ def _run_summary_local(payload: dict) -> dict:
                     key_info = (m.get("key_info") or m.get("summary") or m.get("content") or "").strip()
                     shown_time = _extract_time_from_text(text) or _fmt_meeting_time(m.get("time"))
                     items.append({
-                \"id\": m.get(\"id\") or m.get(\"message_id\"),
-                \"time\": shown_time,
-                \"platform\": _abbr_platform(platform),
+                        "id": m.get("id") or m.get("message_id"),
+                        "time": shown_time,
+                        "platform": _abbr_platform(platform),
                         "number": meeting_no or "待确认",
                         "speaker": m.get("sender") or m.get("sender_name") or "-",
                         "topic": _short_cn(key_info, 10) or "-",

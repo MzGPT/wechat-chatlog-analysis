@@ -54,4 +54,12 @@ def send_wechatpad(body: SendRequest):
     client = WeChatPadClient()
     if not client.configured():
         return {"status": "error", "error": "WeChatPadPro base not configured"}
-    return client.send_batch([i.model_dump() for i in body.items])
+    # Echo target with result for UI summary
+    raw_items = [i.model_dump() for i in body.items]
+    res = client.send_batch(raw_items)
+    for idx, it in enumerate(res.get("results", [])):
+        try:
+            it["target"] = raw_items[idx].get("target") or raw_items[idx].get("chat_id")
+        except Exception:
+            pass
+    return res
