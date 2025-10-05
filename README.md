@@ -1,97 +1,97 @@
 % 微信聊天记录分析系统（FastAPI + SQLite + n8n）
 
-一个最小可运行的后端骨架：
-- FastAPI + SQLite(FTS5) 持久化与检索
-- 对接 chatlog HTTP 服务的拉取同步（新增 /api/sync/chatlog）
-- AI 总结使用本地 SiliconFlow 接口 + JSON 快照数据库，发送管理可选接入 n8n
-- 简单静态前端（`/static/index.html`）用于快速验收 API
+![python](https://img.shields.io/badge/python-3.11%2B-blue.svg?logo=python)
+![fastapi](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)
+![sqlite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite)
 
-## 快速开始
+一个面向“聊天记录检索 + AI 总结 + 自动发送”的最小可用后端：
+- FastAPI + SQLite(FTS5) 提供高效存储与全文检索
+- 支持从 chatlog HTTP 服务增量拉取、离线导入目录（可选）
+- 本地 SiliconFlow 接口完成总结与候选回复生成；发送可选对接 n8n/WeChatPadPro
+- 自带极简 UI（`/static/index.html`）便于验收与演示
 
-1. 复制环境变量并修改：
+预览界面
 
-```
-cp .env.example .env
-```
+![Preview](static/preview.png)
 
-2. 安装依赖并运行：
+目录导航
+- 快速开始
+- 主要特性
+- 目录结构
+- 配置说明
+- 常用 API
+- 开发与调试
+- 安全与发布建议
 
-使用脚本（推荐）：
+快速开始
+1) 初始化环境变量
+   cp .env.example .env
 
-```
-# 安装依赖
-bash scripts/manage.sh install
+2) 安装并启动（推荐脚本）
+   bash scripts/manage.sh install
+   bash scripts/manage.sh start
 
-# 后台启动
-bash scripts/manage.sh start
+   常用：
+   - 状态：bash scripts/manage.sh status
+   - 日志：bash scripts/manage.sh logs -f
+   - 停止：bash scripts/manage.sh stop
+   - 同步：bash scripts/manage.sh sync
 
-# 查看状态/日志
-bash scripts/manage.sh status
-bash scripts/manage.sh logs -f
+3) 手动方式（可选）
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 触发一次从 chatlog 拉取增量
-bash scripts/manage.sh sync
+4) 验证与访问
+   - 前端最小页：http://127.0.0.1:8000/
+   - 健康检查：curl http://127.0.0.1:8000/api/health
+   - 搜索示例：curl 'http://127.0.0.1:8000/api/messages?q=hello'
 
-# 停止
-bash scripts/manage.sh stop
-```
+主要特性
+- 全文检索：基于 SQLite FTS5 的消息/联系人检索
+- AI 总结：本地接口生成摘要、争议分析、候选回复等
+- 同步能力：支持 chatlog HTTP 增量/全量拉取
+- 发送通道：集成 WeChatPadPro（HTTP+WS），可扩展 n8n
+- 极简 UI：检索、过滤、总结与群发一体化验收页
 
-或手动运行：
+目录结构
+app/            FastAPI 应用/路由/服务/模型/配置/模式
+data/           运行期数据库与 AI 产物（默认 data/app.db，已忽略）
+scripts/        管理脚本入口 scripts/manage.sh
+static/         最小 UI；站点根与 /static/*
+docs/ n8n/      参考文档与示例工作流
 
-```
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+配置说明（.env）
+- CHATLOG_HTTP_BASE：chatlog HTTP 服务地址
+- CHATLOG_DIR：本地聊天目录，用于离线导入（可留空）
+- N8N_REPLY_WEBHOOK / N8N_SUMMARY_WEBHOOK / N8N_CONTACT_WEBHOOK / N8N_SEND_WEBHOOK / N8N_AUTH_TOKEN
+- DATABASE_URL：默认 sqlite:///./data/app.db
 
-3. 访问前端与 API（请先启动服务）：
-- 前端最小页：`http://127.0.0.1:8000/`
-- 健康检查：`GET /api/health`
-- 消息查询：`GET /api/messages?q=关键词`
-- 从 chatlog 拉取增量：`POST /api/sync/chatlog`（可选传 since）
-- 生成候选回复：`POST /api/ai/suggest-replies`
-- 生成报告：`POST /api/ai/summary`（基于本地快照 + SiliconFlow）
-- 批量发送：`POST /api/send`
+常用 API（节选）
+- GET /api/health
+- GET /api/messages?q=关键词
+- POST /api/messages/{id}/upvote|downvote
+- POST /api/messages/{id}/tags
+- GET /api/chats  GET /api/contacts
+- POST /api/contacts/{id}/rating?delta=1
+- POST /api/ai/suggest-replies  POST /api/ai/summary
+- POST /api/send
+- POST /api/sync/chatlog
 
-## 主要配置（.env）
-- `CHATLOG_HTTP_BASE`：chatlog HTTP 服务地址
-- `CHATLOG_DIR`：本地聊天目录，用于离线导入（留空亦可）
-- `N8N_REPLY_WEBHOOK`、`N8N_SUMMARY_WEBHOOK`、`N8N_CONTACT_WEBHOOK`、`N8N_SEND_WEBHOOK`、`N8N_AUTH_TOKEN`
-- `DATABASE_URL`：默认 `sqlite:///./data/app.db`
+开发与调试
+- 热重载：bash scripts/manage.sh dev 或 uvicorn app.main:app --reload
+- 本地数据：python scripts/seed_sample_data.py
+- 生成快照：python scripts/run_summary_snapshot.py --period 3days
 
-## 路由概览
-- `GET /api/health`
-- `GET /api/messages` `POST /api/messages/{id}/upvote|downvote` `POST /api/messages/{id}/tags`
-- `GET /api/chats` `GET /api/contacts` `POST /api/contacts/{id}/rating?delta=1`
-- `POST /api/ai/suggest-replies` `POST /api/ai/summary`
-- `POST /api/send`
-- `POST /api/sync/chatlog` （向 chatlog HTTP 拉取增量）
+安全与发布建议
+- 切勿提交 .env / data/（已在 .gitignore 中忽略）
+- 默认 CORS 较宽松，用于本地调试；上线前在 app/main.py 收紧
+- 备份 data/app.db；如迁移位置，设置 DATABASE_URL
+- 若使用 n8n，请使用 Bearer Token 并妥善保管
 
-## n8n 对接约定（示例）
-- 回复生成：`POST $N8N_REPLY_WEBHOOK`，请求包含：
-```
-{"request_id":"reply-1,2,3","context":{"messages":[{"id":1,"text":"...","sender":"...","ts":"..."}]},"prompt_hint":"..."}
-```
-- （可选）若仍需 n8n 生成报告，可参照历史结构：`{"request_id":"summary-task", ...}`
-- 批量发送：`POST $N8N_SEND_WEBHOOK`，请求包含：
-```
-{"request_id":"send-task","items":[{"target":"wxid_xxx","text":"你好"}]}
-```
+关于许可
+当前仓库未指定 License，如需开源请按需添加。
 
-> 所有请求将携带 `Authorization: Bearer $N8N_AUTH_TOKEN`（如配置）
-
-## 说明
-- 该骨架未包含本地目录增量导入任务调度（后续可加定时器/命令行）。
-- FTS5 已为 `messages.content_text/sender_name/talker_name` 建索引并带上触发器。
-- 前端最终会替换为 `wechat_analysis_report_0801_副本.html` 的完整交互；当前仅内置了最小验收页。
-
-## 开发脚本
-- 运行开发服务器：`uvicorn app.main:app --reload`  
-- 生产建议使用：`uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2`
-
-### AI 快照与调试
-- `python scripts/seed_sample_data.py`：快速写入一批示例消息，便于演示 AI 总结。
-- `python scripts/run_summary_snapshot.py --period 3days`：基于当前数据库生成快照并调用本地总结，可通过 `--output result.json` 导出。
-
-> `/api/sync/chatlog` 在拉取新消息后会自动刷新 `analysis_snapshots` 表，AI 总结直接消费该 JSON 快照，无需依赖 n8n。
+致谢
+本项目基于 FastAPI/Starlette/SQLite 等优秀组件构建，感谢开源社区。
