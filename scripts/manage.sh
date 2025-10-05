@@ -178,6 +178,7 @@ usage() {
   status         查看服务状态
   logs [-f]      查看日志（-f 持续跟随）
   sync           触发一次从 chatlog 拉取增量
+  emailsync [id] 同步邮箱（可选账户ID，省略则同步全部已启用账户）
 
 示例：
   bash scripts/manage.sh install
@@ -185,6 +186,7 @@ usage() {
   bash scripts/manage.sh status
   bash scripts/manage.sh logs -f
   bash scripts/manage.sh sync
+  bash scripts/manage.sh emailsync 1
   bash scripts/manage.sh stop
 USAGE
 }
@@ -200,6 +202,28 @@ case "$cmd" in
   logs) shift || true; logs_svc "${1:-}" ;;
   restart) stop_svc; start_bg ;;
   sync) sync_once ;;
+  emailsync)
+    export_env || true
+    id=${2:-}
+    port=${PORT:-8000}
+    if [[ -n "$id" ]]; then
+      info "同步邮箱账户 #$id"
+      curl -fsS -X POST "http://127.0.0.1:$port/api/email/accounts/$id/sync" || true
+      echo
+    else
+      info "同步全部邮箱账户（逐个尝试）"
+      ids=$(curl -fsS "http://127.0.0.1:$port/api/email/accounts" | python3 - <<'PY'
+import sys, json
+data = json.load(sys.stdin)
+print(" ".join(str(i.get('id')) for i in data))
+PY
+      )
+      for i in $ids; do
+        curl -fsS -X POST "http://127.0.0.1:$port/api/email/accounts/$i/sync" || true
+        echo
+      done
+    fi
+    ;;
   syncfull) shift || true; sync_full "${1:-30}" ;;
   *) usage ;;
 esac

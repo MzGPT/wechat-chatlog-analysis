@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     HOST: str = Field(default="127.0.0.1")
     PORT: int = Field(default=8000)
     SYNC_INTERVAL_SECONDS: int | None = Field(default=0)
+    EMAIL_SYNC_INTERVAL_SECONDS: int | None = Field(default=0)
 
     # LLM
     SILICONFLOW_API_KEY: str | None = None
@@ -34,6 +35,9 @@ class Settings(BaseSettings):
     # WeChatPadPro
     WECHATPAD_HTTP_BASE: str | None = None  # e.g., http://60.205.58.39:1238
     WECHATPAD_TEXT_PATH: str | None = "/api/v1/message/sendText"  # fallback path for text sending
+
+    # Extensions / Adapters
+    LANGBOT_ADAPTER_LOG_DIR: str | None = None  # e.g., ./data/adapters
 
     class Config:
         env_file = ".env"

@@ -149,3 +149,88 @@ class ReportArtifact(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     report: Mapped[Report] = relationship("Report", back_populates="artifacts")
+
+
+# ===============
+# New: Mail & Ext Adapters
+# ===============
+
+class EmailAccount(Base):
+    """Outgoing/incoming mail account configuration.
+
+    Note: Credentials are stored in JSON for flexibility (username/password/oauth).
+    In production, consider encrypting the password at rest and masking in APIs.
+    """
+
+    __tablename__ = "email_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128))  # display name in UI
+    email_address: Mapped[str] = mapped_column(String(255), index=True)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)  # gmail/qq/outlook/custom
+    imap_host: Mapped[str] = mapped_column(String(255))
+    imap_port: Mapped[int] = mapped_column(Integer, default=993)
+    imap_ssl: Mapped[bool] = mapped_column(Boolean, default=True)
+    smtp_host: Mapped[str] = mapped_column(String(255))
+    smtp_port: Mapped[int] = mapped_column(Integer, default=465)
+    smtp_ssl: Mapped[bool] = mapped_column(Boolean, default=True)
+    auth: Mapped[dict] = mapped_column(JSON, default=dict)  # {username, password, oauth_token?}
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class EmailMessage(Base):
+    """Persisted email headers and light body for listing/search.
+
+    Attachments and full raw bodies are omitted for now to keep the DB light.
+    """
+
+    __tablename__ = "email_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, ForeignKey("email_accounts.id"), index=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), index=True)  # Message-ID/UID
+    thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    from_addr: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    to_addrs: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    cc_addrs: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    bcc_addrs: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="in")  # in/out
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)  # seen/flagged/etc
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class ExtAdapter(Base):
+    """Configured external adapter (e.g., langbot adapters for telegram/qq/feishu)."""
+
+    __tablename__ = "ext_adapters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # e.g., telegram, qq, feishu
+    name: Mapped[str] = mapped_column(String(128))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_type: Mapped[str] = mapped_column(String(32), default="langbot")
+    config: Mapped[dict] = mapped_column(JSON, default=dict)  # e.g., {log_dir, api_base, token}
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AdapterMessage(Base):
+    """Messages ingested from adapters' logs/APIs, displayed in extension tabs."""
+
+    __tablename__ = "adapter_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    adapter_key: Mapped[str] = mapped_column(String(64), index=True)
+    external_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    chat_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sender: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    timestamp: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    direction: Mapped[str] = mapped_column(String(8), default="in")  # in/out
+    content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)

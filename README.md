@@ -62,6 +62,10 @@
 - 同步能力：支持 chatlog HTTP 增量/全量拉取
 - 发送通道：集成 WeChatPadPro（HTTP+WS），可扩展 n8n
 - 极简 UI：检索、过滤、总结与群发一体化验收页
+ - 邮件引擎：多账户 IMAP 收取 + SMTP 发送，UI 与微信消息对齐
+ - 新闻聚合：对接 @newsnow，内嵌其原生页面
+ - 自媒体聚合：对接 @folo，以同样的列表风格融合展示
+ - 扩展消息：按 langbot 适配器配置生成动态标签页（Telegram/QQ/企微/飞书等）
 
 目录结构
 app/            FastAPI 应用/路由/服务/模型/配置/模式
@@ -86,6 +90,10 @@ docs/ n8n/      参考文档与示例工作流
 - POST /api/ai/suggest-replies  POST /api/ai/summary
 - POST /api/send
 - POST /api/sync/chatlog
+ - 邮件：GET/POST /api/email/accounts，POST /api/email/accounts/{id}/sync，GET /api/email/messages，POST /api/email/send
+ - 新闻：GET /api/news/config（前端 iframe 使用）；配置：GET/POST /api/config/newsnow
+ - 自媒体：GET /api/folo/posts；配置：GET/POST /api/config/folo
+ - 扩展消息：GET/POST /api/extensions/adapters，POST /api/extensions/adapters/{key}/ingest，GET /api/extensions/messages?adapter_key=xxx；配置：GET/POST /api/config/extensions
 
 开发与调试
 - 热重载：bash scripts/manage.sh dev 或 uvicorn app.main:app --reload

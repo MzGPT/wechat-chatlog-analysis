@@ -99,6 +99,74 @@ def set_blacklist(payload: dict, db: Session = Depends(_get_db)):
     return {"status": "ok"}
 
 
+# --------- Module Configurations (persisted in SyncState) ---------
+
+def _get_json_obj(db: Session, key: str) -> dict:
+    row = db.get(SyncState, key)
+    if not row or not row.value:
+        return {}
+    try:
+        data = json.loads(row.value)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _set_json_obj(db: Session, key: str, obj: dict) -> None:
+    payload = json.dumps(obj or {})
+    row = db.get(SyncState, key)
+    if not row:
+        row = SyncState(key=key, value=payload)
+    else:
+        row.value = payload
+    db.add(row)
+
+
+@router.get("/config/newsnow")
+def get_newsnow_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "newsnow_config")
+
+
+@router.post("/config/newsnow")
+def set_newsnow_config(payload: dict, db: Session = Depends(_get_db)):
+    # expected: { base_url: str, auth_token?: str }
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "newsnow_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/config/folo")
+def get_folo_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "folo_config")
+
+
+@router.post("/config/folo")
+def set_folo_config(payload: dict, db: Session = Depends(_get_db)):
+    # expected: { base_url: str, api_key?: str }
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "folo_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/config/extensions")
+def get_extensions_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "extensions_config")
+
+
+@router.post("/config/extensions")
+def set_extensions_config(payload: dict, db: Session = Depends(_get_db)):
+    # expected: { langbot_log_dir?: str, enabled_adapters?: [str] }
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "extensions_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.post("/filters/whitelist")
 def set_whitelist(payload: dict, db: Session = Depends(_get_db)):
     senders = payload.get("senders") or []

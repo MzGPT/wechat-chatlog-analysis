@@ -165,3 +165,101 @@ class ReportDetailOut(ReportOut):
     filters: Optional[dict]
     result_body: Optional[str]
     artifacts: List[ReportArtifactOut] = []
+
+
+# =====================
+# New: Email & Extensions Schemas
+# =====================
+
+class EmailAccountIn(BaseModel):
+    name: str
+    email_address: str
+    provider: str | None = None
+    imap_host: str
+    imap_port: int = 993
+    imap_ssl: bool = True
+    smtp_host: str
+    smtp_port: int = 465
+    smtp_ssl: bool = True
+    auth: dict = {}
+    enabled: bool = True
+
+
+class EmailAccountOut(EmailAccountIn):
+    id: int
+    last_sync_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class EmailSendRequest(BaseModel):
+    account_id: int
+    to: List[str]
+    subject: str
+    body_text: str
+    cc: List[str] | None = None
+    bcc: List[str] | None = None
+
+
+class EmailMessageOut(BaseModel):
+    id: int
+    account_id: int
+    external_id: str | None = None
+    subject: str | None = None
+    from_addr: str | None = None
+    to_addrs: List[str] | None = None
+    cc_addrs: List[str] | None = None
+    bcc_addrs: List[str] | None = None
+    sent_at: datetime | None = None
+    direction: str
+    snippet: str | None = None
+    body_text: str | None = None
+    body_html: str | None = None
+    flags: List[str] | None = None
+    meta: dict | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedEmailMessages(BaseModel):
+    total: int
+    items: List[EmailMessageOut]
+
+
+class ExtAdapterIn(BaseModel):
+    key: str
+    name: str
+    enabled: bool = False
+    source_type: str = "langbot"
+    config: dict = {}
+
+
+class ExtAdapterOut(ExtAdapterIn):
+    id: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdapterMessageOut(BaseModel):
+    id: int
+    adapter_key: str
+    external_id: str | None = None
+    chat_id: str | None = None
+    sender: str | None = None
+    timestamp: datetime | None = None
+    direction: str
+    content_text: str | None = None
+    meta: dict | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedAdapterMessages(BaseModel):
+    total: int
+    items: List[AdapterMessageOut]
