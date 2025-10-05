@@ -9,7 +9,7 @@ from typing import Optional
 from ..db import SessionLocal
 from ..models import EmailAccount, EmailMessage
 from ..schemas import EmailAccountIn, EmailAccountOut, EmailMessageOut, PaginatedEmailMessages, EmailSendRequest
-from ..services.email_engine import imap_fetch, FetchOptions, smtp_send
+from ..services.email_engine import imap_fetch, FetchOptions, smtp_send, pop3_fetch
 
 
 router = APIRouter(prefix="/api/email", tags=["email"])
@@ -74,10 +74,22 @@ def sync_account(account_id: int, unseen_only: bool = True, limit: int = 100, db
         n = imap_fetch(db, row, FetchOptions(limit=limit, unseen_only=unseen_only))
         row.last_sync_at = datetime.utcnow()
         db.commit()
-        return {"status": "ok", "new": n}
+        return {"status": "ok", "new": n, "mode": "imap"}
     except Exception as e:
+        # Fallback to POP3 on auth/IMAP errors
         db.rollback()
-        raise HTTPException(502, f"sync error: {e}")
+        try:
+            n = pop3_fetch(db, row, limit=limit)
+            row.last_sync_at = datetime.utcnow()
+            db.commit()
+            return {"status": "ok", "new": n, "mode": "pop3", "imap_error": str(e)}
+        except Exception as e2:
+            db.rollback()
+            msg = str(e2)
+            # Friendly hints for common providers that have disabled basic auth
+            if 'Authentication unsuccessful' in msg or 'LOGIN failed' in msg or 'Logon failure' in msg:
+                msg += "; 请在邮箱设置中开启 IMAP/POP，或使用应用专用密码，或改用 OAuth(微软/谷歌建议)。"
+            raise HTTPException(502, f"sync error: {msg}")
 
 
 @router.get("/messages", response_model=PaginatedEmailMessages)
