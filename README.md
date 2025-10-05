@@ -14,6 +14,12 @@
 
 ![Preview](static/preview.png)
 
+更多截图
+
+![UI-Search](static/ui-search.png)
+![API-Docs](static/ui-docs.png)
+![Health](static/ui-health.png)
+
 目录导航
 - 快速开始
 - 主要特性
@@ -91,7 +97,7 @@ docs/ n8n/      参考文档与示例工作流
 - 若使用 n8n，请使用 Bearer Token 并妥善保管
 
 关于许可
-当前仓库未指定 License，如需开源请按需添加。
+本项目采用 Apache-2.0 许可证，详见 LICENSE。
 
 致谢
 本项目基于 FastAPI/Starlette/SQLite 等优秀组件构建，感谢开源社区。
