@@ -31,6 +31,9 @@ def list_accounts(db: Session = Depends(get_db)):
 
 @router.post("/accounts", response_model=EmailAccountOut)
 def create_account(body: EmailAccountIn, db: Session = Depends(get_db)):
+    # basic validation for required hosts
+    if not (body.imap_host or "").strip() or not (body.smtp_host or "").strip():
+        raise HTTPException(400, "imap_host 和 smtp_host 不能为空")
     row = EmailAccount(**body.model_dump())
     db.add(row)
     db.commit()
@@ -43,6 +46,8 @@ def update_account(account_id: int, body: EmailAccountIn, db: Session = Depends(
     row = db.get(EmailAccount, account_id)
     if not row:
         raise HTTPException(404, "account not found")
+    if not (body.imap_host or "").strip() or not (body.smtp_host or "").strip():
+        raise HTTPException(400, "imap_host 和 smtp_host 不能为空")
     for k, v in body.model_dump().items():
         setattr(row, k, v)
     db.commit()
@@ -109,4 +114,3 @@ def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(502, f"send error: {e}")
-
