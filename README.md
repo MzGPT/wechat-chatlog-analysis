@@ -19,6 +19,8 @@
 ![UI-Search](static/ui-search.png)
 ![API-Docs](static/ui-docs.png)
 ![Health](static/ui-health.png)
+![Messages](static/ui-messages.png)
+![AI-Summary](static/ui-summary.png)
 
 目录导航
 - 快速开始
