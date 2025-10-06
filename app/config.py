@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # Extensions / Adapters
     LANGBOT_ADAPTER_LOG_DIR: str | None = None  # e.g., ./data/adapters
 
+    # Microsoft OAuth for Outlook/Hotmail
+    MS_CLIENT_ID: str | None = None
+    MS_TENANT: str | None = "consumers"  # common/organizations/consumers
+
     class Config:
         env_file = ".env"
 

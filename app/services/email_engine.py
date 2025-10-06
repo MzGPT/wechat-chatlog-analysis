@@ -244,12 +244,16 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
     This fetches top-N messages (most recent IDs), retrieves headers and a small
     portion of the body for snippet.
     """
-    host = account.imap_host or ''
-    port = account.imap_port or 995
-    # Best-effort: common POP hostname for outlook if IMAP host points to office365
-    if 'office365.com' in host or 'outlook.' in host:
-        host = 'pop-mail.outlook.com'
-        port = 995
+    base_host = (account.imap_host or '').lower()
+    # Try multiple common POP hosts for Outlook
+    candidates: list[tuple[str,int]] = []
+    if 'outlook.' in base_host or 'office365.com' in base_host:
+        candidates = [
+            ('pop-mail.outlook.com', 995),
+            ('outlook.office365.com', 995),
+        ]
+    if not candidates:
+        candidates = [(base_host or 'pop-mail.outlook.com', 995)]
 
     username = (account.auth or {}).get("username") or account.email_address
     password = (account.auth or {}).get("password") or ""
@@ -257,9 +261,18 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
     new_count = 0
     server = None
     try:
-        server = poplib.POP3_SSL(host, port, timeout=30)
-        server.user(username)
-        server.pass_(password)
+        last_err: Exception | None = None
+        for host, port in candidates:
+            try:
+                server = poplib.POP3_SSL(host, port, timeout=30)
+                server.user(username)
+                server.pass_(password)
+                break
+            except Exception as e:
+                last_err = e
+                server = None
+        if not server:
+            raise last_err or RuntimeError('POP3 connect failed')
         num_messages = len(server.list()[1])
         start = max(1, num_messages - limit + 1)
 
