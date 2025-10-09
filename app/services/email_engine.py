@@ -253,7 +253,16 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
             ('outlook.office365.com', 995),
         ]
     if not candidates:
-        candidates = [(base_host or 'pop-mail.outlook.com', 995)]
+        cands: list[tuple[str,int]] = []
+        if base_host.startswith('imap.'):
+            cands.append((base_host.replace('imap.', 'pop.', 1), 995))
+        # also try plain pop.<domain> if not already covered
+        if base_host and not base_host.startswith('pop.'):
+            domain = base_host.split('imap.',1)[-1] if base_host.startswith('imap.') else base_host
+            cands.append((f'pop.{domain}', 995))
+        # final fallback to original host (might be actual pop)
+        cands.append((base_host or 'pop-mail.outlook.com', 995))
+        candidates = cands
 
     username = (account.auth or {}).get("username") or account.email_address
     password = (account.auth or {}).get("password") or ""

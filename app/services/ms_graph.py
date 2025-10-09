@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 import requests
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -118,3 +118,108 @@ def fetch_messages_graph(db: Session, account: EmailAccount, access_token: str, 
         new_count += 1
     return new_count
 
+
+def _ensure_valid_token(db: Session, account: EmailAccount) -> str:
+    """Return a valid access_token, refreshing once if needed.
+
+    This is a best-effort helper to keep logic simple without introducing a
+    background scheduler here. We only refresh when we detect an auth failure
+    from the Graph API call site.
+    """
+    tok = (account.auth or {}).get("oauth") or {}
+    access_token = tok.get("access_token")
+    if access_token:
+        return access_token
+    # Try refresh if we have a refresh_token
+    refresh = tok.get("refresh_token")
+    if not refresh:
+        raise RuntimeError("no access_token; please authorize first")
+    new_tok = refresh_token(refresh)
+    auth = account.auth or {}
+    auth["oauth"] = new_tok
+    account.auth = auth
+    db.add(account)
+    db.flush()
+    return new_tok.get("access_token")
+
+
+def send_mail_graph(
+    db: Session,
+    account: EmailAccount,
+    to: List[str],
+    subject: str,
+    body_text: str,
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Send a simple text email via Microsoft Graph.
+
+    Falls back to a single refresh if the token is expired.
+    Also persists an outgoing EmailMessage row for UI listing.
+    """
+    tok = (account.auth or {}).get("oauth") or {}
+    access_token = tok.get("access_token")
+    if not access_token:
+        # try to refresh once
+        rf = tok.get("refresh_token")
+        if not rf:
+            raise RuntimeError("no access_token; please authorize first")
+        new_tok = refresh_token(rf)
+        access_token = new_tok.get("access_token")
+        auth = account.auth or {}
+        auth["oauth"] = new_tok
+        account.auth = auth
+        db.add(account)
+        db.flush()
+
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    msg = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body_text},
+            "toRecipients": [{"emailAddress": {"address": x}} for x in (to or [])],
+        },
+        "saveToSentItems": True,
+    }
+    if cc:
+        msg["message"]["ccRecipients"] = [{"emailAddress": {"address": x}} for x in cc]
+    if bcc:
+        msg["message"]["bccRecipients"] = [{"emailAddress": {"address": x}} for x in bcc]
+
+    url = f"{GRAPH_BASE}/me/sendMail"
+    r = requests.post(url, headers=headers, json=msg, timeout=20)
+    if r.status_code == 401:
+        # try refresh once
+        rf = ((account.auth or {}).get("oauth") or {}).get("refresh_token")
+        if rf:
+            new_tok = refresh_token(rf)
+            auth = account.auth or {}
+            auth["oauth"] = new_tok
+            account.auth = auth
+            db.add(account)
+            db.flush()
+            headers["Authorization"] = f"Bearer {new_tok.get('access_token')}"
+            r = requests.post(url, headers=headers, json=msg, timeout=20)
+    r.raise_for_status()
+
+    # Persist an outgoing row (direction=out) for unified listing
+    row = EmailMessage(
+        account_id=account.id,
+        external_id=None,
+        thread_id=None,
+        subject=subject,
+        from_addr=f"{account.name} <{account.email_address}>",
+        to_addrs=to,
+        cc_addrs=cc,
+        bcc_addrs=bcc,
+        sent_at=None,
+        direction="out",
+        snippet=body_text[:400],
+        body_text=body_text,
+        body_html=None,
+        flags=["sent"],
+        meta={"graph": True},
+    )
+    db.add(row)
+    db.flush()
+    return {"status": "ok", "message_id": row.id}

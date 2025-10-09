@@ -7,6 +7,7 @@ from .config import settings
 from .db import SessionLocal
 from .services.sync_service import sync_from_chatlog
 from .services.email_engine import imap_fetch, FetchOptions
+from .services.ms_graph import fetch_messages_graph, refresh_token
 from .models import EmailAccount, ExtAdapter
 from .services.ext_adapter_service import ingest_adapter_logs
 
@@ -39,7 +40,26 @@ async def _email_loop():
                 accounts = db.query(EmailAccount).filter(EmailAccount.enabled == True).all()  # noqa
                 for acc in accounts:
                     try:
-                        imap_fetch(db, acc, FetchOptions(limit=50, unseen_only=True))
+                        prov = (acc.provider or "").lower()
+                        oauth = (acc.auth or {}).get("oauth") if acc.auth else None
+                        if prov in ("outlook", "office365", "hotmail") and oauth and oauth.get("access_token"):
+                            try:
+                                fetch_messages_graph(db, acc, oauth.get("access_token"), top=50)
+                            except Exception:
+                                # best-effort refresh then retry once
+                                try:
+                                    if oauth.get("refresh_token"):
+                                        new_tok = refresh_token(oauth.get("refresh_token"))
+                                        auth = acc.auth or {}
+                                        auth["oauth"] = new_tok
+                                        acc.auth = auth
+                                        db.add(acc)
+                                        db.flush()
+                                        fetch_messages_graph(db, acc, new_tok.get("access_token"), top=50)
+                                except Exception:
+                                    pass
+                        else:
+                            imap_fetch(db, acc, FetchOptions(limit=50, unseen_only=True))
                     except Exception:
                         pass
                 db.commit()
