@@ -22,8 +22,8 @@ def start_device_code(client_id: str | None = None, tenant: str | None = None) -
     url = f"{MS_AUTH_BASE}/{tenant}/oauth2/v2.0/devicecode"
     data = {
         "client_id": client_id,
-        # Delegated scopes for reading mail
-        "scope": "Mail.Read offline_access openid profile",
+        # Delegated scopes for read + send + offline refresh
+        "scope": "Mail.Read Mail.Send offline_access openid profile",
     }
     r = requests.post(url, data=data, timeout=15)
     r.raise_for_status()
