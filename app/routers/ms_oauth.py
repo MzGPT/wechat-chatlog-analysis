@@ -67,6 +67,9 @@ def ms_poll(device_code: str, account_id: int | None = None, db: Session = Depen
             auth = acc.auth or {}
             auth["oauth"] = tok
             acc.auth = auth
+            # Make sure provider is set to outlook so background + send use Graph
+            if (acc.provider or "").lower() not in ("outlook", "office365", "hotmail"):
+                acc.provider = "outlook"
         db.commit()
         db.refresh(acc)
         return {"status": "ok", "account_id": acc.id, "email": email}
@@ -91,4 +94,3 @@ def ms_fetch(account_id: int, top: int = 50, db: Session = Depends(get_db)):
         return {"status": "ok", "new": n}
     except Exception as e:
         raise HTTPException(502, f"fetch error: {e}")
-
