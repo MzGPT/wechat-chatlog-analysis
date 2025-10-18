@@ -167,6 +167,27 @@ def set_extensions_config(payload: dict, db: Session = Depends(_get_db)):
     return {"status": "ok"}
 
 
+# --------- Email default account (persisted in SyncState) ---------
+
+@router.get("/config/email-default")
+def get_email_default(db: Session = Depends(_get_db)):
+    obj = _get_json_obj(db, "email_default_account_id")
+    # support both {"account_id": 1} and legacy {"id": 1}
+    acc_id = None
+    if isinstance(obj, dict):
+        acc_id = obj.get("account_id") or obj.get("id")
+    return {"account_id": acc_id}
+
+
+@router.post("/config/email-default")
+def set_email_default(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict) or not payload.get("account_id"):
+        raise HTTPException(400, "invalid payload: require account_id")
+    _set_json_obj(db, "email_default_account_id", {"account_id": int(payload.get("account_id"))})
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.post("/filters/whitelist")
 def set_whitelist(payload: dict, db: Session = Depends(_get_db)):
     senders = payload.get("senders") or []

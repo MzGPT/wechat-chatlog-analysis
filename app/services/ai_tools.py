@@ -104,13 +104,45 @@ def extract_message_features(
                     allowed_categories = {"观点", "会议", "提问", "其他"}
                     raw_cat = str(item.get("category") or "").strip()
                     category = raw_cat if raw_cat in allowed_categories else ("其他" if raw_cat else "")
+                    # extra fields for email key info
+                    meeting_link = item.get("meeting_link") or ""
+                    meeting_number = item.get("meeting_id") or item.get("meeting_number") or ""
+                    appointment_time = item.get("appointment_time") or ""
+                    analyst = item.get("analyst") or item.get("researcher") or ""
+                    organizer = item.get("organizer") or item.get("预约人") or ""
+                    main_point = item.get("main_point") or ""
+                    summary_full = item.get("summary_full") or item.get("full_summary") or ""
+                    # compose key_info if not provided
+                    key_info = str(item.get("key_info") or "").strip()
+                    if not key_info:
+                        parts: list[str] = []
+                        if main_point:
+                            parts.append(f"观点:{main_point}")
+                        if analyst:
+                            parts.append(f"研究员:{analyst}")
+                        if organizer:
+                            parts.append(f"预约:{organizer}")
+                        if meeting_link:
+                            parts.append(f"链接:{meeting_link}")
+                        if meeting_number:
+                            parts.append(f"会议号:{meeting_number}")
+                        if appointment_time:
+                            parts.append(f"时间:{appointment_time}")
+                        key_info = " | ".join(parts)[:120]
                     chunk_results[msg_id] = {
                         "keywords": keywords,
-                        "meeting_number": item.get("meeting_number") or "",
+                        "meeting_number": meeting_number,
                         "platform": item.get("platform") or item.get("meeting_platform") or "",
                         "category": category,
                         "summary": summary,
                         "tone": (item.get("tone") or "neutral").lower(),
+                        "key_info": key_info,
+                        "meeting_link": meeting_link,
+                        "appointment_time": appointment_time,
+                        "analyst": analyst,
+                        "organizer": organizer,
+                        "main_point": main_point,
+                        "summary_full": summary_full,
                     }
         except Exception as exc:
             errors.append(str(exc))

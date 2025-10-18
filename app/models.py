@@ -203,6 +203,7 @@ class EmailMessage(Base):
     body_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     flags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)  # seen/flagged/etc
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    derived: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class ExtAdapter(Base):

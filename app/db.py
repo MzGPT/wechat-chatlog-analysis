@@ -23,7 +23,35 @@ def ensure_dirs():
 
 
 ensure_dirs()
-engine: Engine = create_engine(settings.DATABASE_URL, future=True)
+# Improve SQLite robustness under concurrent access: enable WAL, busy timeout,
+# and cross-thread connections. For non-SQLite, keep defaults.
+if settings.DATABASE_URL.startswith("sqlite"):
+    engine: Engine = create_engine(
+        settings.DATABASE_URL,
+        future=True,
+        connect_args={
+            "check_same_thread": False,  # allow usage across threads
+            "timeout": 30,               # seconds
+        },
+        pool_pre_ping=True,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):  # type: ignore[no-redef]
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=5000")  # ms
+            cursor.close()
+        except Exception:
+            # pragma best-effort
+            try:
+                cursor.close()
+            except Exception:
+                pass
+else:
+    engine: Engine = create_engine(settings.DATABASE_URL, future=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
 
 
@@ -44,6 +72,7 @@ def init_db():
     from . import models  # noqa
     Base.metadata.create_all(bind=engine)
     create_fts_objects()
+    ensure_email_message_columns()
 
 
 def create_fts_objects():
@@ -51,7 +80,6 @@ def create_fts_objects():
     if not settings.DATABASE_URL.startswith("sqlite"):
         return
     with engine.begin() as conn:
-        # Create FTS5 table
         conn.execute(
             text(
                 """
@@ -61,7 +89,6 @@ def create_fts_objects():
                 """
             )
         )
-        # Triggers
         conn.execute(
             text(
                 """
@@ -95,3 +122,17 @@ def create_fts_objects():
             )
         )
 
+
+def ensure_email_message_columns():
+    """Ensure email_messages table has derived column for cached AI features."""
+    if settings.DATABASE_URL.startswith("sqlite"):
+        with engine.begin() as conn:
+            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(email_messages)"))}
+            if "derived" not in columns:
+                conn.execute(text("ALTER TABLE email_messages ADD COLUMN derived TEXT"))
+    else:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE email_messages ADD COLUMN derived JSON"))
+        except Exception:
+            pass

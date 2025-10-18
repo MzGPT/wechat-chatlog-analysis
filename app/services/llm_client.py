@@ -84,8 +84,36 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
 
 DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
     "message_summary": {
-        "system": "你是一名专业的投研小模型助手，负责对输入的消息进行摘要、关键词提取、分类与会议信息识别。输出必须遵循指定的JSON结构。",
-        "user": "请处理以下 JSON 数组，每个元素代表一条消息，字段包含 id/time/sender/content。输出 JSON 数组，元素结构如下：\n{\n  \"id\": string,\n  \"summary\": string (<=30字，且必须以 'ai: ' 前缀开头),\n  \"keywords\": [string<=5],\n  \"category\": string (宏观政策/行业板块/公司基本面/投资策略/市场情绪/其他观点),\n  \"meeting_number\": string,\n  \"platform\": string,\n  \"tone\": string (positive/neutral/negative),\n  \"key_info\": string\n}\n严格要求：summary 字段必须以 'ai: ' 前缀开头；keywords 去除常见无信息词；若文本包含会议安排、链接或8-12位数字则填 meeting_number 与 platform；category 只能选给定六类；key_info 用“平台/会议号/关键词/摘要”拼接（不超过120字符）。\n数据：{{messages_json}}",
+        "system": (
+            "你是一名专业的投研小模型助手，擅长从邮件/消息中提取用于快速浏览的关键信息。"
+            "你的任务是：对每条输入提取‘关键信息’（主要观点、分析师/研究员、会议链接、会议号、预约时间），"
+            "并给出类别与情绪。输出必须严格遵循指定 JSON 结构。"
+        ),
+        "user": (
+            "请处理以下 JSON 数组，每个元素代表一条消息，字段包含 id/time/sender/content。"
+            "输出 JSON 数组，元素结构如下：\n"
+            "{\n"
+            "  \"id\": string,\n"
+            "  \"summary\": string (<=30字，且必须以 'ai: ' 前缀开头，用于简要提示),\n"
+            "  \"keywords\": [string<=5],\n"
+            "  \"category\": string (观点/会议/提问/其他),\n"
+            "  \"tone\": string (bullish/neutral/bearish),\n"
+            "  \"platform\": string,\n"
+            "  \"meeting_number\": string,\n"
+            "  \"meeting_link\": string,\n"
+            "  \"appointment_time\": string,\n"
+            "  \"analyst\": string,\n"
+            "  \"organizer\": string,\n"
+            "  \"main_point\": string,\n"
+            "  \"key_info\": string (<=120字，整合 main_point/analyst/meeting_link/meeting_number/appointment_time 为便于浏览的一行摘要)\n"
+            "}\n"
+            "规则与示例：\n"
+            "- 常见邮件格式示例：‘主题: 【国金医药】特应性皮炎线上路演\n路演类型: 行业路演\n路演方式: 线上\n观点: ……\n内部预约人: 魏家裕\n券商研究员: 唐玉青\n会议链接: https://meeting.tencent.com/dm/xxxx\n会议号: 487-364-622\n时间: 2025-10-16 15:00’；从中提取 main_point/analyst/organizer/meeting_link/meeting_number/appointment_time。\n"
+            "- category 仅选 观点/会议/提问/其他；tone 仅选 bullish/neutral/bearish。\n"
+            "- summary 必须以 'ai: ' 开头；key_info 请压缩为便于快速浏览的一行，字段缺失可省略。\n"
+            "- meeting_number 支持 3*3 形式(***-***-***) 或连续8~12位数字；meeting_link 提取 http/https 链接。\n"
+            "数据：{{messages_json}}"
+        ),
     }
 }
 

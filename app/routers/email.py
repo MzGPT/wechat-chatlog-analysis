@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from threading import Lock
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, or_
+from sqlalchemy import select, desc, or_, case
 from datetime import datetime
 from typing import Optional
 
@@ -10,10 +11,14 @@ from ..db import SessionLocal
 from ..models import EmailAccount, EmailMessage
 from ..schemas import EmailAccountIn, EmailAccountOut, EmailMessageOut, PaginatedEmailMessages, EmailSendRequest
 from ..services.email_engine import imap_fetch, FetchOptions, smtp_send, pop3_fetch
+from ..services.email_features import build_email_features, persist_email_features
 from ..services.ms_graph import send_mail_graph
 
 
 router = APIRouter(prefix="/api/email", tags=["email"])
+
+# serialize per-account sync to avoid SQLite "database is locked" under concurrent writes
+_ACCOUNT_LOCKS: dict[int, Lock] = {}
 
 
 def get_db():
@@ -71,26 +76,27 @@ def sync_account(account_id: int, unseen_only: bool = True, limit: int = 100, db
     row = db.get(EmailAccount, account_id)
     if not row:
         raise HTTPException(404, "account not found")
-    try:
-        n = imap_fetch(db, row, FetchOptions(limit=limit, unseen_only=unseen_only))
-        row.last_sync_at = datetime.utcnow()
-        db.commit()
-        return {"status": "ok", "new": n, "mode": "imap"}
-    except Exception as e:
-        # Fallback to POP3 on auth/IMAP errors
-        db.rollback()
+    lock = _ACCOUNT_LOCKS.setdefault(account_id, Lock())
+    with lock:
         try:
-            n = pop3_fetch(db, row, limit=limit)
+            n = imap_fetch(db, row, FetchOptions(limit=limit, unseen_only=unseen_only))
             row.last_sync_at = datetime.utcnow()
             db.commit()
-            return {"status": "ok", "new": n, "mode": "pop3", "imap_error": str(e)}
-        except Exception as e2:
+            return {"status": "ok", "new": n, "mode": "imap"}
+        except Exception as e:
+            # Fallback to POP3 on auth/IMAP errors
             db.rollback()
-            msg = str(e2)
-            # Friendly hints for common providers that have disabled basic auth
-            if 'Authentication unsuccessful' in msg or 'LOGIN failed' in msg or 'Logon failure' in msg:
-                msg += "; 请在邮箱设置中开启 IMAP/POP，或使用应用专用密码，或改用 OAuth(微软/谷歌建议)。"
-            raise HTTPException(502, f"sync error: {msg}")
+            try:
+                n = pop3_fetch(db, row, limit=limit)
+                row.last_sync_at = datetime.utcnow()
+                db.commit()
+                return {"status": "ok", "new": n, "mode": "pop3", "imap_error": str(e)}
+            except Exception as e2:
+                db.rollback()
+                msg = f"imap_error={str(e)}; pop3_error={str(e2)}"
+                if 'Authentication unsuccessful' in msg or 'LOGIN failed' in msg or 'Logon failure' in msg:
+                    msg += "; 请在邮箱设置中开启 IMAP/POP，或使用应用专用密码，或改用 OAuth(微软/谷歌建议)。"
+                raise HTTPException(502, f"sync error: {msg}")
 
 
 @router.get("/messages", response_model=PaginatedEmailMessages)
@@ -110,10 +116,45 @@ def list_email_messages(
             or_(EmailMessage.subject.like(like), EmailMessage.snippet.like(like), EmailMessage.from_addr.like(like))
         )
     total = db.execute(query.with_only_columns(EmailMessage.id)).all()
-    rows = db.execute(query.order_by(desc(EmailMessage.sent_at.nullslast())).limit(limit).offset(offset)).scalars().all()
+    # SQLite 不支持 NULLS LAST 语法，这里用 CASE 将 NULL 置后
+    order_nulls_last = case((EmailMessage.sent_at == None, 1), else_=0)  # noqa: E711
+    rows = (
+        db.execute(
+            query.order_by(order_nulls_last.asc(), desc(EmailMessage.sent_at)).limit(limit).offset(offset)
+        )
+        .scalars()
+        .all()
+    )
     items = [EmailMessageOut.model_validate(r) for r in rows]
     return {"total": len(total), "items": items}
 
+
+@router.post("/features")
+def derive_email_features(payload: dict, db: Session = Depends(get_db)):
+    items = payload.get("items") or []
+    if not isinstance(items, list):
+        raise HTTPException(400, "invalid payload: items must be list")
+    features = build_email_features(items)
+    if payload.get("persist", True):
+        ids = [int(it.get("id")) for it in items if it.get("id") is not None]
+        if ids:
+            rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(ids))).scalars().all()
+            persist_email_features(db, rows, precomputed=features, force=True, commit=True)
+    return {"features": features}
+
+
+@router.post("/derive")
+def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
+    ids = payload.get("ids") or []
+    if not ids:
+        raise HTTPException(400, "ids is required")
+    try:
+        id_list = [int(i) for i in ids]
+    except Exception:
+        raise HTTPException(400, "invalid ids")
+    rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(id_list))).scalars().all()
+    features = persist_email_features(db, rows, force=bool(payload.get("force", False)), commit=True)
+    return {"status": "ok", "processed": len(rows), "features": features}
 
 @router.post("/send")
 def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):

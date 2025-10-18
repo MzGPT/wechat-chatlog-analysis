@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import EmailAccount, EmailMessage
+from .email_features import persist_email_features
 
 
 def _decode(s: str | bytes | None) -> str | None:
@@ -71,6 +72,7 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
     opts = opts or FetchOptions()
     context = ssl.create_default_context()
     new_count = 0
+    new_rows: List[EmailMessage] = []
 
     if account.imap_ssl:
         M = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=context)
@@ -81,7 +83,20 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
         username = (account.auth or {}).get("username") or account.email_address
         password = (account.auth or {}).get("password") or ""
         M.login(username, password)
-        M.select(opts.folder)
+        # ensure a selectable mailbox is selected; fallback to INBOX
+        try:
+            typ, _ = M.select(opts.folder)
+            if typ != "OK":
+                typ, _ = M.select("INBOX")
+                if typ != "OK":
+                    raise RuntimeError("IMAP select mailbox failed")
+        except Exception:
+            # force close and re-raise to trigger POP3 fallback upstream
+            try:
+                M.logout()
+            except Exception:
+                pass
+            raise
 
         criteria = "UNSEEN" if opts.unseen_only else "ALL"
         typ, data = M.search(None, criteria)
@@ -170,6 +185,7 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
 
             db.add(row)
             db.flush()
+            new_rows.append(row)
             new_count += 1
 
     finally:
@@ -177,6 +193,13 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
             M.logout()
         except Exception:
             pass
+
+    # Persist AI-derived features; wrap in try/except to avoid sync failure if busy
+    if new_rows:
+        try:
+            persist_email_features(db, new_rows, force=True, commit=True)
+        except Exception as feature_err:
+            print(f"[email_engine] persist features failed: {feature_err}")
 
     return new_count
 
@@ -230,6 +253,10 @@ def smtp_send(db: Session, account: EmailAccount, to: list[str], subject: str, b
     )
     db.add(row)
     db.flush()
+    try:
+        persist_email_features(db, [row], force=True, commit=True)
+    except Exception as feature_err:
+        print(f"[email_engine] persist features failed: {feature_err}")
 
     return {"status": "ok", "message_id": row.id}
 
@@ -269,6 +296,8 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
 
     new_count = 0
     server = None
+    new_rows: List[EmailMessage] = []
+    new_rows: List[EmailMessage] = []
     try:
         last_err: Exception | None = None
         for host, port in candidates:
@@ -344,7 +373,14 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
                 body_text=None,
             )
             db.add(row)
+            db.flush()
+            new_rows.append(row)
             new_count += 1
+        if new_rows:
+            try:
+                persist_email_features(db, new_rows, force=True, commit=True)
+            except Exception as feature_err:
+                print(f"[email_engine] persist features failed: {feature_err}")
         return new_count
     finally:
         try:

@@ -218,6 +218,7 @@ class EmailMessageOut(BaseModel):
     body_html: str | None = None
     flags: List[str] | None = None
     meta: dict | None = None
+    derived: dict | None = None
 
     class Config:
         from_attributes = True
