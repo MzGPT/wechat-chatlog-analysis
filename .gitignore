@@ -21,3 +21,7 @@ uvicorn.log
 # OS/editor
 .DS_Store
 .vscode/
+
+# Backups
+*.bak
+static/*.bak
