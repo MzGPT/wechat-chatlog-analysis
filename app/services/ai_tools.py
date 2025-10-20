@@ -132,6 +132,19 @@ def extract_message_features(
                         if appointment_time:
                             parts.append(f"时间:{appointment_time}")
                         key_info = " | ".join(parts)[:120]
+                    else:
+                        # Ensure tool key_info also contains viewpoint
+                        if main_point and main_point not in key_info:
+                            key_info = f"观点:{main_point} | {key_info}"
+
+                    # Ensure summary field surfaces viewpoint at the front for quick scan
+                    try:
+                        if main_point:
+                            s_body = summary.split(":", 1)[1].strip() if ":" in summary else summary
+                            if main_point not in s_body:
+                                summary = f"ai: {main_point[:50]} | {s_body}".strip()
+                    except Exception:
+                        pass
                     chunk_results[msg_id] = {
                         "keywords": keywords,
                         "meeting_number": meeting_number,
