@@ -175,7 +175,8 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
 
         category = feat.get('category') or _infer_category(base.get('subject', ''), raw_text)
 
-        key_info = feat.get('key_info') or ''
+        # 强制保证 key_info 包含观点（main_point），否则将观点置于最前
+        key_info = (feat.get('key_info') or '').strip()
         key_info_origin = 'tool' if key_info else 'fallback'
         if not key_info:
             parts: List[str] = []
@@ -192,9 +193,14 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
             if appointment_time:
                 parts.append(f"时间:{appointment_time}")
             key_info = " | ".join([p for p in parts if p]).strip()[:160]
+        else:
+            vp = (main_point or '').strip()
+            if vp and vp not in key_info:
+                key_info = f"{vp} | {key_info}"
 
         summary_origin = 'tool' if feat.get('summary') or feat.get('summary_full') or feat.get('key_info') else 'fallback'
-        summary_value = summary_short or key_info[:30] or (raw_text[:30])
+        # 摘要优先使用观点，确保前端第一眼看到观点
+        summary_value = (main_point or '').strip()[:30] or summary_short or key_info[:30] or (raw_text[:30])
         if summary_origin == 'tool' and summary_value:
             summary_text = f"ai: {summary_value}"
         else:
