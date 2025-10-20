@@ -95,6 +95,22 @@ def extract_message_features(
                         raise ValueError(f"tool model未返回摘要: id={msg_id}")
                     if not summary.lower().startswith("ai:"):
                         summary = f"ai: {summary}"
+                    # enforce 20-50 char window on the content after 'ai: '
+                    try:
+                        head, body = (summary.split(":",1)[0], summary.split(":",1)[1].strip()) if ":" in summary else ("ai","" )
+                        def _clen(s: str) -> int:
+                            return len(s.replace(" ", ""))
+                        if _clen(body) > 50:
+                            acc = []
+                            for ch in body:
+                                if _clen("".join(acc)+ch) > 50:
+                                    break
+                                acc.append(ch)
+                            body = "".join(acc).strip()
+                        # if too short but we have main_point later we will prepend below
+                        summary = f"ai: {body}".strip()
+                    except Exception:
+                        pass
                     keywords = item.get("keywords") or []
                     if not isinstance(keywords, list):
                         keywords = []
@@ -114,6 +130,8 @@ def extract_message_features(
                     analyst = item.get("analyst") or item.get("researcher") or ""
                     organizer = item.get("organizer") or item.get("预约人") or ""
                     main_point = item.get("main_point") or ""
+                    intent = item.get("intent") or item.get("purpose") or ""
+                    advice = item.get("advice") or item.get("suggestion") or item.get("suggestions") or ""
                     summary_full = item.get("summary_full") or item.get("full_summary") or ""
                     # compose key_info if not provided
                     key_info = str(item.get("key_info") or "").strip()
@@ -142,7 +160,20 @@ def extract_message_features(
                         if main_point:
                             s_body = summary.split(":", 1)[1].strip() if ":" in summary else summary
                             if main_point not in s_body:
-                                summary = f"ai: {main_point[:50]} | {s_body}".strip()
+                                # if too short (<20), pad by adding viewpoint; else prepend viewpoint with separator
+                                def _clen(s: str) -> int:
+                                    return len(s.replace(" ", ""))
+                                if _clen(s_body) < 20:
+                                    s_body = (main_point + " | " + s_body).strip()
+                                else:
+                                    s_body = (main_point[:50] + " | " + s_body).strip()
+                                # clamp 50
+                                acc = []
+                                for ch in s_body:
+                                    if _clen("".join(acc)+ch) > 50:
+                                        break
+                                    acc.append(ch)
+                                summary = f"ai: {''.join(acc).strip()}"
                     except Exception:
                         pass
                     chunk_results[msg_id] = {
@@ -151,6 +182,7 @@ def extract_message_features(
                         "platform": item.get("platform") or item.get("meeting_platform") or "",
                         "category": category,
                         "summary": summary,
+                        "summary_full": summary_full,
                         "tone": (item.get("tone") or "neutral").lower(),
                         "key_info": key_info,
                         "meeting_link": meeting_link,
@@ -158,7 +190,8 @@ def extract_message_features(
                         "analyst": analyst,
                         "organizer": organizer,
                         "main_point": main_point,
-                        "summary_full": summary_full,
+                        "intent": intent,
+                        "advice": advice,
                     }
         except Exception as exc:
             errors.append(str(exc))
