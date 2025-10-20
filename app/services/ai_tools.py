@@ -106,7 +106,10 @@ def extract_message_features(
                     category = raw_cat if raw_cat in allowed_categories else ("其他" if raw_cat else "")
                     # extra fields for email key info
                     meeting_link = item.get("meeting_link") or ""
-                    meeting_number = item.get("meeting_id") or item.get("meeting_number") or ""
+                    # 规范化会议号：仅保留数字，且长度限定在9–13位，避免将“15/13”等误识别为会议号
+                    meeting_number_raw = item.get("meeting_id") or item.get("meeting_number") or ""
+                    meeting_number_digits = re.sub(r"\D", "", str(meeting_number_raw))
+                    meeting_number = meeting_number_digits if 9 <= len(meeting_number_digits) <= 13 else ""
                     appointment_time = item.get("appointment_time") or ""
                     analyst = item.get("analyst") or item.get("researcher") or ""
                     organizer = item.get("organizer") or item.get("预约人") or ""
@@ -305,7 +308,7 @@ def ensure_message_features(
             freq[k] = freq.get(k,0)+1
         return [w for w,_ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:topk]]
 
-    def _fallback_summary(text: str, limit: int = 30) -> str:
+    def _fallback_summary(text: str, limit: int = 50) -> str:
         if not text:
             return ""
         t = re.sub(r"https?://\S+", "", text)
