@@ -197,6 +197,29 @@
 
 ---
 
+## 2025-10-20 调整（去除 key_info + 两段式摘要覆盖）
+
+- 字段与语义
+  - 移除 `derived.key_info` 字段，统一以 `derived.summary` 展示摘要；来源标识为 `derived.summary_origin in {"fallback","tool"}`。
+  - 小模型产出强制以 `ai: ` 前缀；兜底摘要以 `fallback: ` 前缀，便于排查来源；UI 展示时建议去前缀，但使用配色区分。
+
+- 两段式流水线
+  1) 兜底快刷：`populate_fallback_derived()` 立即为有效消息写入短摘要（灰色），不依赖外部接口；
+  2) AI 覆盖：`ensure_message_features()` 在小模型成功返回后覆盖写入（橘色），`summary_origin` 置为 `tool`。不再做“填空式合并”。
+
+- 前端显示建议
+  - “摘要/关键信息”列绑定 `derived.summary`；根据 `derived.summary_origin` 应用样式：`tool → .summary-text.ai`（橘色），`fallback → .summary-text.fallback`（灰色斜体）。
+  - 展示时去掉 `ai:` 与 `fallback:` 前缀，仅保留配色差异；鼠标悬停可显示完整文本与原文片段。
+
+- 提示词与模块
+  - 工具模型提示已去除 key_info 字段要求；会议模块“主题列”直接取 `summary`（去前缀，≤10字）。
+
+- 兼容与迁移
+  - 旧数据中若存在 `derived.key_info`，前端应忽略该字段；无需 DB 迁移。
+  - 测试数据/样例应改为使用 `derived.summary` 与 `summary_origin`。
+
+---
+
 ## 2025-09-25 更新（列表可读性 + 拉取机制 + 黑名单 + 发送集成）
 
 - 路由统一

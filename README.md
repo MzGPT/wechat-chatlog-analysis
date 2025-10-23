@@ -99,6 +99,7 @@ docs/ n8n/      参考文档与示例工作流
 - 热重载：bash scripts/manage.sh dev 或 uvicorn app.main:app --reload
 - 本地数据：python scripts/seed_sample_data.py
 - 生成快照：python scripts/run_summary_snapshot.py --period 3days
+- 运行测试：pytest -q 或 python test_summary_improvement.py
 
 安全与发布建议
 - 切勿提交 .env / data/（已在 .gitignore 中忽略）

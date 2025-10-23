@@ -10,12 +10,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.orm import Session
 
 from ..models import Message
-
-from .llm_client import siliconflow_tool_chat, load_ai_config, DEFAULT_TOOL_PROMPTS
-
+from .llm_client import DEFAULT_TOOL_PROMPTS, load_ai_config, siliconflow_tool_chat
 
 logger = logging.getLogger(__name__)
 
+
+# ----------------------------- helpers -----------------------------
 
 def _batched(iterable: Iterable[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     batch: List[Dict[str, Any]] = []
@@ -29,9 +29,40 @@ def _batched(iterable: Iterable[Dict[str, Any]], size: int) -> Iterable[List[Dic
 
 
 def _tool_prompt_payload(messages: List[Dict[str, Any]], prompt_conf: Dict[str, str]) -> List[Dict[str, str]]:
+    """Build JSON payload for the tool model with defensive normalization.
+
+    Some callers may pass `datetime` objects (e.g., from DB) in the `time` field,
+    which are not JSON-serializable by default. Normalize typical fields to avoid
+    `TypeError: Object of type datetime is not JSON serializable`.
+    """
     system_prompt = prompt_conf.get("system") or DEFAULT_TOOL_PROMPTS["message_summary"]["system"]
     user_template = prompt_conf.get("user") or DEFAULT_TOOL_PROMPTS["message_summary"]["user"]
-    payload_json = json.dumps(messages, ensure_ascii=False)
+
+    norm_messages: List[Dict[str, Any]] = []
+    for m in messages:
+        try:
+            mid = m.get("id")
+            t = m.get("time") or m.get("timestamp")
+            if hasattr(t, "isoformat"):
+                t = t.isoformat()  # datetime -> ISO string
+            sender = m.get("sender") or m.get("sender_name")
+            content = m.get("content") or m.get("content_text") or m.get("text")
+            norm_messages.append(
+                {
+                    "id": str(mid) if mid is not None else "",
+                    "time": t,
+                    "sender": str(sender) if sender is not None else "",
+                    "content": str(content) if content is not None else "",
+                }
+            )
+        except Exception:
+            # Best-effort fallback: convert values that have isoformat(); else use raw
+            try:
+                norm_messages.append({k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in m.items()})  # type: ignore[arg-type]
+            except Exception:
+                norm_messages.append({"id": "", "time": None, "sender": "", "content": ""})
+
+    payload_json = json.dumps(norm_messages, ensure_ascii=False)
     if "{{messages_json}}" in user_template:
         user_content = user_template.replace("{{messages_json}}", payload_json)
     else:
@@ -42,13 +73,15 @@ def _tool_prompt_payload(messages: List[Dict[str, Any]], prompt_conf: Dict[str, 
     ]
 
 
+# ------------------------- tool extraction -------------------------
+
 def extract_message_features(
     messages: List[Dict[str, Any]],
-    batch_size: int = 20,
+    batch_size: int = 1,  # 改为逐条调用
     concurrency: int = 8,
     temperature: float = 0.1,
 ) -> Dict[str, Dict[str, Any]]:
-    """Use the tool LLM to enrich messages with keywords/meetings/summaries."""
+    """逐条调用小模型提取特征（不再批处理）"""
 
     if concurrency < 1:
         concurrency = 1
@@ -56,168 +89,115 @@ def extract_message_features(
     conf = load_ai_config()
     tool_prompt_conf = (conf.get("tool_prompts") or {}).get("message_summary") or DEFAULT_TOOL_PROMPTS["message_summary"]
 
-    prepared_batches: List[List[Dict[str, Any]]] = []
-    for chunk in _batched(messages, batch_size):
-        prepared: List[Dict[str, Any]] = []
-        for msg in chunk:
-            msg_id = msg.get("id") or msg.get("time") or msg.get("message_id") or ""
-            msg_id = str(msg_id)
-            if not msg_id:
-                continue
-            msg.setdefault("id", msg_id)
-            prepared.append({
-                "id": msg_id,
-                "time": msg.get("time") or msg.get("timestamp"),
-                "sender": msg.get("sender") or msg.get("sender_name"),
-                "content": msg.get("content") or msg.get("content_text") or msg.get("text"),
-            })
-        if prepared:
-            prepared_batches.append(prepared)
+    # 准备每条消息
+    prepared: List[Dict[str, Any]] = []
+    for msg in messages:
+        msg_id = msg.get("id") or msg.get("time") or msg.get("message_id") or ""
+        msg_id = str(msg_id)
+        if not msg_id:
+            continue
+        prepared.append({
+            "id": msg_id,
+            "time": msg.get("time") or msg.get("timestamp"),
+            "sender": msg.get("sender") or msg.get("sender_name"),
+            "content": msg.get("content") or msg.get("content_text") or msg.get("text"),
+        })
 
     errors: List[str] = []
 
-    def _process(chunk: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        nonlocal errors
-        chunk_results: Dict[str, Dict[str, Any]] = {}
+    def _process_single(single_msg: Dict[str, Any]) -> tuple[str, Dict[str, Any] | None]:
+        """处理单条消息，返回 (msg_id, result)"""
+        msg_id = single_msg["id"]
         try:
-            prompt = _tool_prompt_payload(chunk, tool_prompt_conf)
+            # 构造单条消息的 prompt（包装成数组以兼容现有格式）
+            prompt = _tool_prompt_payload([single_msg], tool_prompt_conf)
             content = siliconflow_tool_chat(prompt, temperature=temperature)
+            
+            # 解析返回
             data = json.loads(content)
-            if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    msg_id = str(item.get("id") or "").strip()
-                    if not msg_id:
-                        continue
-                    summary = str(item.get("summary") or "").strip()
-                    if not summary:
-                        raise ValueError(f"tool model未返回摘要: id={msg_id}")
-                    if not summary.lower().startswith("ai:"):
-                        summary = f"ai: {summary}"
-                    # enforce 20-50 char window on the content after 'ai: '
-                    try:
-                        head, body = (summary.split(":",1)[0], summary.split(":",1)[1].strip()) if ":" in summary else ("ai","" )
-                        def _clen(s: str) -> int:
-                            return len(s.replace(" ", ""))
-                        if _clen(body) > 50:
-                            acc = []
-                            for ch in body:
-                                if _clen("".join(acc)+ch) > 50:
-                                    break
-                                acc.append(ch)
-                            body = "".join(acc).strip()
-                        # if too short but we have main_point later we will prepend below
-                        summary = f"ai: {body}".strip()
-                    except Exception:
-                        pass
-                    keywords = item.get("keywords") or []
-                    if not isinstance(keywords, list):
-                        keywords = []
-                    # Persist fields returned by the tool model. Some fields are optional in the
-                    # prompt; keep sensible defaults if missing so downstream stays stable.
-                    # Normalize category/tone to expected values to improve robustness.
-                    allowed_categories = {"观点", "会议", "提问", "其他"}
-                    raw_cat = str(item.get("category") or "").strip()
-                    category = raw_cat if raw_cat in allowed_categories else ("其他" if raw_cat else "")
-                    # extra fields for email key info
-                    meeting_link = item.get("meeting_link") or ""
-                    # 规范化会议号：仅保留数字，且长度限定在9–13位，避免将“15/13”等误识别为会议号
-                    meeting_number_raw = item.get("meeting_id") or item.get("meeting_number") or ""
-                    meeting_number_digits = re.sub(r"\D", "", str(meeting_number_raw))
-                    meeting_number = meeting_number_digits if 9 <= len(meeting_number_digits) <= 13 else ""
-                    appointment_time = item.get("appointment_time") or ""
-                    analyst = item.get("analyst") or item.get("researcher") or ""
-                    organizer = item.get("organizer") or item.get("预约人") or ""
-                    main_point = item.get("main_point") or ""
-                    intent = item.get("intent") or item.get("purpose") or ""
-                    advice = item.get("advice") or item.get("suggestion") or item.get("suggestions") or ""
-                    summary_full = item.get("summary_full") or item.get("full_summary") or ""
-                    # compose key_info if not provided
-                    key_info = str(item.get("key_info") or "").strip()
-                    if not key_info:
-                        parts: list[str] = []
-                        if main_point:
-                            parts.append(f"观点:{main_point}")
-                        if analyst:
-                            parts.append(f"研究员:{analyst}")
-                        if organizer:
-                            parts.append(f"预约:{organizer}")
-                        if meeting_link:
-                            parts.append(f"链接:{meeting_link}")
-                        if meeting_number:
-                            parts.append(f"会议号:{meeting_number}")
-                        if appointment_time:
-                            parts.append(f"时间:{appointment_time}")
-                        key_info = " | ".join(parts)[:120]
-                    else:
-                        # Ensure tool key_info also contains viewpoint
-                        if main_point and main_point not in key_info:
-                            key_info = f"观点:{main_point} | {key_info}"
-
-                    # Ensure summary field surfaces viewpoint at the front for quick scan
-                    try:
-                        if main_point:
-                            s_body = summary.split(":", 1)[1].strip() if ":" in summary else summary
-                            if main_point not in s_body:
-                                # if too short (<20), pad by adding viewpoint; else prepend viewpoint with separator
-                                def _clen(s: str) -> int:
-                                    return len(s.replace(" ", ""))
-                                if _clen(s_body) < 20:
-                                    s_body = (main_point + " | " + s_body).strip()
-                                else:
-                                    s_body = (main_point[:50] + " | " + s_body).strip()
-                                # clamp 50
-                                acc = []
-                                for ch in s_body:
-                                    if _clen("".join(acc)+ch) > 50:
-                                        break
-                                    acc.append(ch)
-                                summary = f"ai: {''.join(acc).strip()}"
-                    except Exception:
-                        pass
-                    chunk_results[msg_id] = {
-                        "keywords": keywords,
-                        "meeting_number": meeting_number,
-                        "platform": item.get("platform") or item.get("meeting_platform") or "",
-                        "category": category,
-                        "summary": summary,
-                        "summary_full": summary_full,
-                        "tone": (item.get("tone") or "neutral").lower(),
-                        "key_info": key_info,
-                        "meeting_link": meeting_link,
-                        "appointment_time": appointment_time,
-                        "analyst": analyst,
-                        "organizer": organizer,
-                        "main_point": main_point,
-                        "intent": intent,
-                        "advice": advice,
-                    }
+            if isinstance(data, list) and len(data) > 0:
+                item = data[0]
+            elif isinstance(data, dict):
+                item = data
+            else:
+                raise ValueError(f"意外的返回格式: {type(data)}")
+            
+            if not isinstance(item, dict):
+                raise ValueError(f"返回元素不是dict: {type(item)}")
+            
+            # 提取核心字段
+            summary = str(item.get("summary") or "").strip()
+            if not summary:
+                raise ValueError(f"未返回摘要")
+            if not summary.lower().startswith("ai:"):
+                summary = f"ai: {summary}"
+            
+            # 截断摘要（保留30字可见字符）
+            try:
+                body = summary.split(":", 1)[1].strip() if ":" in summary else summary
+                def _clen(s: str) -> int:
+                    return len(s.replace(" ", ""))
+                if _clen(body) > 30:
+                    acc = []
+                    for ch in body:
+                        if _clen("".join(acc) + ch) > 30:
+                            break
+                        acc.append(ch)
+                    body = "".join(acc).strip()
+                summary = f"ai: {body}"
+            except Exception:
+                pass
+            
+            # 会议号处理
+            meeting_number_raw = item.get("meeting_number") or ""
+            meeting_number_digits = re.sub(r"\D", "", str(meeting_number_raw))
+            meeting_number = meeting_number_digits if 9 <= len(meeting_number_digits) <= 13 else ""
+            
+            # tone 标准化（支持新增的 meeting 类型）
+            tone = str(item.get("tone") or "neutral").lower()
+            allowed_tones = {"bullish", "bearish", "neutral", "meeting"}
+            if tone not in allowed_tones:
+                tone = "neutral"
+            
+            # confidence
+            confidence = float(item.get("confidence", 0.5))
+            confidence = max(0.0, min(1.0, confidence))  # clamp to [0, 1]
+            
+            return msg_id, {
+                "summary": summary,
+                "meeting_number": meeting_number,
+                "tone": tone,
+                "confidence": confidence,
+                # 保留兼容字段（用于后续可能的扩展）
+                "keywords": [],
+                "platform": "",
+                "category": "",
+            }
         except Exception as exc:
-            errors.append(str(exc))
-        return chunk_results
+            errors.append(f"{msg_id}: {exc}")
+            return msg_id, None
 
     results: Dict[str, Dict[str, Any]] = {}
-    if concurrency <= 1 or len(prepared_batches) <= 1:
-        for batch in prepared_batches:
-            results.update(_process(batch))
-        return results
-
+    
+    # 并发处理所有消息
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        future_map = {executor.submit(_process, batch): batch for batch in prepared_batches}
+        future_map = {executor.submit(_process_single, msg): msg for msg in prepared}
         for future in as_completed(future_map):
             try:
-                chunk_results = future.result()
-                results.update(chunk_results)
-            except Exception:
-                continue
+                msg_id, result = future.result()
+                if result:
+                    results[msg_id] = result
+            except Exception as exc:
+                errors.append(str(exc))
 
     if errors:
         results["__errors__"] = errors
-        logger.warning("小模型提取失败: %s", "; ".join(errors))
+        logger.warning("小模型提取失败 (部分): %s", "; ".join(errors[:5]))  # 只记录前5个错误
 
     return results
 
+
+# ---------------------------- adapters ----------------------------
 
 def build_ai_input_messages(messages: List[Dict[str, Any]], features: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
@@ -239,12 +219,14 @@ def build_ai_input_messages(messages: List[Dict[str, Any]], features: Dict[str, 
                 "platform": feature.get("platform", ""),
                 "category": feature.get("category", ""),
                 "summary": feature.get("summary", ""),
-                "tone": feature.get("tone", "neutral"),
-                "key_info": feature.get("key_info", ""),
+                # Normalize tone for downstream filters/modules
+                "tone": str(feature.get("tone", "neutral")).lower(),
             }
         )
     return enriched
 
+
+# ---------------------------- two-pass API ----------------------------
 
 def ensure_message_features(
     db: Session,
@@ -256,8 +238,12 @@ def ensure_message_features(
     concurrency: int = 8,
     temperature: float = 0.1,
 ) -> None:
-    """Populate Message.derived with keywords/summaries via the tool model."""
+    """Overlay tool-model outputs onto Message.derived.
 
+    Assumes populate_fallback_derived has already provided an initial snapshot.
+    This function does NOT do any local fallback; it only updates rows where the tool
+    produced results. summary_origin will be set to "tool" for updated rows.
+    """
     if not messages:
         return
 
@@ -274,14 +260,14 @@ def ensure_message_features(
             continue
 
         text = (msg.content_text or "").strip()
-        # Fallback: build text from meta.contents for link/structured messages
         if not text:
             try:
                 meta = msg.meta or {}
                 contents = meta.get("contents") if isinstance(meta, dict) else None
                 parts: list[str] = []
                 if isinstance(contents, dict):
-                    for k in ("title", "desc", "content", "url"):
+                    # Prefer true body content first; title/url are last-resort hints only
+                    for k in ("content", "desc", "title", "url"):
                         v = contents.get(k)
                         if isinstance(v, str) and v.strip():
                             parts.append(v.strip())
@@ -291,26 +277,10 @@ def ensure_message_features(
         if not text:
             continue
 
-        # Skip re-extraction only when we are confident that prior derived data is
-        # complete and from the tool model. Historically we only checked for
-        # keywords/summary/meeting_number which caused "key_info" to remain empty
-        # forever for older rows, so the frontend kept showing fallback. Make the
-        # condition stricter to ensure "key_info" exists and summary came from tool.
         derived = msg.derived if isinstance(msg.derived, dict) else {}
-        has_keywords = bool(derived.get("keywords"))
         has_summary = bool(derived.get("summary"))
-        has_key_info = bool(str(derived.get("key_info") or "").strip())
-        origin = str(derived.get("summary_origin") or "").lower()  # 'tool' | 'fallback' | ''
-        meeting_present = derived.get("meeting_number") is not None
-        if (
-            not force
-            and has_keywords
-            and has_summary
-            and has_key_info
-            and meeting_present
-            and origin == "tool"
-        ):
-            # Good enough – keep existing derived features.
+        origin = str(derived.get("summary_origin") or "").lower()
+        if (not force) and has_summary and origin == "tool":
             continue
 
         to_extract.append({
@@ -332,29 +302,97 @@ def ensure_message_features(
     )
     tool_errors = features.pop("__errors__", None)
     if tool_errors:
-        # 仅记录日志，不要全局降级，否则会让成功的条目也丢失AI结果
         logger.warning("小模型提取存在部分失败：%s", "; ".join(tool_errors))
 
-    # 本地兜底：若工具模型不可用或返回缺失，为缺失项做简易关键词与摘要提取
+    for msg in messages:
+        fid = str(msg.id)
+        data = features.get(fid)
+        if not data:
+            continue
+        
+        summary_text = str(data.get("summary") or "").strip()
+        if not summary_text:
+            continue
+        if not summary_text.lower().startswith("ai:"):
+            summary_text = f"ai: {summary_text}"
+        
+        meeting_number = str(data.get("meeting_number") or "").strip()
+        tone = str(data.get("tone") or "neutral").lower()
+        confidence = float(data.get("confidence", 0.5))
+        
+        # 从 summary 提取平台信息（辅助逻辑）
+        platform = ""
+        summary_lower = summary_text.lower()
+        if "腾讯" in summary_text or "wemeet" in summary_lower:
+            platform = "腾讯"
+        elif "进门" in summary_text or "jinmen" in summary_lower:
+            platform = "进门"
+        elif "飞书" in summary_text or "feishu" in summary_lower:
+            platform = "飞书"
+        elif "zoom" in summary_lower:
+            platform = "Zoom"
+        elif "teams" in summary_lower:
+            platform = "Teams"
+        elif "钉钉" in summary_text:
+            platform = "钉钉"
+        
+        new_part: Dict[str, Any] = {
+            "summary": summary_text,
+            "meeting_number": meeting_number,
+            "platform": platform,
+            "tone": tone,
+            "confidence": confidence,
+            "summary_origin": "tool",
+            # 兼容字段（保持向后兼容）
+            "keywords": data.get("keywords") or [],
+            "category": data.get("category") or "",
+        }
+        
+        derived = msg.derived if isinstance(msg.derived, dict) else {}
+        derived.update({k: v for k, v in new_part.items()})
+        msg.derived = derived
+        db.add(msg)
+        updated = True
+
+    if updated:
+        db.commit()
+
+
+def populate_fallback_derived(
+    db: Session,
+    messages: List[Message],
+    days_to_keep: int = 7,
+    *,
+    force: bool = False,
+    summary_limit: int = 50,
+) -> int:
+    """Write fallback snapshot first for instant UI.
+
+    Skip rows that already have summary_origin=tool unless force is True.
+    Returns number of rows updated.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
+    changed = 0
+
     def _fallback_keywords(text: str, topk: int = 5) -> List[str]:
         if not text:
             return []
-        # 去掉链接/ID/数字长串
         t = re.sub(r"https?://\S+", " ", text)
         t = re.sub(r"#[A-Za-z0-9_]+|@\S+", " ", t)
         t = re.sub(r"\b\d{5,}\b", " ", t)
-        # 简单分词：按非字母数字汉字切分
         tokens = re.split(r"[^\w\u4e00-\u9fff]+", t)
         tokens = [k.strip().lower() for k in tokens if k.strip()]
-        stop = {"的","了","和","是","在","对","及","与","于","与","以及","相关","我们","他们","你们","你","我","他","她","它","这个","那个","进行","公司","行业","板块","观点","认为","建议","报告","最新","今天","明天","市场","影响","可能"}
+        stop = {"的","了","和","是","在","对","及","与","于","以及","相关","我们","他们","你们","你","我","他","她","它","这个","那个","进行","公司","行业","板块","认为","建议","报告","最新","今天","明天","市场","影响","可能"}
         freq: Dict[str,int] = {}
         for k in tokens:
-            if len(k) <= 1 or k in stop:
+            if k in stop:
                 continue
-            freq[k] = freq.get(k,0)+1
-        return [w for w,_ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)[:topk]]
+            if re.fullmatch(r"\d{5,}", k):
+                continue
+            freq[k] = freq.get(k, 0) + 1
+        return [w for w,_ in sorted(freq.items(), key=lambda x:x[1], reverse=True)[:topk]]
 
-    def _fallback_summary(text: str, limit: int = 50) -> str:
+    def _fallback_summary(text: str, limit: int) -> str:
         if not text:
             return ""
         t = re.sub(r"https?://\S+", "", text)
@@ -364,12 +402,8 @@ def ensure_message_features(
     def _fallback_meeting(text: str) -> tuple[str,str]:
         if not text:
             return "",""
-        number = ""
-        # Heuristic: 9–13 contiguous digits near meeting context tends to be a meeting ID.
-        # (Looser than tool rules but good for offline fallback.)
         m = re.search(r"(?<!\d)(\d{9,13})(?!\d)", text)
-        if m:
-            number = m.group(1)
+        number = m.group(1) if m else ""
         platform = ""
         low = text.lower()
         if "腾讯会议" in text or "wemeet" in low or "meeting.tencent.com" in low:
@@ -387,89 +421,183 @@ def ensure_message_features(
         elif "电话会" in text or "电话会议" in text or re.search(r"(?i)tel|电话|phone", text):
             platform = "电话"
         return number, platform
-    
-    # Remove personal names/mentions to keep key_info focused on观点/要点
-    def _strip_person_refs(s: str) -> str:
-        if not s:
-            return s
-        t = s
-        # Remove @mentions
-        t = re.sub(r"@[^\s:：]{1,20}", "", t)
-        # Remove leading speaker labels like “张三/王总/李老师:”
-        t = re.sub(r"^(?:[\u4e00-\u9fa5]{2,4}(?:[·•][\u4e00-\u9fa5]{1,3})?(?:总|老师|同学|经理|总监|董秘|博士|先生|女士|小姐)?)\s*[:：]\s*", "", t)
-        # Remove common trailing ‘表示/说/提到’ patterns with short name prefix at start
-        t = re.sub(r"^(?:[\u4e00-\u9fa5]{2,4})\s*(?:表示|说|提到|认为|建议)[:：]?\s*", "", t)
-        return t.strip()
+
+    def _infer_tone(text: str) -> str:
+        low = (text or '').lower()
+        pos = ('看多','利好','上调','增持','上涨','改善','超预期','提价','回暖','反弹','增长','积极','强势')
+        neg = ('看空','利空','下调','减持','下跌','承压','不及预期','回落','下滑','风险','下行','疲弱')
+        if any(p in text for p in pos) or any(p in low for p in ('bullish','positive')):
+            return 'bullish'
+        if any(n in text for n in neg) or any(n in low for n in ('bearish','negative')):
+            return 'bearish'
+        return 'neutral'
+
+    def _extract_key_info(text: str) -> str:
+        """Heuristic key_info from full body: prefer 观点/结论/主旨，再看 建议/下一步，兼顾标的/行业。"""
+        if not text:
+            return ''
+        t = re.sub(r"\s+", " ", text)
+        # 1) 明确标注的观点/结论/主旨
+        m = re.search(r"(?:观点|结论|主旨|判断)[:：]\s*([^；。\n]{6,60})", t)
+        if m:
+            return m.group(1).strip()
+        # 2) 建议/下一步
+        m = re.search(r"(?:建议|下一步|行动|策略)[:：]\s*([^；。\n]{6,60})", t)
+        if m:
+            return m.group(1).strip()
+        # 3) 简要抽取前一句较长语句
+        m = re.search(r"([^；。\n]{6,60})(?:；|。|\n)", t)
+        return (m.group(1).strip() if m else t[:60]).strip()
+
     for msg in messages:
-        fid = str(msg.id)
-        data = features.get(fid)
-        origin = "tool"
-        text = (msg.content_text or "").strip()
-        if not data:
-            # 工具模型无返回或整体失败时，做本地兜底
-            kws = _fallback_keywords(text, topk=5)
-            summ = _fallback_summary(text, limit=30)
-            num, plat = _fallback_meeting(text)
-            data = {
-                "keywords": kws,
-                "summary": f"fallback: {summ}" if summ else "fallback: ",
-                "meeting_number": num,
-                "tone": "neutral",
-            }
-            origin = "fallback"
-        else:
-            summary_text = str(data.get("summary") or "").strip()
-            if not summary_text:
-                summary_text = f"fallback: {_fallback_summary(text, 30)}"
-                origin = "fallback"
-            elif not summary_text.lower().startswith("ai:"):
-                summary_text = f"ai: {summary_text}"
-            data["summary"] = summary_text
+        if msg.timestamp and msg.timestamp < cutoff:
+            continue
         derived = msg.derived if isinstance(msg.derived, dict) else {}
-        enriched = data.copy()
-        meeting_number = enriched.get("meeting_number") or ""
-        # Prefer platform from tool output if present; otherwise infer from content.
-        platform = (enriched.get("platform") or "").strip() or None
-        lowered = text.lower()
-        if not platform:
-            if "腾讯会议" in text or "wemeet" in lowered or "meeting.tencent.com" in lowered:
-                platform = "腾讯"
-            elif "进门财经" in text or "jinmen" in lowered:
-                platform = "进门"
-            elif "飞书" in text or "feishu" in lowered or "lark" in lowered:
-                platform = "飞书"
-            elif "zoom" in lowered:
-                platform = "Zoom"
-            elif "teams" in lowered or "microsoft.com" in lowered:
-                platform = "Teams"
-            elif "钉钉" in text or "dingtalk" in lowered:
-                platform = "钉钉"
-        key_parts: List[str] = []
-        if meeting_number:
-            key_parts.append(f"{(platform or '会议')}:{meeting_number}")
-        elif platform:
-            key_parts.append(platform)
-        # Build key_info without keywords or truncation; emphasize viewpoint
-        summary = enriched.get("summary") or ""
-        summary_clean = _strip_person_refs(summary)
-        # Prefer “平台:会议号 | 摘要” if meeting exists, else just 摘要
-        if meeting_number and (platform or "会议"):
-            key_parts.append(summary_clean)
-            enriched["key_info"] = " | ".join([p for p in key_parts if p]).strip()
-        else:
-            enriched["key_info"] = summary_clean
-        # Canonicalize and persist fields expected by frontend
-        if platform:
-            enriched["platform"] = platform
-        if data.get("category") is not None:
-            enriched["category"] = data.get("category") or ""
-        enriched.setdefault("tone", (data.get("tone") or "neutral").lower())
-        enriched["summary_origin"] = origin
+        origin = str(derived.get("summary_origin") or "").lower()
+        if origin == "tool" and not force:
+            continue
+        text = (msg.content_text or "").strip()
+        if not text:
+            meta = msg.meta or {}
+            contents = meta.get("contents") if isinstance(meta, dict) else None
+            parts: list[str] = []
+            if isinstance(contents, dict):
+                for k in ("title", "desc", "content", "url"):
+                    v = contents.get(k)
+                    if isinstance(v, str) and v.strip():
+                        parts.append(v.strip())
+            text = " \n".join(parts).strip()
+        if not text:
+            continue
 
-        derived.update(enriched)
-        msg.derived = derived
-        db.add(msg)
-        updated = True
+        kws = _fallback_keywords(text, topk=5)
+        summ = _fallback_summary(text, limit=summary_limit)
+        num, plat = _fallback_meeting(text)
+        # key_info: 倾向 观点/结论/主旨/建议，长于 6 字。
+        key_src = _extract_key_info(text) or summ or text[:60]
+        # 轻量实体增强：若 key_info 中未明显包含“行业/标的”，且空间允许，则补充首个行业/代码
+        ents = _detect_entities(text)
+        enrich_parts: list[str] = []
+        base = key_src
+        def _present(s: str, frag: str) -> bool:
+            return frag and (frag in s)
+        # prefer industry then ticker
+        if ents.get("industries"):
+            ind = ents["industries"][0]
+            if not _present(base, ind):
+                enrich_parts.append(ind)
+        for group in ("a", "hk", "us"):
+            codes = ents.get(group) or []
+            if codes:
+                code = codes[0]
+                if not _present(base, code):
+                    enrich_parts.append(code)
+                    break
+        if enrich_parts:
+            candidate = (base + " | " + " ".join(enrich_parts)).strip()
+            key_src = candidate
+        def _clip_vis(s: str, limit: int) -> str:
+            acc = []
+            for ch in (s or "").strip():
+                if len("".join(acc).replace(" ", "")) >= limit:
+                    break
+                acc.append(ch)
+            return "".join(acc).strip()
+        key_info = _clip_vis(key_src, 30)
+        tone = _infer_tone(text)
+        # 形成可阅读的 summary_full（结论/建议/要点拼接）
+        parts = []
+        if key_info:
+            parts.append(f"结论：{key_info}")
+        sug = re.search(r"(?:建议|下一步|行动)[:：]\s*([^；。\n]{4,60})", text)
+        if sug:
+            parts.append(f"建议：{sug.group(1).strip()}")
+        # 选取一条依据
+        ev = re.search(r"(?:依据|原因|背景)[:：]\s*([^；。\n]{4,60})", text)
+        if ev:
+            parts.append(f"依据：{ev.group(1).strip()}")
+        summary_full = "；".join(parts)[:180]
+        new_derived = {
+            "keywords": kws,
+            "meeting_number": num,
+            "platform": plat,
+            "tone": tone,
+            "summary": f"fallback: {summ}" if summ else "fallback: ",
+            "summary_origin": "fallback",
+            "key_info": key_info,
+            "key_info_origin": "fallback",
+            "summary_full": summary_full,
+        }
+        before = msg.derived if isinstance(msg.derived, dict) else {}
+        if any(before.get(k) != v for k, v in new_derived.items()):
+            merged = dict(before)
+            merged.update(new_derived)
+            msg.derived = merged
+            db.add(msg)
+            changed += 1
 
-    if updated:
+    if changed:
         db.commit()
+    return changed
+# ---------------------- lightweight entity dictionary ----------------------
+
+_DEFAULT_INDUSTRIES: list[str] = [
+    "半导体", "芯片", "集成电路", "算力", "人工智能", "AI", "云计算",
+    "新能源", "光伏", "储能", "风电", "锂电", "动力电池",
+    "煤炭", "石油", "有色", "钢铁", "化工", "机械",
+    "汽车", "汽车零部件", "整车", "电动车",
+    "银行", "券商", "保险",
+    "白酒", "消费", "家电",
+    "医药", "生物", "医疗",
+    "军工", "国防",
+    "地产", "房地产",
+    "通信", "电力", "公用事业",
+    "TMT", "软件", "游戏", "传媒", "互联网", "电商", "物流", "航运", "航空",
+]
+
+def _load_external_industries() -> list[str]:
+    """Optionally load extra industries from data/entities.json: {"industries": [...]}"""
+    try:
+        import os, json
+        path = os.path.abspath(os.path.join(os.getcwd(), 'data', 'entities.json'))
+        if not os.path.exists(path):
+            return []
+        with open(path, 'r', encoding='utf-8') as f:
+            j = json.load(f)
+        inds = j.get('industries') if isinstance(j, dict) else None
+        if isinstance(inds, list):
+            return [str(x) for x in inds if isinstance(x, (str, int))]
+        return []
+    except Exception:
+        return []
+
+def _detect_entities(text: str) -> dict[str, list[str]]:
+    """Detect lightweight entities: A/H/US tickers and industries.
+
+    - A-share: 60x/00x/30x/68x patterns (strict 6 digits)
+    - HK: 4 digits + .HK or HKxxxx
+    - US: after prefixes (NASDAQ|NYSE|AMEX|US:|Ticker:|代码:) + 1-5 uppercase letters
+    - industries: substring match from a small dictionary
+    """
+    if not text:
+        return {"a": [], "hk": [], "us": [], "industries": []}
+    low = text.lower()
+    # A-share 6-digit codes
+    a_pat = re.compile(r"(?<!\d)(?:60\d{4}|601\d{3}|603\d{3}|605\d{3}|000\d{3}|001\d{3}|002\d{3}|300\d{3}|301\d{3}|688\d{3})(?!\d)")
+    a_codes = a_pat.findall(text)
+    # HK codes
+    hk_pat1 = re.compile(r"\b\d{4}\.(?:hk|HK)\b")
+    hk_pat2 = re.compile(r"\b(?:hk|HK)\d{4}\b")
+    hk_codes = sorted(set(hk_pat1.findall(text) + hk_pat2.findall(text)))
+    # US tickers with context
+    us_pat = re.compile(r"\b(?:NASDAQ|NYSE|AMEX|US:|Ticker[:：]|代码[:：])\s*([A-Z]{1,5})\b")
+    us_codes = [m.group(1) for m in us_pat.finditer(text)]
+    # industries (dedup preserve order)
+    inds: list[str] = []
+    seen = set()
+    ext_inds = _load_external_industries()
+    for ind in list(dict.fromkeys(_DEFAULT_INDUSTRIES + ext_inds)):
+        if ind in text and ind not in seen:
+            inds.append(ind)
+            seen.add(ind)
+    return {"a": a_codes[:3], "hk": hk_codes[:3], "us": us_codes[:3], "industries": inds[:3]}

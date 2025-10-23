@@ -22,6 +22,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
             "- 每个分类下用无序列表列出倾向、关键依据（含联系人与评分）及风险提示。",
             "- 末尾增加 `## 行动建议` 与 `## 关注事项` 两段，给出策略与监控要点。",
             "- 忽略低信息术语（如“流通股本”“所属行业”等）。",
+            "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
             "数据：{{messages_data}}",
         ]),
     },
@@ -37,8 +38,9 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
             "- 使用 `## 概览` 段总结会议数量、行业焦点与信息缺口。",
             "- 使用 Markdown 表格（按时间倒序）：`| 时间(月-日 时:分) | 形式(简称) | 会议号 | 主讲人/机构 | 要点 |`。",
             "  - 平台简称示例：腾讯=腾，进门财经=进，飞书=飞，Zoom=ZM，Teams=TM，钉钉=钉，电话=电。",
-            "  - 主题列直接取消息的 key_info/summary，去掉前缀后截断至 10 个字；保持整行两行以内的精要描述。",
+            "  - 主题列直接取消息的 summary（去掉前缀），截断至 10 个字；保持整行两行以内的精要描述。",
             "- 以 `## 待处理事项` 列出需跟进的动作。",
+            "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
             "数据：{{messages_data}}",
         ]),
     },
@@ -58,7 +60,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
             "  - 结论/建议：给出行动建议或继续核查方向（1-2条）。",
             "- 仅纳入证据充分的真实冲突；不要生造争议。",
             "- 文末使用 `## 总结` 简述整体分歧与下一步。\n- 注意：保持条目清晰，避免表格，严格按上述层级输出。",
-            "数据：{{messages_data}}",
+            "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
         ]),
     },
     "contacts": {
@@ -77,7 +79,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
             "  `- 跟进建议：给出可执行的跟进动作（1-2条）。`",
             "- 可另加 `## 关注联系人` 段落列出潜力对象（同上模版）。",
             "- 可增加 `## 关注联系人` 段落列出潜力对象。",
-            "数据：{{messages_data}}",
+            "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
         ]),
     },
 }
@@ -85,36 +87,31 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
 DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
     "message_summary": {
         "system": (
-            "你是一名严谨的投研小模型助手，必须通读每条邮件/消息并完整理解其含义，"
-            "提炼‘核心观点/意图/建议’，并准确抽取会议要素与分类情绪。"
-            "禁止糊弄与复述片段，摘要必须覆盖全文要点而非标题拼接。"
+            "你是专业的投研信息提取助手。你的任务是：\n"
+            "1. 仔细阅读每封邮件/消息的完整内容\n"
+            "2. 理解其核心意图（路演邀请？观点分享？会议通知？）\n"
+            "3. 提取关键事实（会议号/观点/建议），不要编造\n"
+            "4. 用一句话概括最重要的信息（不超过30字）\n\n"
+            "注意：\n"
+            "- 必须通读完整正文，不要只看标题\n"
+            "- 摘要要提炼实质内容，不要复读标题或拼凑关键词\n"
+            "- 如果内容确实信息量很少，诚实标注'信息有限'"
         ),
         "user": (
-            "请处理以下 JSON 数组（每个元素含 id/time/sender/content），输出 JSON 数组，元素结构：\n"
+            "请逐条分析以下消息（JSON格式：id/time/sender/content），返回JSON数组，每个元素结构：\n"
             "{\n"
-            "  \"id\": string,\n"
-            "  \"summary\": string,                // 20-50字，且以 'ai: ' 开头；概括‘观点+意图/建议’\n"
-            "  \"summary_full\": string,          // 80-180字；覆盖‘结论+依据/背景+建议/下一步’，不得遗漏要点\n"
-            "  \"main_point\": string,            // 一句话观点（<=50字）\n"
-            "  \"intent\": string,                // 发信人意图/诉求（若无留空）\n"
-            "  \"advice\": string,                // 给收信人的建议/下一步（若无留空）\n"
-            "  \"keywords\": [string],            // 3-6个主题词\n"
-            "  \"category\": string,             // 观点/会议/提问/其他\n"
-            "  \"tone\": string,                 // bullish/neutral/bearish\n"
-            "  \"platform\": string,\n"
-            "  \"meeting_number\": string,       // 仅 9-13位或 ***-***-***；否则留空\n"
-            "  \"meeting_link\": string,\n"
-            "  \"appointment_time\": string,\n"
-            "  \"analyst\": string,\n"
-            "  \"organizer\": string,\n"
-            "  \"key_info\": string               // <=160字：整合 main_point/intent/advice 及会议信息的一行\n"
-            "}\n"
-            "严格要求：\n"
-            "- 先充分阅读再写 summary/summary_full，避免只摘标题或会议号。\n"
-            "- summary 要覆盖‘观点+意图/建议’（若有），保持 20-50字；summary_full 覆盖‘结论+依据+建议’。\n"
-            "- meeting_number 仅允许 9-13位或 ***-***-***，不满足则写空。\n"
-            "- category 仅选 观点/会议/提问/其他；tone 仅选 bullish/neutral/bearish。\n"
-            "- 输出有效 JSON（数组），不要多余文本。\n"
+            "  \"id\": string,                    // 必填：消息ID\n"
+            "  \"summary\": string,               // 必填：<=30字自然语句，必须以'ai: '开头，概括核心内容\n"
+            "  \"meeting_number\": string,        // 选填：9-13位纯数字会议号，无则留空\n"
+            "  \"tone\": string,                  // 必填：bullish(看多)/bearish(看空)/neutral(中性)/meeting(会议)\n"
+            "  \"confidence\": float              // 必填：0.0-1.0，你对提取准确性的信心\n"
+            "}\n\n"
+            "说明：\n"
+            "- summary: 用自然语句概括，不要列举关键词。例如：'ai: XX证券邀约芯片板块路演，会议号123456789'\n"
+            "- meeting_number: 只提取纯数字（9-13位），例如'123456789'或'123-456-789'统一写成'123456789'\n"
+            "- tone: 会议邀请选'meeting'；观点看多选'bullish'；看空选'bearish'；中性或不明确选'neutral'\n"
+            "- confidence: 内容完整且确定时>=0.8；信息不足或模糊时<=0.5\n"
+            "- 如果内容太少无法提取有意义摘要，summary写'ai: 信息有限'，confidence设为0.3\n\n"
             "数据：{{messages_json}}"
         ),
     }
@@ -275,3 +272,48 @@ def siliconflow_tool_chat(messages: list[dict], temperature: float = 0.2) -> str
     conf = load_ai_config()
     tool_model = conf.get("tool_model") or "Qwen/Qwen3-8B"
     return siliconflow_chat(messages, temperature=temperature, model_override=tool_model)
+
+
+def siliconflow_chat_stream(messages: list, temperature: float = 0.7, model_override: str = None) -> str:
+    """硅基流动流式对话接口"""
+    conf = load_ai_config()
+    api_key = conf.get("siliconflow_api_key")
+    if not api_key:
+        raise ValueError("SiliconFlow API key not configured")
+    
+    model = model_override or conf.get("model") or "Qwen/Qwen3-8B"
+    
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    data = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, stream=True)
+        response.raise_for_status()
+        
+        for line in response.iter_lines():
+            if line:
+                line = line.decode('utf-8')
+                if line.startswith('data: '):
+                    data_str = line[6:]  # 去掉 'data: ' 前缀
+                    if data_str.strip() == '[DONE]':
+                        break
+                    try:
+                        data_obj = json.loads(data_str)
+                        if 'choices' in data_obj and len(data_obj['choices']) > 0:
+                            delta = data_obj['choices'][0].get('delta', {})
+                            if 'content' in delta:
+                                yield delta['content']
+                    except json.JSONDecodeError:
+                        continue
+    except requests.RequestException as e:
+        raise RuntimeError(f"SiliconFlow API request failed: {e}")

@@ -35,6 +35,35 @@ def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
             parsed_since = None
     try:
         res = sync_from_chatlog(db, parsed_since)
+        # After sync, immediately write fallback summaries so UI shows grey entries
+        from sqlalchemy import select
+        from ..models import Message
+        from ..services.ai_tools import populate_fallback_derived, ensure_message_features
+        # build a conservative window since parsed_since (or 3 days if None)
+        from datetime import datetime, timedelta
+        cutoff = parsed_since or (datetime.utcnow() - timedelta(days=3))
+        recent = db.execute(select(Message).where(Message.timestamp >= cutoff).order_by(Message.id.desc()).limit(5000)).scalars().all()
+        try:
+            populate_fallback_derived(db, recent, force=False)
+        except Exception:
+            pass
+        # Fire-and-forget AI overlay on same window (does not block response)
+        try:
+            import threading
+            from ..db import SessionLocal as _SessionLocal
+            ids = [m.id for m in recent]
+            def _overlay(ids: list[int]):
+                sess = _SessionLocal()
+                try:
+                    rows = sess.execute(select(Message).where(Message.id.in_(ids))).scalars().all()
+                    ensure_message_features(sess, rows, force=False, concurrency=8)
+                except Exception:
+                    pass
+                finally:
+                    sess.close()
+            threading.Thread(target=_overlay, args=(ids,), daemon=True).start()
+        except Exception:
+            pass
         refresh_default_snapshots(db)
         db.commit()
         return res

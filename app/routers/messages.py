@@ -12,7 +12,7 @@ from ..services.llm_client import load_ai_config
 from ..services.message_filters import filter_effective_messages
 from starlette.responses import Response
 from typing import Dict, Any, List
-import csv, io, html
+import csv, io, html, json
 from datetime import datetime, timedelta, timezone
 
 
@@ -112,18 +112,66 @@ def list_messages(
         # 为了保证列表接口快速稳定，这里不触发小模型派生；
         # 派生由前端在进入页面或点击“拉取”时调用 /api/messages/derive 完成
         total = db.execute(count_sql, {k: v for k, v in params.items() if k != "limit" and k != "offset"}).scalar() or 0
+        def _compose_display_summary(d: dict | None) -> str:
+            try:
+                if not isinstance(d, dict):
+                    return ""
+                num = (d.get("meeting_number") or "").strip()
+                plat = (d.get("platform") or "").strip()
+                key = (d.get("key_info") or "").strip()
+                left = " ".join([x for x in (num, plat) if x])
+                if key:
+                    return f"{left} | {key}" if left else key
+                return left
+            except Exception:
+                return ""
+
         data = []
         for row in items:
             rd = dict(row)
             msg_id = rd.get("id")
             if msg_id in derived_map:
                 rd["derived"] = derived_map[msg_id]
+            
+            # Fix JSON field parsing for FTS queries
+            # FTS queries return JSON fields as strings, need to parse them
+            try:
+                if isinstance(rd.get("meta"), str):
+                    rd["meta"] = json.loads(rd["meta"]) if rd["meta"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["meta"] = None
+                
+            try:
+                if isinstance(rd.get("derived"), str):
+                    rd["derived"] = json.loads(rd["derived"]) if rd["derived"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["derived"] = None
+                
+            try:
+                if isinstance(rd.get("tags"), str):
+                    rd["tags"] = json.loads(rd["tags"]) if rd["tags"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["tags"] = None
+            
             # include raw meta to allow frontend to render link/image badges
             if rd.get("meta") is None and hasattr(row, 'meta'):
                 try:
                     rd["meta"] = row["meta"]
                 except Exception:
                     pass
+            # 兼容旧前端：回填 key_info/key_info_origin
+            try:
+                d = rd.get("derived") or {}
+                if isinstance(d, dict):
+                    if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                        d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+                    if d.get("summary_origin") and not d.get("key_info_origin"):
+                        d["key_info_origin"] = d.get("summary_origin")
+                    # Compose display-only summary from meeting_number/platform/key_info
+                    d["display_summary"] = _compose_display_summary(d)
+                    rd["derived"] = d
+            except Exception:
+                pass
             data.append(MessageOut(**rd))
         return {"total": int(total), "items": data}
 
@@ -180,7 +228,35 @@ def list_messages(
     # except Exception:
     #     concurrency = 8
     # ensure_message_features(db, list(items), concurrency=concurrency)
-    return {"total": int(total), "items": [MessageOut.model_validate(i) for i in items]}
+    def _compose_display_summary(d: dict | None) -> str:
+        try:
+            if not isinstance(d, dict):
+                return ""
+            num = (d.get("meeting_number") or "").strip()
+            plat = (d.get("platform") or "").strip()
+            key = (d.get("key_info") or "").strip()
+            left = " ".join([x for x in (num, plat) if x])
+            if key:
+                return f"{left} | {key}" if left else key
+            return left
+        except Exception:
+            return ""
+
+    compat_items: list[MessageOut] = []
+    for i in items:
+        out = MessageOut.model_validate(i)
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            d["display_summary"] = _compose_display_summary(d)
+            out.derived = d
+        except Exception:
+            pass
+        compat_items.append(out)
+    return {"total": int(total), "items": compat_items}
 
 
 @router.get("/effective", response_model=PaginatedMessages)
@@ -296,7 +372,20 @@ def list_effective_messages(
     if id_map:
         orm_page = db.execute(select(Message).where(Message.id.in_(id_map))).scalars().all()
         orm_page.sort(key=lambda m: m.timestamp or datetime.min, reverse=True)
-    return {"total": int(total), "items": [MessageOut.model_validate(i) for i in orm_page]}
+    compat_items: list[MessageOut] = []
+    for i in orm_page:
+        out = MessageOut.model_validate(i)
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            out.derived = d
+        except Exception:
+            pass
+        compat_items.append(out)
+    return {"total": int(total), "items": compat_items}
 
 
 @router.post("/{message_id}/upvote", response_model=UpDownVoteResult)
@@ -413,7 +502,29 @@ def export_messages(
             "ORDER BY m.timestamp DESC"
         )
         rows = db.execute(fts_sql, params).mappings().all()
-        items = [MessageOut(**dict(r)) for r in rows]
+        items = []
+        for r in rows:
+            rd = dict(r)
+            # Fix JSON field parsing for FTS queries
+            try:
+                if isinstance(rd.get("meta"), str):
+                    rd["meta"] = json.loads(rd["meta"]) if rd["meta"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["meta"] = None
+                
+            try:
+                if isinstance(rd.get("derived"), str):
+                    rd["derived"] = json.loads(rd["derived"]) if rd["derived"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["derived"] = None
+                
+            try:
+                if isinstance(rd.get("tags"), str):
+                    rd["tags"] = json.loads(rd["tags"]) if rd["tags"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["tags"] = None
+            
+            items.append(MessageOut(**rd))
     else:
         query = select(Message)
         if chat_id:
@@ -570,4 +681,33 @@ def get_messages_by_ids(ids: str, db: Session = Depends(get_db)):
     rows = db.execute(select(Message).where(Message.id.in_(id_list))).scalars().all()
     # keep same order
     rows.sort(key=lambda m: (m.timestamp or datetime.min), reverse=True)
-    return {"total": len(rows), "items": [MessageOut.model_validate(i) for i in rows]}
+
+    def _compose_display_summary(d: dict | None) -> str:
+        try:
+            if not isinstance(d, dict):
+                return ""
+            num = (d.get("meeting_number") or "").strip()
+            plat = (d.get("platform") or "").strip()
+            key = (d.get("key_info") or "").strip()
+            left = " ".join([x for x in (num, plat) if x])
+            if key:
+                return f"{left} | {key}" if left else key
+            return left
+        except Exception:
+            return ""
+
+    items: list[MessageOut] = []
+    for i in rows:
+        out = MessageOut.model_validate(i)
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            d["display_summary"] = _compose_display_summary(d)
+            out.derived = d
+        except Exception:
+            pass
+        items.append(out)
+    return {"total": len(rows), "items": items}

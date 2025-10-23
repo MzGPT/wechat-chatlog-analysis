@@ -22,7 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import EmailAccount, EmailMessage
-from .email_features import persist_email_features
+from .email_features import persist_email_features, persist_email_fallback
+import threading
 
 
 def _decode(s: str | bytes | None) -> str | None:
@@ -194,12 +195,37 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
         except Exception:
             pass
 
-    # Persist AI-derived features; wrap in try/except to avoid sync failure if busy
+    # First persist local fallback summaries for instant UI
     if new_rows:
         try:
-            persist_email_features(db, new_rows, force=True, commit=True)
+            persist_email_fallback(db, new_rows, force=True, commit=True)
         except Exception as feature_err:
-            print(f"[email_engine] persist features failed: {feature_err}")
+            print(f"[email_engine] persist fallback failed: {feature_err}")
+        # Then schedule AI features asynchronously to overlay later
+        def _run_ai_overlay(ids: list[int]):
+            sess = None
+            try:
+                from ..db import SessionLocal as _SessionLocal
+                sess = _SessionLocal()
+                rows = sess.execute(select(EmailMessage).where(EmailMessage.id.in_(ids))).scalars().all()
+                persist_email_features(sess, rows, force=True, commit=True)
+            except Exception as e:
+                print(f"[email_engine] async ai overlay failed: {e}")
+            finally:
+                try:
+                    if sess:
+                        sess.close()
+                except Exception:
+                    pass
+        try:
+            t = threading.Thread(target=_run_ai_overlay, args=([r.id for r in new_rows],), daemon=True)
+            t.start()
+        except Exception:
+            # fallback to sync if thread creation fails
+            try:
+                persist_email_features(db, new_rows, force=True, commit=True)
+            except Exception as feature_err:
+                print(f"[email_engine] persist features failed: {feature_err}")
 
     return new_count
 
@@ -254,7 +280,14 @@ def smtp_send(db: Session, account: EmailAccount, to: list[str], subject: str, b
     db.add(row)
     db.flush()
     try:
-        persist_email_features(db, [row], force=True, commit=True)
+        # immediate fallback, then async overlay
+        persist_email_fallback(db, [row], force=True, commit=True)
+        try:
+            t = threading.Thread(target=lambda: persist_email_features(db, [row], force=True, commit=True), daemon=True)
+            t.start()
+        except Exception:
+            # if thread fails, do sync
+            persist_email_features(db, [row], force=True, commit=True)
     except Exception as feature_err:
         print(f"[email_engine] persist features failed: {feature_err}")
 

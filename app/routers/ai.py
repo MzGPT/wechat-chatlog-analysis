@@ -19,6 +19,7 @@ from ..services.llm_client import (
 from ..services.ai_tools import extract_message_features, build_ai_input_messages
 from ..services.report_artifacts import build_artifact_payloads
 from ..services.snapshot_service import upsert_snapshot
+import os
 import html
 import json
 import re
@@ -187,6 +188,17 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             except Exception:
                 continue
 
+        # 保存原始数据集文件，供大模型完整读取与审计
+        try:
+            ds_dir = os.path.abspath(os.path.join(os.getcwd(), 'data', 'datasets'))
+            os.makedirs(ds_dir, exist_ok=True)
+            ds_name = f"messages_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
+            ds_path = os.path.join(ds_dir, ds_name)
+            with open(ds_path, 'w', encoding='utf-8') as f:
+                json.dump(snapshot.messages or [], f, ensure_ascii=False, indent=2)
+        except Exception:
+            ds_path = None
+
         summary_payload = {
             "messages": snapshot.messages or [],
             "prompts": prompts,
@@ -195,6 +207,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             "meta": snapshot.meta or {},
             "modules": modules,
             "temperature": temperature,
+            "dataset_path": ds_path,
         }
 
         local_summary = _run_summary_local(summary_payload)
@@ -406,6 +419,33 @@ def set_ai_config(conf: dict):
     return {"status": "ok"}
 
 
+@router.get("/entities")
+def get_entities():
+    path = os.path.abspath(os.path.join(os.getcwd(), 'data', 'entities.json'))
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data = {"industries": []}
+    except Exception:
+        data = {"industries": []}
+    return data
+
+
+@router.post("/entities")
+def set_entities(body: dict):
+    inds = body.get('industries')
+    if inds is None or not isinstance(inds, list):
+        raise HTTPException(400, 'industries must be a list')
+    payload = {"industries": [str(x) for x in inds]}
+    path = os.path.abspath(os.path.join(os.getcwd(), 'data', 'entities.json'))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return {"status": "ok"}
+
+
 def _run_summary_local(payload: dict) -> dict:
     # payload expects: { messages: [...], prompts: {...}, options:{}, contact_ratings:{}, contact_details:{} }
     msgs = payload.get("messages", []) or []
@@ -473,8 +513,17 @@ def _run_summary_local(payload: dict) -> dict:
         conf = load_ai_config()
         module_prompts = conf.get("module_prompts", {})
 
-        features = extract_message_features(msgs)
-        enriched_messages = build_ai_input_messages(msgs, features)
+        # 使用原始消息作为大模型输入，不依赖小模型摘要
+        enriched_messages = []
+        for m in msgs[:2000]:
+            enriched_messages.append({
+                "id": m.get("id"),
+                "time": m.get("time") or m.get("timestamp"),
+                "sender": m.get("sender_name") or m.get("sender_id"),
+                "talker": m.get("talker_name") or m.get("chat_id"),
+                "message_type": m.get("message_type") or m.get("type"),
+                "content": m.get("content") or m.get("content_text") or m.get("text"),
+            })
 
         # 紧凑化传入大模型的数据，避免上下文过大导致超限/失败
         def _safe_str(v: Any) -> str:
@@ -503,30 +552,23 @@ def _run_summary_local(payload: dict) -> dict:
         market_terms = ("认为", "观点", "策略", "看多", "看空", "判断", "建议", "风险", "目标价", "估值", "行业", "公司", "基本面", "宏观", "政策")
 
         def _is_meeting(m: dict) -> bool:
-            if (m.get("meeting_number") or "").strip():
-                return True
-            text = (m.get("summary") or m.get("content") or "").strip()
+            text = (m.get("content") or "").strip()
             return any(t in text for t in meeting_terms)
 
         def _is_market(m: dict) -> bool:
-            text = (m.get("summary") or m.get("content") or "").strip()
+            text = (m.get("content") or "").strip()
             return any(t in text for t in market_terms)
 
         def _is_counter(m: dict) -> bool:
-            text = (m.get("summary") or m.get("content") or "").strip()
-            return any(t in text for t in market_terms) or (m.get("tone") in ("positive", "negative"))
+            text = (m.get("content") or "").strip()
+            return any(t in text for t in market_terms)
 
         high_contact_senders = {c.get("sender") for c in locals().get("high_contacts", []) if c.get("sender")}
 
         # 统一裁剪长度，尽量依赖摘要/关键词，正文仅取前200字符
         def _compact(ms: list[dict], prefer_meetings: bool = False, limit: int = 400) -> list[dict]:
             selected: list[dict] = []
-            if prefer_meetings:
-                with_number = [m for m in ms if (m.get("meeting_number") or "").strip()]
-                without_number = [m for m in ms if not (m.get("meeting_number") or "").strip()]
-                pool = with_number + without_number
-            else:
-                pool = ms
+            pool = ms
             for m in pool:
                 if len(selected) >= limit:
                     break
@@ -536,11 +578,7 @@ def _run_summary_local(payload: dict) -> dict:
                     "sender": m.get("sender") or m.get("sender_name"),
                     "talker": m.get("talker"),
                     "message_type": m.get("message_type"),
-                    "summary": (m.get("summary") or "")[:180],
-                    "keywords": m.get("keywords") or [],
-                    "tone": m.get("tone") or "neutral",
-                    "meeting_number": m.get("meeting_number") or "",
-                    # 保留少量正文以便模型理解上下文
+                    # 保留少量正文以便模型理解上下文，仅传原文
                     "content": (_safe_str(m.get("content"))[:200]),
                 })
             return selected
@@ -730,13 +768,13 @@ def _run_summary_local(payload: dict) -> dict:
 
             # 粗略 token 预算，防止超过大上下文（~128k tokens）；按字符估算并分块摘要再合并
             try:
-                est_tokens = sum(len((m.get("summary") or "")) + len((m.get("content") or "")) for m in module_payload["messages"]) * 1.1
+                est_tokens = sum(len((m.get("content") or "")) for m in module_payload["messages"]) * 1.1
                 if est_tokens > 120_000 and len(module_payload["messages"]) > 200:
                     chunks: list[list[dict]] = []
                     chunk: list[dict] = []
                     budget = 0
                     for m in module_payload["messages"]:
-                        cost = len((m.get("summary") or "")) + len((m.get("content") or "")) + 64
+                        cost = len((m.get("content") or "")) + 64
                         if budget + cost > 40_000 and chunk:
                             chunks.append(chunk)
                             chunk = []
@@ -1005,7 +1043,8 @@ def _run_summary_local(payload: dict) -> dict:
                     if key in seen:
                         continue
                     seen.add(key)
-                    key_info = (m.get("key_info") or m.get("summary") or m.get("content") or "").strip()
+                    # 使用 summary 作为主题要点来源（已移除 key_info 字段）
+                    base_summary = (m.get("summary") or m.get("content") or "").strip()
                     shown_time = _extract_time_from_text(text) or _fmt_meeting_time(m.get("time"))
                     items.append({
                         "id": m.get("id") or m.get("message_id"),
@@ -1013,7 +1052,7 @@ def _run_summary_local(payload: dict) -> dict:
                         "platform": _abbr_platform(platform),
                         "number": meeting_no or "待确认",
                         "speaker": m.get("sender") or m.get("sender_name") or "-",
-                        "topic": _short_cn(key_info, 10) or "-",
+                        "topic": _short_cn(base_summary, 10) or "-",
                     })
             # sort by time desc
             items.sort(key=lambda x: x.get("time") or "", reverse=True)
@@ -1031,7 +1070,8 @@ def _run_summary_local(payload: dict) -> dict:
             return "\n".join(md)
 
         def _normalize_conflict_theme(m: dict) -> str:
-            base = (m.get("key_info") or m.get("summary") or m.get("content") or "").strip()
+            # 统一使用 summary 作为议题主题来源
+            base = (m.get("summary") or m.get("content") or "").strip()
             if base.lower().startswith("ai:"):
                 base = base[3:].strip()
             return _short(base, 40) or "未命名议题"

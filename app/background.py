@@ -20,7 +20,23 @@ async def _sync_loop():
         try:
             db = SessionLocal()
             try:
-                sync_from_chatlog(db)
+                res = sync_from_chatlog(db)
+                # After sync, apply fallback summaries for recent messages (last 3 days)
+                from sqlalchemy import select
+                from datetime import datetime, timedelta
+                from .models import Message
+                from .services.ai_tools import populate_fallback_derived, ensure_message_features
+                cutoff = datetime.utcnow() - timedelta(days=3)
+                recent = db.execute(select(Message).where(Message.timestamp >= cutoff).order_by(Message.id.desc()).limit(2000)).scalars().all()
+                try:
+                    populate_fallback_derived(db, recent, force=False)
+                except Exception:
+                    pass
+                # Start async overlay in a background task (best-effort, small batch)
+                try:
+                    ensure_message_features(db, recent, force=False, concurrency=8)
+                except Exception:
+                    pass
                 db.commit()
             finally:
                 db.close()
