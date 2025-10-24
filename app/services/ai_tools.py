@@ -252,11 +252,8 @@ def ensure_message_features(
     updated = False
 
     for msg in messages:
-        if msg.timestamp and msg.timestamp < cutoff:
-            if msg.derived:
-                msg.derived = None
-                db.add(msg)
-                updated = True
+        # Skip very old messages unless force=True (explicit derive request)
+        if (not force) and msg.timestamp and msg.timestamp < cutoff:
             continue
 
         text = (msg.content_text or "").strip()

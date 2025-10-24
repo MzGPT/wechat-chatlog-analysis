@@ -633,6 +633,12 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
             "total": len(messages),
             "done": 0,
         }
+        # When explicitly deriving selected messages, default to force=True to bypass age cutoffs
+        try:
+            if (body.message_ids and len(body.message_ids) > 0):
+                body.force = True
+        except Exception:
+            body.force = True
         # process in chunks to report progress
         bs = max(1, int(body.batch_size or 20))
         idx = 0
@@ -651,10 +657,11 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         PROGRESS[progress_key]["status"] = "done"
         return {"status": "ok", "updated": len(messages), "progress_key": progress_key}
 
+    # When explicitly deriving selected messages (non-progress path), also force tool overlay by default
     ensure_message_features(
         db,
         messages,
-        force=body.force,
+        force=(True if (body.message_ids and len(body.message_ids) > 0) else body.force),
         batch_size=body.batch_size,
         concurrency=body.concurrency,
         temperature=body.temperature,
