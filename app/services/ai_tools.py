@@ -104,8 +104,9 @@ def extract_message_features(
         })
 
     errors: List[str] = []
+    debug: List[Dict[str, Any]] = []
 
-    def _process_single(single_msg: Dict[str, Any]) -> tuple[str, Dict[str, Any] | None]:
+    def _process_single(single_msg: Dict[str, Any]) -> tuple[str, Dict[str, Any] | None, Dict[str, Any]]:
         """处理单条消息，返回 (msg_id, result)"""
         msg_id = single_msg["id"]
         try:
@@ -163,6 +164,7 @@ def extract_message_features(
             confidence = float(item.get("confidence", 0.5))
             confidence = max(0.0, min(1.0, confidence))  # clamp to [0, 1]
             
+            dbg = {"id": msg_id, "ok": True, "raw": (content[:500] if isinstance(content, str) else str(type(content))) }
             return msg_id, {
                 "summary": summary,
                 "meeting_number": meeting_number,
@@ -172,10 +174,19 @@ def extract_message_features(
                 "keywords": [],
                 "platform": "",
                 "category": "",
-            }
+            }, dbg
         except Exception as exc:
+            raw_preview = None
+            try:
+                # 尝试截取原始返回文本，便于调试
+                raw_preview = content[:500] if isinstance(locals().get('content'), str) else None  # type: ignore[name-defined]
+            except Exception:
+                raw_preview = None
             errors.append(f"{msg_id}: {exc}")
-            return msg_id, None
+            dbg = {"id": msg_id, "ok": False, "error": str(exc)}
+            if raw_preview:
+                dbg["raw"] = raw_preview
+            return msg_id, None, dbg
 
     results: Dict[str, Dict[str, Any]] = {}
     
@@ -184,7 +195,9 @@ def extract_message_features(
         future_map = {executor.submit(_process_single, msg): msg for msg in prepared}
         for future in as_completed(future_map):
             try:
-                msg_id, result = future.result()
+                msg_id, result, dbg = future.result()
+                if isinstance(dbg, dict):
+                    debug.append(dbg)
                 if result:
                     results[msg_id] = result
             except Exception as exc:
@@ -192,7 +205,8 @@ def extract_message_features(
 
     if errors:
         results["__errors__"] = errors
-        logger.warning("小模型提取失败 (部分): %s", "; ".join(errors[:5]))  # 只记录前5个错误
+    results["__debug__"] = debug
+    logger.warning("小模型提取失败 (部分): %s", "; ".join(errors[:5]))  # 只记录前5个错误
 
     return results
 
@@ -251,6 +265,7 @@ def ensure_message_features(
     to_extract: List[Dict[str, Any]] = []
     updated = False
     updated_count = 0
+    applied: List[Dict[str, Any]] = []
 
     for msg in messages:
         # Skip very old messages unless force=True (explicit derive request)
@@ -299,6 +314,7 @@ def ensure_message_features(
         temperature=temperature,
     )
     tool_errors = features.pop("__errors__", None)
+    tool_debug = features.pop("__debug__", None)
     if tool_errors:
         logger.warning("小模型提取存在部分失败：%s", "; ".join(tool_errors))
 
@@ -346,16 +362,26 @@ def ensure_message_features(
             "category": data.get("category") or "",
         }
         
-        derived = msg.derived if isinstance(msg.derived, dict) else {}
-        derived.update({k: v for k, v in new_part.items()})
-        msg.derived = derived
+        # Always assign a new dict instance so SQLAlchemy marks column as changed
+        before = msg.derived if isinstance(msg.derived, dict) else {}
+        merged = dict(before)
+        merged.update({k: v for k, v in new_part.items()})
+        msg.derived = merged
         db.add(msg)
         updated = True
         updated_count += 1
+        try:
+            applied.append({
+                "id": int(getattr(msg, 'id')),
+                "summary": summary_text,
+                "origin": "tool",
+            })
+        except Exception:
+            pass
 
     if updated:
         db.commit()
-    return {"updated": updated_count, "errors": tool_errors or []}
+    return {"updated": updated_count, "errors": tool_errors or [], "debug": tool_debug or [], "applied": applied}
 
 
 def populate_fallback_derived(
@@ -529,6 +555,12 @@ def populate_fallback_derived(
             "summary_full": summary_full,
         }
         before = msg.derived if isinstance(msg.derived, dict) else {}
+        # Do not override tool results unless force=True
+        try:
+            if (not force) and isinstance(before, dict) and str(before.get("summary_origin") or '').lower() == 'tool':
+                continue
+        except Exception:
+            pass
         if any(before.get(k) != v for k, v in new_derived.items()):
             merged = dict(before)
             merged.update(new_derived)

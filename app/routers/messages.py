@@ -643,7 +643,10 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         bs = max(1, int(body.batch_size or 20))
         idx = 0
         errs: list[str] = []
+        debs: list[dict] = []
         total_updated = 0
+        # collect ids for debug readback
+        id_list = [int(getattr(m, 'id')) for m in messages if getattr(m, 'id', None) is not None]
         while idx < len(messages):
             chunk = messages[idx : idx + bs]
             res = ensure_message_features(
@@ -659,14 +662,31 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
                 e = res.get("errors") or []
                 if isinstance(e, list):
                     errs.extend([str(x) for x in e])
+                d = res.get("debug") or []
+                if isinstance(d, list):
+                    debs.extend(d)
+                a = res.get("applied") or []
+                if isinstance(a, list):
+                    debs.extend([{**x, "applied": True} for x in a])
             except Exception:
                 pass
             PROGRESS[progress_key]["done"] = min(len(messages), idx + len(chunk))
             idx += bs
         PROGRESS[progress_key]["status"] = "done"
-        return {"status": "ok", "updated": total_updated, "errors": errs[:50], "progress_key": progress_key}
+        # immediate read-back for debugging: what does DB store now?
+        readback: list[dict] = []
+        try:
+            if id_list:
+                rows = db.execute(select(Message.id, Message.derived).where(Message.id.in_(id_list))).all()
+                for rid, derv in rows:
+                    # limit size for safety
+                    readback.append({"id": int(rid), "summary_origin": (derv or {}).get("summary_origin") if isinstance(derv, dict) else None, "has_ai": bool(isinstance(derv, dict) and isinstance(derv.get("summary"), str) and derv.get("summary"," ").lower().strip().startswith("ai:"))})
+        except Exception:
+            pass
+        return {"status": "ok", "updated": total_updated, "errors": errs[:50], "debug": debs[:50], "debug_readback": readback[:50], "progress_key": progress_key}
 
     # When explicitly deriving selected messages (non-progress path), also force tool overlay by default
+    id_list = [int(getattr(m, 'id')) for m in messages if getattr(m, 'id', None) is not None]
     res = ensure_message_features(
         db,
         messages,
@@ -679,7 +699,23 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         updated = int(res.get("updated", len(messages)))
     except Exception:
         updated = len(messages)
-    return {"status": "ok", "updated": updated, "errors": (res.get("errors") or [])[:50]}
+    # read-back now
+    readback: list[dict] = []
+    try:
+        if id_list:
+            rows = db.execute(select(Message.id, Message.derived).where(Message.id.in_(id_list))).all()
+            for rid, derv in rows:
+                readback.append({"id": int(rid), "summary_origin": (derv or {}).get("summary_origin") if isinstance(derv, dict) else None, "has_ai": bool(isinstance(derv, dict) and isinstance(derv.get("summary"), str) and derv.get("summary"," ").lower().strip().startswith("ai:"))})
+    except Exception:
+        pass
+    deb = (res.get("debug") or [])
+    appd = (res.get("applied") or [])
+    debug_combined = []
+    if isinstance(deb, list):
+        debug_combined.extend(deb)
+    if isinstance(appd, list):
+        debug_combined.extend([{**x, "applied": True} for x in appd])
+    return {"status": "ok", "updated": updated, "errors": (res.get("errors") or [])[:50], "debug": debug_combined[:50], "debug_readback": readback[:50]}
 
 
 @router.get("/derive/progress")

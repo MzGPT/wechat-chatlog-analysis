@@ -420,9 +420,10 @@ def persist_email_features(
         feat = features.get(fid)
         if not feat:
             continue
-        derived = em.derived if isinstance(em.derived, dict) else {}
-        derived.update(feat)
-        em.derived = derived
+        before = em.derived if isinstance(em.derived, dict) else {}
+        merged = dict(before)
+        merged.update(feat)
+        em.derived = merged  # assign new dict instance to ensure SQLAlchemy change tracking
         db.add(em)
 
     if commit:
@@ -472,9 +473,10 @@ def persist_email_fallback(
         feat = features.get(fid)
         if not feat:
             continue
-        derived = em.derived if isinstance(em.derived, dict) else {}
-        derived.update(feat)
-        em.derived = derived
+        before = em.derived if isinstance(em.derived, dict) else {}
+        merged = dict(before)
+        merged.update(feat)
+        em.derived = merged  # assign new dict instance to ensure SQLAlchemy change tracking
         db.add(em)
     if commit:
         db.commit()
