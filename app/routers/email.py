@@ -194,6 +194,18 @@ def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(400, "invalid ids")
     rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(id_list))).scalars().all()
     features = persist_email_features(db, rows, force=bool(payload.get("force", False)), commit=True)
+    # readback for debug visibility
+    readback: list[dict] = []
+    try:
+        rws = db.execute(select(EmailMessage.id, EmailMessage.derived).where(EmailMessage.id.in_(id_list))).all()
+        for rid, derv in rws:
+            readback.append({
+                "id": int(rid),
+                "summary_origin": (derv or {}).get("summary_origin") if isinstance(derv, dict) else None,
+                "has_ai": bool(isinstance(derv, dict) and isinstance(derv.get("summary"), str) and derv.get("summary"," ").lower().strip().startswith("ai:")),
+            })
+    except Exception:
+        pass
     # 兼容前端：填充 key_info/key_info_origin 字段
     compat = {}
     for k, f in (features or {}).items():
@@ -206,7 +218,7 @@ def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
         if g.get("summary_origin") and not g.get("key_info_origin"):
             g["key_info_origin"] = g.get("summary_origin")
         compat[k] = g
-    return {"status": "ok", "processed": len(rows), "features": compat}
+    return {"status": "ok", "processed": len(rows), "features": compat, "debug_readback": readback[:50]}
 
 @router.post("/send")
 def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):
