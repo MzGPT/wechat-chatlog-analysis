@@ -237,7 +237,7 @@ def ensure_message_features(
     batch_size: int = 20,
     concurrency: int = 8,
     temperature: float = 0.1,
-) -> None:
+) -> dict:
     """Overlay tool-model outputs onto Message.derived.
 
     Assumes populate_fallback_derived has already provided an initial snapshot.
@@ -250,6 +250,7 @@ def ensure_message_features(
     cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
     to_extract: List[Dict[str, Any]] = []
     updated = False
+    updated_count = 0
 
     for msg in messages:
         # Skip very old messages unless force=True (explicit derive request)
@@ -289,7 +290,7 @@ def ensure_message_features(
     if not to_extract:
         if updated:
             db.commit()
-        return
+        return {"updated": 0, "errors": []}
 
     features = extract_message_features(
         to_extract,
@@ -350,9 +351,11 @@ def ensure_message_features(
         msg.derived = derived
         db.add(msg)
         updated = True
+        updated_count += 1
 
     if updated:
         db.commit()
+    return {"updated": updated_count, "errors": tool_errors or []}
 
 
 def populate_fallback_derived(

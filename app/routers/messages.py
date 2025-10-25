@@ -642,23 +642,32 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         # process in chunks to report progress
         bs = max(1, int(body.batch_size or 20))
         idx = 0
+        errs: list[str] = []
+        total_updated = 0
         while idx < len(messages):
             chunk = messages[idx : idx + bs]
-            ensure_message_features(
+            res = ensure_message_features(
                 db,
                 chunk,
-                force=body.force,
+                force=True,
                 batch_size=bs,
                 concurrency=body.concurrency,
                 temperature=body.temperature,
             )
+            try:
+                total_updated += int(res.get("updated", 0))
+                e = res.get("errors") or []
+                if isinstance(e, list):
+                    errs.extend([str(x) for x in e])
+            except Exception:
+                pass
             PROGRESS[progress_key]["done"] = min(len(messages), idx + len(chunk))
             idx += bs
         PROGRESS[progress_key]["status"] = "done"
-        return {"status": "ok", "updated": len(messages), "progress_key": progress_key}
+        return {"status": "ok", "updated": total_updated, "errors": errs[:50], "progress_key": progress_key}
 
     # When explicitly deriving selected messages (non-progress path), also force tool overlay by default
-    ensure_message_features(
+    res = ensure_message_features(
         db,
         messages,
         force=(True if (body.message_ids and len(body.message_ids) > 0) else body.force),
@@ -666,7 +675,11 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         concurrency=body.concurrency,
         temperature=body.temperature,
     )
-    return {"status": "ok", "updated": len(messages)}
+    try:
+        updated = int(res.get("updated", len(messages)))
+    except Exception:
+        updated = len(messages)
+    return {"status": "ok", "updated": updated, "errors": (res.get("errors") or [])[:50]}
 
 
 @router.get("/derive/progress")
