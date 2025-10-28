@@ -7,6 +7,7 @@ from starlette.responses import FileResponse, Response
 from .db import init_db
 from .background import install_background
 from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, ms_oauth
+from .routers import news as newsfeed
 from .db import SessionLocal
 from .models import Message
 import orjson
@@ -41,6 +42,8 @@ def create_app() -> FastAPI:
     app.include_router(news.router)
     app.include_router(folo.router)
     app.include_router(ms_oauth.router)
+    # News feed aggregation (API-only, no frontend)
+    app.include_router(newsfeed.router)
     app.include_router(market.router)
 
     static_dir = os.path.join(os.path.dirname(__file__), "..", "static")

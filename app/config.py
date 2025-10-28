@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     MS_CLIENT_ID: str | None = None
     MS_TENANT: str | None = "consumers"  # common/organizations/consumers
 
+    # NewsNow aggregation (server on :4445)
+    NEWSNOW_ENABLED: bool = True
+    NEWSNOW_API_BASE: str = Field(default="http://localhost:4445")
+    NEWSNOW_CACHE_TTL: int = Field(default=300)  # seconds
+    NEWSNOW_REFRESH_INTERVAL_SECONDS: int | None = Field(default=0)  # 0 = disabled (manual only)
+
     class Config:
         env_file = ".env"
 

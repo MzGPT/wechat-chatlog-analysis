@@ -10,6 +10,7 @@ from .services.email_engine import imap_fetch, FetchOptions
 from .services.ms_graph import fetch_messages_graph, refresh_token
 from .models import EmailAccount, ExtAdapter
 from .services.ext_adapter_service import ingest_adapter_logs
+from .services import news_client
 
 
 async def _sync_loop():
@@ -123,6 +124,31 @@ async def _ext_adapter_loop():
         await asyncio.sleep(interval)
 
 
+async def _news_loop():
+    interval = int(settings.__dict__.get("NEWSNOW_REFRESH_INTERVAL_SECONDS", 0) or 0)
+    if interval <= 0:
+        return
+    while True:
+        try:
+            # Trigger upstream refresh and warm local caches
+            try:
+                news_client.newsnow_refresh()
+            except Exception:
+                pass
+            try:
+                news_client.newsnow_sources(force=True)
+            except Exception:
+                pass
+            try:
+                # warm a small slice
+                news_client.newsnow_news(limit=20, simple=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        await asyncio.sleep(max(30, interval))
+
+
 def install_background(app: FastAPI):
     @app.on_event("startup")
     async def start_sync():
@@ -136,3 +162,6 @@ def install_background(app: FastAPI):
         #     asyncio.create_task(_email_loop())
         if settings.__dict__.get("LANGBOT_ADAPTER_LOG_DIR"):
             asyncio.create_task(_ext_adapter_loop())
+        news_interval = int(settings.__dict__.get("NEWSNOW_REFRESH_INTERVAL_SECONDS", 0) or 0)
+        if news_interval and news_interval > 0:
+            asyncio.create_task(_news_loop())
