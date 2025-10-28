@@ -133,8 +133,25 @@ def list_email_messages(
                 return ""
             num = (d.get("meeting_number") or "").strip()
             plat = (d.get("platform") or "").strip()
-            key = (d.get("key_info") or "").strip()
-            left = " ".join([x for x in (num, plat) if x])
+            # 展示策略（看齐微信）：会议 + 号 + 小模型摘要
+            # - 优先使用工具摘要（去掉 ai:/fallback: 前缀），否则用 key_info
+            # - 左侧展示会议信息：会议 <平台?> <会议号?>
+            raw_sum = (d.get("summary") or "").strip()
+            clean_sum = raw_sum
+            if clean_sum:
+                # 去掉前缀，仅用于展示
+                import re as _re
+                clean_sum = _re.sub(r"^\s*(ai:|fallback:)\s*", "", clean_sum, flags=_re.IGNORECASE).strip()
+            key = clean_sum or (d.get("key_info") or "").strip()
+            left_parts = []
+            if num or plat:
+                label = "会议"
+                if plat:
+                    label += f" {plat}"
+                if num:
+                    label += f" {num}"
+                left_parts.append(label)
+            left = " ".join(left_parts).strip()
             if key:
                 return f"{left} | {key}" if left else key
             return left
