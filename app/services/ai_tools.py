@@ -133,15 +133,15 @@ def extract_message_features(
             if not summary.lower().startswith("ai:"):
                 summary = f"ai: {summary}"
             
-            # 截断摘要（保留30字可见字符）
+            # 截断摘要（保留50字可见字符）
             try:
                 body = summary.split(":", 1)[1].strip() if ":" in summary else summary
                 def _clen(s: str) -> int:
                     return len(s.replace(" ", ""))
-                if _clen(body) > 30:
+                if _clen(body) > 50:
                     acc = []
                     for ch in body:
-                        if _clen("".join(acc) + ch) > 30:
+                        if _clen("".join(acc) + ch) > 50:
                             break
                         acc.append(ch)
                     body = "".join(acc).strip()
@@ -249,7 +249,7 @@ def ensure_message_features(
     *,
     force: bool = False,
     batch_size: int = 20,
-    concurrency: int = 8,
+    concurrency: int = 3,
     temperature: float = 0.1,
 ) -> dict:
     """Overlay tool-model outputs onto Message.derived.
@@ -266,6 +266,12 @@ def ensure_message_features(
     updated = False
     updated_count = 0
     applied: List[Dict[str, Any]] = []
+
+    def _vis_len(s: str) -> int:
+        try:
+            return len((s or '').replace('\n',' ').replace('\r',' ').replace('\t',' ').strip())
+        except Exception:
+            return len(s or '')
 
     for msg in messages:
         # Skip very old messages unless force=True (explicit derive request)
@@ -287,8 +293,17 @@ def ensure_message_features(
                 text = " \n".join(parts).strip()
             except Exception:
                 text = ""
-        if not text:
+        # Skip short/low-signal texts to reduce token usage
+        if not text or _vis_len(text) < 20:
             continue
+
+        # Skip non-text messages (image/file/video) entirely
+        try:
+            t = (msg.type or '').lower()
+            if t in ('image','file','video'):
+                continue
+        except Exception:
+            pass
 
         derived = msg.derived if isinstance(msg.derived, dict) else {}
         has_summary = bool(derived.get("summary"))

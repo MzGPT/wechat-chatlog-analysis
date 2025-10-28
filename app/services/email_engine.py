@@ -195,20 +195,74 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
         except Exception:
             pass
 
-    # First persist local fallback summaries for instant UI
+    # First persist local fallback summaries for instant UI (for any new rows)
+    overlay_ids: list[int] = []
     if new_rows:
         try:
             persist_email_fallback(db, new_rows, force=True, commit=True)
         except Exception as feature_err:
             print(f"[email_engine] persist fallback failed: {feature_err}")
-        # Then schedule AI features asynchronously to overlay later
+        overlay_ids.extend([r.id for r in new_rows if getattr(r, 'id', None) is not None])
+
+    # Always schedule a small overlay window for recent messages that still lack tool results,
+    # so clicking "同步" 可以修复之前遗漏的邮件（增量覆盖）。允许在“功能设置”中关闭或调整窗口大小。
+    try:
+        # Read runtime switches from SyncState
+        from ..models import SyncState
+        ai_switch = db.get(SyncState, "ai_runtime")
+        import json as _json
+        cfg = {}
+        try:
+            if ai_switch and ai_switch.value:
+                cfg = _json.loads(ai_switch.value) or {}
+        except Exception:
+            cfg = {}
+        enable_overlay = bool((cfg or {}).get("enable_email_tool_overlay", True))
+        win = int((cfg or {}).get("email_overlay_window", 120))
+        cap = int((cfg or {}).get("email_overlay_cap", 160))
+        if win <= 0 or cap <= 0:
+            enable_overlay = False
+        if not enable_overlay:
+            overlay_ids = overlay_ids  # no-op; skip building recent window
+            raise RuntimeError("overlay_disabled")
+        from sqlalchemy import desc as _desc
+        recent = (
+            db.execute(
+                select(EmailMessage)
+                .where(EmailMessage.account_id == account.id)
+                .order_by(_desc(EmailMessage.sent_at), _desc(EmailMessage.id))
+                .limit(max(20, min(1000, win)))
+            )
+            .scalars()
+            .all()
+        )
+        for em in recent:
+            d = em.derived if isinstance(em.derived, dict) else {}
+            if str(d.get('summary_origin') or '').lower() != 'tool':
+                if getattr(em, 'id', None) is not None:
+                    overlay_ids.append(int(em.id))
+        # de-dup and cap to a safe size to avoid bursts
+        seen: set[int] = set()
+        capped: list[int] = []
+        for i in overlay_ids:
+            if i not in seen:
+                seen.add(i)
+                capped.append(i)
+            if len(capped) >= max(20, min(2000, cap)):
+                break
+        overlay_ids = capped
+    except Exception:
+        pass
+
+    if overlay_ids:
         def _run_ai_overlay(ids: list[int]):
             sess = None
             try:
                 from ..db import SessionLocal as _SessionLocal
                 sess = _SessionLocal()
                 rows = sess.execute(select(EmailMessage).where(EmailMessage.id.in_(ids))).scalars().all()
-                persist_email_features(sess, rows, force=True, commit=True)
+                # force=False：仅对缺失/非tool 的项进行覆盖；已是 tool 的将被跳过
+                persist_email_features(sess, rows, force=False, commit=True)
             except Exception as e:
                 print(f"[email_engine] async ai overlay failed: {e}")
             finally:
@@ -218,12 +272,13 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
                 except Exception:
                     pass
         try:
-            t = threading.Thread(target=_run_ai_overlay, args=([r.id for r in new_rows],), daemon=True)
+            t = threading.Thread(target=_run_ai_overlay, args=(overlay_ids,), daemon=True)
             t.start()
         except Exception:
             # fallback to sync if thread creation fails
             try:
-                persist_email_features(db, new_rows, force=True, commit=True)
+                rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(overlay_ids))).scalars().all()
+                persist_email_features(db, rows, force=False, commit=True)
             except Exception as feature_err:
                 print(f"[email_engine] persist features failed: {feature_err}")
 

@@ -34,7 +34,20 @@ async def _sync_loop():
                     pass
                 # Start async overlay in a background task (best-effort, small batch)
                 try:
-                    ensure_message_features(db, recent, force=False, concurrency=8)
+                    # Respect runtime switch from SyncState.ai_runtime
+                    from .models import SyncState
+                    import json as _json
+                    sw = db.get(SyncState, 'ai_runtime')
+                    cfg = {}
+                    try:
+                        if sw and sw.value:
+                            cfg = _json.loads(sw.value) or {}
+                    except Exception:
+                        cfg = {}
+                    if bool((cfg or {}).get('enable_msg_tool_overlay', True)):
+                        cc = int((cfg or {}).get('default_concurrency', 3) or 3)
+                        # Lower concurrency to reduce provider rate-limit (429) under burst loads
+                        ensure_message_features(db, recent, force=False, concurrency=max(1, min(16, cc)))
                 except Exception:
                     pass
                 db.commit()
@@ -116,8 +129,10 @@ def install_background(app: FastAPI):
         interval = int(settings.__dict__.get("SYNC_INTERVAL_SECONDS", 0) or 0)
         if interval and interval > 0:
             asyncio.create_task(_sync_loop())
-        email_interval = int(settings.__dict__.get("EMAIL_SYNC_INTERVAL_SECONDS", 0) or 0)
-        if email_interval and email_interval > 0:
-            asyncio.create_task(_email_loop())
+        # 邮件同步改为“仅手动触发”，不再定时自动拉取
+        # 如需恢复定时，请显式改回并确保 EMAIL_SYNC_INTERVAL_SECONDS > 0
+        # email_interval = int(settings.__dict__.get("EMAIL_SYNC_INTERVAL_SECONDS", 0) or 0)
+        # if email_interval and email_interval > 0:
+        #     asyncio.create_task(_email_loop())
         if settings.__dict__.get("LANGBOT_ADAPTER_LOG_DIR"):
             asyncio.create_task(_ext_adapter_loop())

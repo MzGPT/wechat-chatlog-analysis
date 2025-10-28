@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import json
+import time
+import random
+import threading
 import requests
 from typing import Optional, Dict, Any
 from ..config import settings
@@ -10,19 +13,17 @@ from ..config import settings
 DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
     "market": {
         "system": "\n".join([
-            "你是一名资深投研首席，需要通读全部聊天记录后形成结构化的市场观点报告。",
-            "需严格按照六大类进行归纳：宏观政策、行业板块、公司基本面、投资策略、市场情绪、其他观点。",
-            "禁止逐条复述或拼接原始消息，只能在必要时引用不超过30字的短句，并注明来源联系人。",
-            "当信息不足时可以省略该小类或标注‘信息有限’。",
+            "你是资深投研首席，要在高噪声样本中形成‘综述级’结论而非逐条摘录。",
+            "你的职责：去重、合并同义、提炼趋势与因果链，保留关键信号与不确定性。",
+            "只在必要时引用极短证据，并标注来源 `#<id>`，禁止罗列长段原文。",
         ]),
         "user": "\n".join([
-            "请阅读 JSON 数据并输出 JSON 对象 {\"markdown\": string}：",
-            "- markdown 顶部使用 `# 市场观点总结` 概述市场基调（2-3句话）。",
-            "- 依次使用 `## 宏观政策`、`## 行业板块`、`## 公司基本面`、`## 投资策略`、`## 市场情绪`、`## 其他观点`，无信息的分类写 `- 信息有限`。",
-            "- 每个分类下用无序列表列出倾向、关键依据（含联系人与评分）及风险提示。",
-            "- 末尾增加 `## 行动建议` 与 `## 关注事项` 两段，给出策略与监控要点。",
-            "- 忽略低信息术语（如“流通股本”“所属行业”等）。",
-            "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
+            "请阅读 JSON，并输出 JSON 对象 {\"markdown\": string}：",
+            "- 开头 `# 市场观点总结`：用2-3句话给出‘本周市场基调+主因’（必须是你自己的归纳）。",
+            "- 分类：`## 宏观政策`、`## 行业板块`、`## 公司基本面`、`## 投资策略`、`## 市场情绪`、`## 其他观点`。",
+            "  - 每类只保留3-6条去重后的要点；每条=‘结论/倾向 + 关键依据(简短) + 风险/不确定性’，必要处用 `#<id>` 标注来源。",
+            "- 末尾 `## 行动建议` 与 `## 关注事项`：聚焦可执行的仓位/跟踪项。",
+            "- 严禁逐条拼接消息；必须合并同义、消除重复，使用统一表述；对矛盾信息给出‘以何为准’的判断或待证。",
             "数据：{{messages_data}}",
         ]),
     },
@@ -82,6 +83,14 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
             "- 引用来源：当需要引用具体消息时，引用短句（<=20字），并在条目末尾标注 `#<id>`（消息 id）。",
         ]),
     },
+    "newswatch": {
+        "system": "你是一名舆情风控分析师，擅长从新闻与快讯中识别风险、黑天鹅与突发利好，输出面向投研/交易的预警摘要。",
+        "user": "请阅读 JSON 数据并输出 JSON 对象{\"markdown\": string}：\n- 标题：`# 新闻舆情监测`，用一段话概述总体风险基调。\n- `## 重大风险`：列出3-8条，包含事件、涉及标的/行业、潜在影响、证据来源（引用 #id 或来源字段）。\n- `## 突发利好`：列出2-6条，说明逻辑链与催化窗口。\n- `## 需跟踪`：列出待确认信息与下一步动作。\n要求：\n- 去除营销/低信噪信息；强调可验证来源；避免夸大。\n数据：{{messages_data}}"
+    },
+    "socialwatch": {
+        "system": "你是一名自媒体舆情分析师，关注雪球/微博/公众号/视频号等内容对市场带来的情绪与潜在风险/机会。",
+        "user": "请阅读 JSON 数据并输出 JSON 对象{\"markdown\": string}：\n- 标题：`# 自媒体舆情监测`。\n- `## 负面舆情`：3-6条，指出对象/证据/扩散度/潜在冲击。\n- `## 正面催化`：2-5条，说明触发条件与可量化观察指标。\n- `## 伪信息/谣言`：列出可核查的证伪证据与建议声明。\n- `## 建议`：给风控与投研的具体提醒。\n数据：{{messages_data}}"
+    },
 }
 
 DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
@@ -90,8 +99,8 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
             "你是专业的投研信息提取助手。你的任务是：\n"
             "1. 仔细阅读每封邮件/消息的完整内容\n"
             "2. 理解其核心意图（路演邀请？观点分享？会议通知？）\n"
-            "3. 提取关键事实（会议号/观点/建议），不要编造\n"
-            "4. 用一句话概括最重要的信息（不超过30字）\n\n"
+            "3. 提取关键事实（会议号/观点/建议/论据/关键数据），不要编造\n"
+            "4. 用一句话概括最重要的信息（不超过50字），除概括主旨外，把出现的核心结论、观点、推荐、论据、关键数据等要点尽量囊括到这句话中（用分号或逗号自然连接）\n\n"
             "注意：\n"
             "- 必须通读完整正文，不要只看标题\n"
             "- 摘要要提炼实质内容，不要复读标题或拼凑关键词\n"
@@ -101,7 +110,7 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
             "请逐条分析以下消息（JSON格式：id/time/sender/content），返回JSON数组，每个元素结构：\n"
             "{\n"
             "  \"id\": string,                    // 必填：消息ID\n"
-            "  \"summary\": string,               // 必填：<=30字自然语句，必须以'ai: '开头，概括核心内容\n"
+            "  \"summary\": string,               // 必填：<=50字自然语句，必须以'ai: '开头，概括主旨并包含关键要点（结论/观点/推荐/论据/关键数据）\n"
             "  \"meeting_number\": string,        // 选填：9-13位纯数字会议号，无则留空\n"
             "  \"tone\": string,                  // 必填：bullish(看多)/bearish(看空)/neutral(中性)/meeting(会议)\n"
             "  \"confidence\": float              // 必填：0.0-1.0，你对提取准确性的信心\n"
@@ -232,9 +241,55 @@ def save_ai_config(conf: Dict[str, Any]) -> None:
         json.dump(normalized, f, ensure_ascii=False, indent=2)
 
 
+_LLM_MAX_PARALLEL = max(1, int(os.getenv("AI_MAX_PARALLEL", "3") or 3))
+# Global semaphore to throttle concurrent LLM calls across the process
+_LLM_SEMAPHORE = threading.BoundedSemaphore(_LLM_MAX_PARALLEL)
+
+
+def _post_with_backoff(url: str, headers: dict, payload: dict, *, timeout: int = 180) -> requests.Response:
+    """POST with basic exponential backoff on 429/5xx.
+
+    This reduces flakiness under provider TPM/RPM limits while preserving caller simplicity.
+    """
+    attempts = 5
+    backoff = 0.6
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            # Happy path
+            if resp.status_code < 400:
+                return resp
+            # Backoff on 429 or 5xx
+            if resp.status_code in (429, 500, 502, 503, 504):
+                # Honor Retry-After if present
+                ra = resp.headers.get("Retry-After")
+                try:
+                    wait = float(ra) if ra is not None else None
+                except Exception:
+                    wait = None
+                # Base backoff with jitter
+                if wait is None:
+                    wait = backoff * (2 ** (attempt - 1)) + random.uniform(0.05, 0.25)
+                time.sleep(min(wait, 8.0))
+                last_exc = requests.HTTPError(f"status={resp.status_code}")
+                continue
+            # Other client errors: bubble up immediately
+            resp.raise_for_status()
+            return resp  # pragma: no cover
+        except requests.RequestException as e:  # network errors -> retry
+            last_exc = e
+            time.sleep(backoff * (2 ** (attempt - 1)) + random.uniform(0.05, 0.25))
+            continue
+    # Exhausted retries
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("LLM request failed after retries")
+
+
 def siliconflow_chat(messages: list[dict], temperature: float | None = 0.3, model_override: str | None = None) -> str:
-    """Call SiliconFlow once; do NOT fallback to other models.
-    If it fails, caller should handle local fallback.
+    """Call SiliconFlow once; auto‑retry with gentle backoff on rate limits.
+    If it still fails, caller should handle local fallback.
     """
     conf = load_ai_config()
     api_key = conf.get("api_key")
@@ -254,7 +309,9 @@ def siliconflow_chat(messages: list[dict], temperature: float | None = 0.3, mode
         "max_tokens": max_tokens,
         "stream": False,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=180)
+    # Throttle concurrent calls globally to reduce 429 spikes
+    with _LLM_SEMAPHORE:
+        resp = _post_with_backoff(url, headers, payload, timeout=180)
     try:
         resp.raise_for_status()
     except requests.HTTPError as exc:  # type: ignore[name-defined]

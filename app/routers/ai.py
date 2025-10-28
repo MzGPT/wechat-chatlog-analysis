@@ -128,16 +128,17 @@ def summary(payload: dict, db: Session = Depends(get_db)):
     options = payload.get("options") or {"format": "markdown"}
     prompts = payload.get("prompts") or {}
     module_candidates = payload.get("modules")
+    ALLOWED_MODULES = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}
     if isinstance(module_candidates, list) and module_candidates:
-        modules = [m for m in module_candidates if m in {"market", "meetings", "counter", "contacts"}]
+        modules = [m for m in module_candidates if m in ALLOWED_MODULES]
     else:
         modules = options.get("modules") or []
         if isinstance(modules, list):
-            modules = [m for m in modules if m in {"market", "meetings", "counter", "contacts"}]
+            modules = [m for m in modules if m in ALLOWED_MODULES]
         else:
             modules = []
     if not modules:
-        modules = ["market", "meetings", "counter", "contacts"]
+        modules = ["market", "meetings", "counter", "contacts", "newswatch", "socialwatch"]
     temperature = options.get("temperature") if isinstance(options, dict) else None
     try:
         temperature = float(temperature) if temperature is not None else None
@@ -188,14 +189,23 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             except Exception:
                 continue
 
-        # 保存原始数据集文件，供大模型完整读取与审计
+        # 保存原始数据集文件，供大模型完整读取与审计（按渠道分组）
         try:
             ds_dir = os.path.abspath(os.path.join(os.getcwd(), 'data', 'datasets'))
             os.makedirs(ds_dir, exist_ok=True)
             ds_name = f"messages_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
             ds_path = os.path.join(ds_dir, ds_name)
+            by_channel: dict[str, list] = {}
+            for m in (snapshot.messages or []):
+                ch = str((m or {}).get('channel') or 'wechat')
+                by_channel.setdefault(ch, []).append(m)
+            dataset = {
+                "period": (filters or {}).get("period") if filters else None,
+                "counts": {k: len(v) for k, v in by_channel.items()},
+                "channels": by_channel,
+            }
             with open(ds_path, 'w', encoding='utf-8') as f:
-                json.dump(snapshot.messages or [], f, ensure_ascii=False, indent=2)
+                json.dump(dataset, f, ensure_ascii=False, indent=2)
         except Exception:
             ds_path = None
 
@@ -704,9 +714,9 @@ def _run_summary_local(payload: dict) -> dict:
 
         requested_modules = payload.get("modules")
         if isinstance(requested_modules, list) and requested_modules:
-            module_filter = {m for m in requested_modules if m in {"market", "meetings", "counter", "contacts"}}
+            module_filter = {m for m in requested_modules if m in {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}}
         else:
-            module_filter = {"market", "meetings", "counter", "contacts"}
+            module_filter = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}
 
         temperature = payload.get("temperature")
         try:
@@ -719,6 +729,8 @@ def _run_summary_local(payload: dict) -> dict:
             "meetings": "meetings_markdown",
             "counter": "counter_markdown",
             "contacts": "top_contacts_markdown",
+            "newswatch": "newswatch_markdown",
+            "socialwatch": "socialwatch_markdown",
         }
 
         module_titles = {
@@ -726,6 +738,8 @@ def _run_summary_local(payload: dict) -> dict:
             "meetings": "会议路演信息",
             "counter": "反驳观点分析",
             "contacts": "高评分联系人摘要",
+            "newswatch": "新闻舆情监测",
+            "socialwatch": "自媒体舆情监测",
         }
 
         result: dict[str, str] = {
@@ -737,6 +751,8 @@ def _run_summary_local(payload: dict) -> dict:
             "meetings_html": "",
             "counter_html": "",
             "top_contacts_html": "",
+            "newswatch_markdown": "",
+            "socialwatch_markdown": "",
         }
 
         for module_key, result_key in module_map.items():
@@ -868,8 +884,8 @@ def _run_summary_local(payload: dict) -> dict:
                 result[result_key] = _strip_llm_thoughts(output_text)
 
         # ---------- Local fallbacks to guarantee useful content ----------
-        POS = {"看多","看好","上涨","增持","买入","积极","乐观","超配"}
-        NEG = {"看空","不看好","下跌","减持","卖出","悲观","谨慎","风险","压力","回调"}
+        POS = {"看多","看好","上涨","增持","买入","积极","乐观","超配","超预期","改善","提价","扩产","胜诉","达成"}
+        NEG = {"看空","不看好","下跌","减持","卖出","悲观","谨慎","风险","压力","回调","不及预期","降价","停产","失利","受阻"}
 
         def _short(txt: str, n: int = 80) -> str:
             t = (txt or "").strip().replace("\n", " ")
@@ -1096,6 +1112,7 @@ def _run_summary_local(payload: dict) -> dict:
                 summary = (m.get("summary") or m.get("content") or "").strip()
                 if not summary:
                     continue
+                # 主题归并：优先股票/行业/会议主题关键词，否则用摘要短句
                 theme = _normalize_conflict_theme(m)
                 entry = _short(summary, 160)
                 bucket = topics.setdefault(theme, {"positive": [], "negative": []})
@@ -1110,7 +1127,16 @@ def _run_summary_local(payload: dict) -> dict:
                     "positive_id": ids_map.get(theme, {}).get("positive", [""])[0] if ids_map.get(theme, {}).get("positive") else "",
                     "negative_id": ids_map.get(theme, {}).get("negative", [""])[0] if ids_map.get(theme, {}).get("negative") else "",
                 })
-            return conflicts[:6]
+            # 若严格二元分法产生空结果，退化为“争议线索”：提取包含对立词根的样本各3条
+            if not conflicts:
+                leads = []
+                for m in enriched_messages:
+                    txt = (m.get("content") or "")
+                    if _has_any(txt, POS) and _has_any(txt, NEG):
+                        leads.append(_short(txt, 120))
+                if leads:
+                    return [{"theme": "存在分歧/待核查", "positive": leads[0], "negative": leads[1] if len(leads)>1 else leads[0]}]
+            return conflicts[:8]
 
         def _build_counter_md() -> str:
             conflicts = _extract_conflicts()
@@ -1231,7 +1257,10 @@ def summary_local(payload: dict):
 def _markdown_to_html(markdown_text: str) -> str:
     if not markdown_text:
         return ""
-    lines = [line.rstrip() for line in markdown_text.strip().splitlines()]
+    # 将 `#123` 引用转换为可点击消息徽标
+    import re
+    md = re.sub(r"#(\d+)", r"<span class=\"msg-badge\" data-msg-id=\"\\1\">源</span>", markdown_text)
+    lines = [line.rstrip() for line in md.strip().splitlines()]
     html_parts: list[str] = []
     list_open = False
 

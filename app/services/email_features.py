@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..models import EmailMessage
 from .ai_tools import extract_message_features
+from .llm_client import load_ai_config
 
 
 def _html_to_text(html: str | None) -> str:
@@ -133,6 +134,12 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
 
     prepared: List[dict] = []
     id_map: Dict[str, dict] = {}
+    def _vis_len(s: str) -> int:
+        try:
+            return len((s or '').replace('\n',' ').replace('\r',' ').replace('\t',' ').strip())
+        except Exception:
+            return len(s or '')
+
     for it in items:
         mid = str(it.get('id')) if it.get('id') is not None else ''
         if not mid:
@@ -168,18 +175,39 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
                     trimmed = trimmed[:last_pos + len(sep)]
                     break
         
+        # Skip very short bodies to save tokens (<20 visible chars)
+        if _vis_len(trimmed) < 20:
+            continue
+        # Compose content for the tool model.
+        # 需求：小模型的生成必须“基于原文正文”，不要基于标题。
+        # 因此仅向模型提供正文内容，避免标题驱动模型复读或拼接标题。
+        # 如确无正文（极少数情况），上面 text 的兜底会回退到 snippet/subject。
+        from_addr = (it.get('from_addr') or '').strip()
+        content_rich = "\n".join([
+            f"发件人: {from_addr}" if from_addr else "",
+            f"正文: {trimmed}" if trimmed else "",
+        ]).strip()
         prepared.append({
             'id': mid,
             'time': it.get('sent_at'),
             'sender': it.get('from_addr') or '',
-            'content': trimmed,
+            'content': content_rich or trimmed,
         })
         id_map[mid] = {
             'raw_text': trimmed,
             'subject': it.get('subject') or '',
         }
 
-    features = extract_message_features(prepared, batch_size=8, concurrency=6, temperature=0.1) if prepared else {}
+    # Respect global derive_defaults.concurrency when available, clamp to a safe low value by default
+    try:
+        conf = load_ai_config()
+        dd = conf.get('derive_defaults') or {}
+        max_workers = int(dd.get('concurrency', 3))
+    except Exception:
+        max_workers = 3
+    # Cap concurrency to avoid provider RPM/TPM throttling; global semaphore in llm_client adds extra safety
+    max_workers = max(1, min(6, max_workers))
+    features = extract_message_features(prepared, batch_size=8, concurrency=max_workers, temperature=0.1) if prepared else {}
     features.pop("__errors__", None)
 
     results: Dict[str, dict] = {}
@@ -226,6 +254,7 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         analyst = feat.get('analyst') or feat.get('researcher') or _extract(r"(?:券商研究员|分析师)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
         organizer = feat.get('organizer') or _extract(r"(?:内部预约人|预约人)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
 
+        # main_point：优先使用工具产出（若将来提供），否则从正文提取“观点/主题”段；最后才回退到标题
         main_point = feat.get('main_point')
         if not main_point:
             match = re.search(r"(?:观点|主题)[:：]\s*([\s\S]{4,400}?)\s*(?:内部预约人|预约人|券商研究员|分析师|会议链接|会议号|时间|路演|路演类型|路演方式|重点关注|重点|$)", raw_text)
@@ -234,6 +263,7 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         if not main_point:
             main_point = base.get('subject', '')
 
+        # 长摘要：严格基于正文构建，避免标题复读
         summary_full = feat.get('summary_full') or _build_summary(raw_text) or main_point or ''
         summary_full = summary_full.strip()
         summary_short = summary_full[:30]
@@ -244,17 +274,23 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
 
         category = feat.get('category') or _infer_category(base.get('subject', ''), raw_text)
 
-        # 两段式：这里产出 summary（短）与 key_info；其余字段尽量补齐
-        summary_origin = 'tool' if feat.get('summary') or feat.get('summary_full') else 'fallback'
-        summary_value = (main_point or '').strip()[:30] or summary_short or (raw_text[:30])
-        key_info_src = feat.get('key_info') or main_point or base.get('subject', '') or raw_text[:50]
-        key_info = key_info_src.strip()[:30]
-        key_info_origin = 'tool' if feat.get('key_info') else 'fallback'
-        if summary_origin == 'tool' and summary_value:
-            summary_text = f"ai: {summary_value}"
+        # 两段式：产出 summary（短）与 key_info；其余字段尽量补齐
+        # 修复：当工具已给出 summary 时，必须直接使用工具的摘要，避免回退到标题导致“标题 + 摘要重复标题”的问题。
+        tool_summary = (feat.get('summary') or '').strip()
+        if tool_summary:
+            summary_text = tool_summary  # 已含 ai: 前缀与长度控制，见 ai_tools.extract_message_features
+            summary_origin = 'tool'
         else:
+            # 仅在无工具摘要时，才基于正文提炼简短显示
+            summary_value = (summary_short or _build_summary(raw_text) or main_point or raw_text[:50]).strip()
             summary_text = f"fallback: {summary_value}" if summary_value else 'fallback:'
             summary_origin = 'fallback'
+
+        # key_info：优先基于工具摘要（去掉前缀）或正文提炼要点，避免直接使用标题
+        key_info_body = re.sub(r'^\s*(ai:|fallback:)\s*', '', summary_text, flags=re.IGNORECASE).strip()
+        key_info_src = feat.get('key_info') or key_info_body or main_point or raw_text[:50]
+        key_info = (key_info_src or '').strip()[:30]
+        key_info_origin = 'tool' if feat.get('key_info') or tool_summary else 'fallback'
 
         results[mid] = {
             'summary': summary_text,

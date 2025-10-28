@@ -137,6 +137,51 @@ def set_newsnow_config(payload: dict, db: Session = Depends(_get_db)):
     return {"status": "ok"}
 
 
+# --------- AI runtime (tool overlay) switches ---------
+
+_AI_RUNTIME_KEY = "ai_runtime"
+
+
+@router.get("/config/ai-runtime")
+def get_ai_runtime(db: Session = Depends(_get_db)):
+    obj = _get_json_obj(db, _AI_RUNTIME_KEY)
+    # defaults
+    return {
+        "enable_msg_tool_overlay": bool(obj.get("enable_msg_tool_overlay", True)) if isinstance(obj, dict) else True,
+        "enable_email_tool_overlay": bool(obj.get("enable_email_tool_overlay", True)) if isinstance(obj, dict) else True,
+        "email_overlay_window": int(obj.get("email_overlay_window", 120)) if isinstance(obj, dict) else 120,
+        "email_overlay_cap": int(obj.get("email_overlay_cap", 160)) if isinstance(obj, dict) else 160,
+        "messages_overlay_batch": int(obj.get("messages_overlay_batch", 200)) if isinstance(obj, dict) else 200,
+        "default_concurrency": int(obj.get("default_concurrency", 3)) if isinstance(obj, dict) else 3,
+    }
+
+
+@router.post("/config/ai-runtime")
+def set_ai_runtime(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    # sanitize/clamp
+    def _b(v, d):
+        return bool(v) if isinstance(v, (bool, int)) else d
+    def _i(v, d, lo, hi):
+        try:
+            n = int(v)
+            return max(lo, min(hi, n))
+        except Exception:
+            return d
+    obj = _get_json_obj(db, _AI_RUNTIME_KEY)
+    obj = obj if isinstance(obj, dict) else {}
+    obj["enable_msg_tool_overlay"] = _b(payload.get("enable_msg_tool_overlay"), True)
+    obj["enable_email_tool_overlay"] = _b(payload.get("enable_email_tool_overlay"), True)
+    obj["email_overlay_window"] = _i(payload.get("email_overlay_window"), 120, 20, 1000)
+    obj["email_overlay_cap"] = _i(payload.get("email_overlay_cap"), 160, 20, 2000)
+    obj["messages_overlay_batch"] = _i(payload.get("messages_overlay_batch"), 200, 20, 2000)
+    obj["default_concurrency"] = _i(payload.get("default_concurrency"), 3, 1, 16)
+    _set_json_obj(db, _AI_RUNTIME_KEY, obj)
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.get("/config/folo")
 def get_folo_config(db: Session = Depends(_get_db)):
     return _get_json_obj(db, "folo_config")

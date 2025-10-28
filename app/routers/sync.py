@@ -55,8 +55,21 @@ def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
             def _overlay(ids: list[int]):
                 sess = _SessionLocal()
                 try:
-                    rows = sess.execute(select(Message).where(Message.id.in_(ids))).scalars().all()
-                    ensure_message_features(sess, rows, force=False, concurrency=8)
+                    # read ai-runtime switch; allow turning off overlay from settings
+                    from ..models import SyncState
+                    import json as _json
+                    sw = sess.get(SyncState, 'ai_runtime')
+                    cfg = {}
+                    try:
+                        if sw and sw.value:
+                            cfg = _json.loads(sw.value) or {}
+                    except Exception:
+                        cfg = {}
+                    if bool((cfg or {}).get('enable_msg_tool_overlay', True)):
+                        rows = sess.execute(select(Message).where(Message.id.in_(ids))).scalars().all()
+                        cc = int((cfg or {}).get('default_concurrency', 3) or 3)
+                        # Keep a conservative concurrency to avoid 429 Too Many Requests
+                        ensure_message_features(sess, rows, force=False, concurrency=max(1, min(16, cc)))
                 except Exception:
                     pass
                 finally:

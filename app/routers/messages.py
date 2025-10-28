@@ -633,12 +633,8 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
             "total": len(messages),
             "done": 0,
         }
-        # When explicitly deriving selected messages, default to force=True to bypass age cutoffs
-        try:
-            if (body.message_ids and len(body.message_ids) > 0):
-                body.force = True
-        except Exception:
-            body.force = True
+        # 默认不强制覆盖，按增量策略：已有 tool 摘要的消息跳过，仅处理新增/缺失项
+        # 如需覆盖，请在请求体里显式传入 {"force": true}
         # process in chunks to report progress
         bs = max(1, int(body.batch_size or 20))
         idx = 0
@@ -652,7 +648,7 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
             res = ensure_message_features(
                 db,
                 chunk,
-                force=True,
+                force=bool(body.force),
                 batch_size=bs,
                 concurrency=body.concurrency,
                 temperature=body.temperature,
@@ -685,12 +681,12 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
             pass
         return {"status": "ok", "updated": total_updated, "errors": errs[:50], "debug": debs[:50], "debug_readback": readback[:50], "progress_key": progress_key}
 
-    # When explicitly deriving selected messages (non-progress path), also force tool overlay by default
+    # 非进度路径：同样遵循增量策略，除非调用方显式 force=true
     id_list = [int(getattr(m, 'id')) for m in messages if getattr(m, 'id', None) is not None]
     res = ensure_message_features(
         db,
         messages,
-        force=(True if (body.message_ids and len(body.message_ids) > 0) else body.force),
+        force=bool(body.force),
         batch_size=body.batch_size,
         concurrency=body.concurrency,
         temperature=body.temperature,

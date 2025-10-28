@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/email", tags=["email"])
 
 # serialize per-account sync to avoid SQLite "database is locked" under concurrent writes
 _ACCOUNT_LOCKS: dict[int, Lock] = {}
+EMAIL_PROGRESS: dict[str, dict] = {}
 
 
 def get_db():
@@ -184,7 +185,7 @@ def derive_email_features(payload: dict, db: Session = Depends(get_db)):
 
 
 @router.post("/derive")
-def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
+def derive_email_messages(payload: dict, progress_key: str | None = None, db: Session = Depends(get_db)):
     ids = payload.get("ids") or []
     if not ids:
         raise HTTPException(400, "ids is required")
@@ -192,6 +193,27 @@ def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
         id_list = [int(i) for i in ids]
     except Exception:
         raise HTTPException(400, "invalid ids")
+
+    # progress path (chunked)
+    if progress_key:
+        ids2 = list(dict.fromkeys(id_list))
+        EMAIL_PROGRESS[progress_key] = {"status": "running", "total": len(ids2), "done": 0}
+        bs = max(10, min(200, int(payload.get("batch_size", 50))))
+        done = 0
+        errs: list[str] = []
+        for i in range(0, len(ids2), bs):
+            chunk = ids2[i:i+bs]
+            rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(chunk))).scalars().all()
+            try:
+                persist_email_features(db, rows, force=bool(payload.get("force", False)), commit=True)
+            except Exception as e:
+                errs.append(str(e))
+            done = min(len(ids2), i + len(chunk))
+            EMAIL_PROGRESS[progress_key]["done"] = done
+        EMAIL_PROGRESS[progress_key]["status"] = "done"
+        return {"status": "ok", "updated": done, "errors": errs[:50], "progress_key": progress_key}
+
+    # non-progress path (single batch)
     rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(id_list))).scalars().all()
     features = persist_email_features(db, rows, force=bool(payload.get("force", False)), commit=True)
     # readback for debug visibility
@@ -219,6 +241,14 @@ def derive_email_messages(payload: dict, db: Session = Depends(get_db)):
             g["key_info_origin"] = g.get("summary_origin")
         compat[k] = g
     return {"status": "ok", "processed": len(rows), "features": compat, "debug_readback": readback[:50]}
+
+
+@router.get("/derive/progress")
+def email_derive_progress(key: str):
+    info = EMAIL_PROGRESS.get(key)
+    if not info:
+        return {"status": "unknown", "done": 0, "total": 0}
+    return {"status": info.get("status"), "done": info.get("done"), "total": info.get("total")}
 
 @router.post("/send")
 def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):
