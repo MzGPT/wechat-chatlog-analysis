@@ -75,11 +75,15 @@ def _build_summary(text: str) -> str:
     lines = [re.sub(r"[；。]+$", "", ln.strip()) for ln in raw_lines]
     result: List[str] = []
     skip_prefix = (
+        # 元信息字段，避免进入摘要
         "主题", "路演类型", "路演方式", "内部预约人", "预约人", "券商研究员", "分析师",
-        "会议链接", "会议号", "时间", "路演平台", "会议平台"
+        "会议链接", "会议号", "时间", "路演平台", "会议平台", "位置"
     )
     for idx, line in enumerate(lines):
         if not line:
+            continue
+        # 忽略分隔线（下划线/破折号等）
+        if re.fullmatch(r"[_\-—\s]{3,}", line):
             continue
         if any(line.startswith(p) for p in skip_prefix):
             if line.startswith("观点") and ":" in line:
@@ -91,6 +95,10 @@ def _build_summary(text: str) -> str:
             val = _normalize_line(line.split(":", 1)[1].strip())
             if val:
                 result.append(val)
+            continue
+        # 支持【1】/① ②等编号要点
+        if re.match(r"^【\d+】", line) or re.match(r"^[①②③④⑤⑥⑦⑧⑨⑩]", line):
+            result.append(_normalize_line(line))
             continue
         if line.startswith("重点关注") and ":" in line:
             val = line.split(":", 1)[1].strip()
