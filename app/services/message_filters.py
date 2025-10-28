@@ -16,6 +16,7 @@ SYSTEM_PATTERNS = (
     "通过了你的朋友验证",
     "邀请\"",
     "加入群聊",
+    "进入群聊",
     "已经成为朋友",
     "群主已开启",
     "系统消息",
@@ -46,7 +47,8 @@ def is_short_message(text: str | None) -> bool:
         return True
     chinese = sum(1 for ch in compact if "\u4e00" <= ch <= "\u9fff")
     if chinese > 0:
-        return chinese <= 15
+        # 定义：低于 15 个中文字视为短消息（垃圾）
+        return chinese < 15
     return len(compact) <= 30
 
 
@@ -66,4 +68,3 @@ def filter_effective_messages(
         if exclude_short and is_short_message(text):
             continue
         yield r
-

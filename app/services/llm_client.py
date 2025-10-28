@@ -124,6 +124,32 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
             "数据：{{messages_json}}"
         ),
     }
+    ,
+    "email_message_summary": {
+        "system": (
+            "你是一名专业的投研小模型助手，负责基于邮件正文提炼摘要。\n"
+            "要求：\n"
+            "- 严禁复读/引用邮件主题或标题；只看正文内容\n"
+            "- 摘要需覆盖：核心观点(简洁)、关键信息(要点)、若文中出现则包含分析师/预约人等角色信息\n"
+            "- 如为会议或路演邮件，识别会议号(9-13位数字)与平台；tone 选 'meeting'；category 选 '会议'\n"
+        ),
+        "user": (
+            "请逐条分析以下邮件正文（JSON格式：id/time/sender/content），返回JSON数组，每个元素结构：\n"
+            "{\n"
+            "  \"id\": string,\n"
+            "  \"summary\": string,               // 必填：<=50字自然语句，必须以'ai: '开头；基于正文概括观点与关键信息，若有则点名分析师/预约人\n"
+            "  \"meeting_number\": string,        // 选填：从正文抽取的9-13位纯数字会议号，无则''\n"
+            "  \"tone\": string,                  // 必填：meeting/neutral/bullish/bearish 中选；会议邀请用'meeting'\n"
+            "  \"confidence\": float,             // 必填：0.0-1.0\n"
+            "  \"category\": string              // 必填：会议/观点/其他 中选；当检测到会议信息时选'会议'\n"
+            "}\n\n"
+            "说明：\n"
+            "- 严禁使用标题或主题信息；仅使用正文进行判断与生成\n"
+            "- meeting_number 只保留数字；tone=meeting 当存在会议/路演述求或会议号/平台\n"
+            "- 如果正文信息不足，summary 写'ai: 信息有限'，confidence=0.3\n\n"
+            "数据：{{messages_json}}"
+        ),
+    }
 }
 
 
@@ -144,6 +170,8 @@ def load_ai_config() -> Dict[str, Any]:
             "api_url": settings.SILICONFLOW_API_URL or "https://api.siliconflow.cn/v1",
             "model": settings.SILICONFLOW_MODEL or "Qwen/Qwen3-30B-A3B",
             "tool_model": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
+            "tool_model_messages": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
+            "tool_model_emails": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
             "max_tokens": 4000,
             "model_temperature": 0.7,
             "message_filters": {"external_only": True, "exclude_short": True, "exclude_system": True},
@@ -154,6 +182,8 @@ def load_ai_config() -> Dict[str, Any]:
         conf.setdefault("api_url", settings.SILICONFLOW_API_URL or conf.get("api_url", "https://api.siliconflow.cn/v1"))
         conf.setdefault("model", settings.SILICONFLOW_MODEL or conf.get("model", "Qwen/Qwen3-30B-A3B"))
         conf.setdefault("tool_model", settings.SILICONFLOW_TOOL_MODEL or conf.get("tool_model", "Qwen/Qwen3-8B"))
+        conf.setdefault("tool_model_messages", conf.get("tool_model_messages") or conf.get("tool_model", "Qwen/Qwen3-8B"))
+        conf.setdefault("tool_model_emails", conf.get("tool_model_emails") or conf.get("tool_model", "Qwen/Qwen3-8B"))
         conf.setdefault("max_tokens", conf.get("max_tokens", 4000))
         conf.setdefault("model_temperature", conf.get("model_temperature", 0.7))
         conf.setdefault("message_filters", conf.get("message_filters", {"external_only": True, "exclude_short": True, "exclude_system": True}))
@@ -325,9 +355,9 @@ def siliconflow_chat(messages: list[dict], temperature: float | None = 0.3, mode
     return content or ""
 
 
-def siliconflow_tool_chat(messages: list[dict], temperature: float = 0.2) -> str:
+def siliconflow_tool_chat(messages: list[dict], temperature: float = 0.2, model_override: str | None = None) -> str:
     conf = load_ai_config()
-    tool_model = conf.get("tool_model") or "Qwen/Qwen3-8B"
+    tool_model = model_override or conf.get("tool_model") or "Qwen/Qwen3-8B"
     return siliconflow_chat(messages, temperature=temperature, model_override=tool_model)
 
 

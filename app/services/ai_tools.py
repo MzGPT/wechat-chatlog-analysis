@@ -80,6 +80,9 @@ def extract_message_features(
     batch_size: int = 1,  # 改为逐条调用
     concurrency: int = 8,
     temperature: float = 0.1,
+    *,
+    prompt_key: str = "message_summary",
+    model_override: str | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """逐条调用小模型提取特征（不再批处理）"""
 
@@ -87,7 +90,7 @@ def extract_message_features(
         concurrency = 1
 
     conf = load_ai_config()
-    tool_prompt_conf = (conf.get("tool_prompts") or {}).get("message_summary") or DEFAULT_TOOL_PROMPTS["message_summary"]
+    tool_prompt_conf = (conf.get("tool_prompts") or {}).get(prompt_key) or DEFAULT_TOOL_PROMPTS.get(prompt_key) or DEFAULT_TOOL_PROMPTS["message_summary"]
 
     # 准备每条消息
     prepared: List[Dict[str, Any]] = []
@@ -112,7 +115,7 @@ def extract_message_features(
         try:
             # 构造单条消息的 prompt（包装成数组以兼容现有格式）
             prompt = _tool_prompt_payload([single_msg], tool_prompt_conf)
-            content = siliconflow_tool_chat(prompt, temperature=temperature)
+            content = siliconflow_tool_chat(prompt, temperature=temperature, model_override=model_override)
             
             # 解析返回
             data = json.loads(content)
@@ -322,11 +325,21 @@ def ensure_message_features(
             db.commit()
         return {"updated": 0, "errors": []}
 
+    # Per-channel model override: prefer tool_model_messages when configured
+    model_ovr = None
+    try:
+        conf = load_ai_config()
+        model_ovr = conf.get("tool_model_messages") or conf.get("tool_model")
+    except Exception:
+        model_ovr = None
+
     features = extract_message_features(
         to_extract,
         batch_size=batch_size,
         concurrency=concurrency,
         temperature=temperature,
+        prompt_key="message_summary",
+        model_override=model_ovr,
     )
     tool_errors = features.pop("__errors__", None)
     tool_debug = features.pop("__debug__", None)

@@ -215,7 +215,20 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         max_workers = 3
     # Cap concurrency to avoid provider RPM/TPM throttling; global semaphore in llm_client adds extra safety
     max_workers = max(1, min(6, max_workers))
-    features = extract_message_features(prepared, batch_size=8, concurrency=max_workers, temperature=0.1) if prepared else {}
+    # Use email-specific prompt and (optional) model override
+    try:
+        conf2 = load_ai_config()
+        model_ovr = conf2.get('tool_model_emails') or conf2.get('tool_model')
+    except Exception:
+        model_ovr = None
+    features = extract_message_features(
+        prepared,
+        batch_size=8,
+        concurrency=max_workers,
+        temperature=0.1,
+        prompt_key='email_message_summary',
+        model_override=model_ovr,
+    ) if prepared else {}
     features.pop("__errors__", None)
 
     results: Dict[str, dict] = {}

@@ -234,7 +234,11 @@ def list_messages(
                 return ""
             num = (d.get("meeting_number") or "").strip()
             plat = (d.get("platform") or "").strip()
-            key = (d.get("key_info") or "").strip()
+            # 优先使用小模型摘要（去前缀），否则使用 key_info
+            raw_sum = (d.get("summary") or "").strip()
+            import re as _re
+            clean_sum = _re.sub(r"^\s*(ai:|fallback:)\s*", "", raw_sum, flags=_re.IGNORECASE).strip() if raw_sum else ""
+            key = clean_sum or (d.get("key_info") or "").strip()
             left = " ".join([x for x in (num, plat) if x])
             if key:
                 return f"{left} | {key}" if left else key
