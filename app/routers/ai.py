@@ -286,6 +286,8 @@ def get_ai_config():
         "model": conf.get("model"),
         "has_key": bool(conf.get("api_key")),
         "tool_model": conf.get("tool_model"),
+        "tool_model_messages": conf.get("tool_model_messages") or conf.get("tool_model"),
+        "tool_model_emails": conf.get("tool_model_emails") or conf.get("tool_model"),
         "max_tokens": conf.get("max_tokens"),
         "model_temperature": conf.get("model_temperature"),
         # Send (WeChatPadPro) config surface for UI
@@ -313,7 +315,7 @@ def get_ai_config():
 @router.post("/config")
 def set_ai_config(conf: dict):
     merged = load_ai_config()
-    for key in ("api_key", "api_url", "model", "tool_model"):
+    for key in ("api_key", "api_url", "model", "tool_model", "tool_model_messages", "tool_model_emails"):
         if key in conf and conf[key] is not None:
             merged[key] = conf[key]
     # Allow frontend to configure WeChatPadPro endpoint without editing .env
