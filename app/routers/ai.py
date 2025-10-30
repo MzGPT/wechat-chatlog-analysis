@@ -20,12 +20,16 @@ from ..services.ai_tools import extract_message_features, build_ai_input_message
 from ..services.report_artifacts import build_artifact_payloads
 from ..services.snapshot_service import upsert_snapshot
 import os
+from hashlib import sha1
 import html
 import json
 import re
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
+
+# 简单的进程内增量缓存：按 (snapshot_id, module, prompt_hash, temperature) 缓存模块产出
+SUMMARY_CACHE: dict[tuple[object, str, str, float], str] = {}
 
 
 def _strip_llm_thoughts(text: str) -> str:
@@ -228,6 +232,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             "modules": modules,
             "temperature": temperature,
             "dataset_path": ds_path,
+            "snapshot_id": snapshot.id,
         }
 
         local_summary = _run_summary_local(summary_payload)
@@ -916,6 +921,18 @@ def _run_summary_local(payload: dict) -> dict:
                     "meta": {"total_messages": (module_payload.get("meta") or {}).get("total_messages")},
                 }
                 payload_str = json.dumps(slim, ensure_ascii=False)
+
+            # ===== 增量缓存命中检查 =====
+            try:
+                snap_id = payload.get("snapshot_id")
+                ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
+                cache_key = (snap_id, module_key, ph, float(temperature))
+                cached = SUMMARY_CACHE.get(cache_key)
+                if cached:
+                    result[result_key] = cached
+                    continue
+            except Exception:
+                pass
             if "{{messages_data}}" in user_template:
                 user_content = user_template.replace("{{messages_data}}", payload_str)
             else:
@@ -945,6 +962,15 @@ def _run_summary_local(payload: dict) -> dict:
                     result[result_key] = _strip_llm_thoughts(parsed.get("html", ""))
             else:
                 result[result_key] = _strip_llm_thoughts(output_text)
+
+            # 写入缓存
+            try:
+                snap_id = payload.get("snapshot_id")
+                ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
+                cache_key = (snap_id, module_key, ph, float(temperature))
+                SUMMARY_CACHE[cache_key] = result[result_key]
+            except Exception:
+                pass
 
         # ---------- Local fallbacks to guarantee useful content ----------
         POS = {"看多","看好","上涨","增持","买入","积极","乐观","超配","超预期","改善","提价","扩产","胜诉","达成"}
