@@ -260,6 +260,35 @@ def derive_email_messages(payload: dict, progress_key: str | None = None, db: Se
     return {"status": "ok", "processed": len(rows), "features": compat, "debug_readback": readback[:50]}
 
 
+@router.post("/derive/latest")
+def derive_latest_emails(limit: int = 10, db: Session = Depends(get_db)):
+    """强制对最新 N 封邮件重新生成小模型摘要（覆盖旧的 fallback/tool 结果）。"""
+    try:
+        limit = max(1, min(200, int(limit)))
+    except Exception:
+        limit = 10
+    # SQLite 无 NULLS LAST，使用 CASE 将 NULL 置后
+    order_nulls_last = case((EmailMessage.sent_at == None, 1), else_=0)  # noqa: E711
+    rows = (
+        db.execute(select(EmailMessage).order_by(order_nulls_last.asc(), desc(EmailMessage.sent_at)).limit(limit))
+        .scalars()
+        .all()
+    )
+    from ..services.email_features import persist_email_features
+    features = persist_email_features(db, rows, force=True, commit=True)
+    # 返回简要结果
+    out = []
+    for em in rows:
+        d = em.derived if isinstance(em.derived, dict) else {}
+        out.append({
+            "id": em.id,
+            "subject": em.subject,
+            "summary_origin": (d or {}).get("summary_origin"),
+            "has_ai": bool(isinstance(d, dict) and isinstance(d.get("summary"), str) and d.get("summary"," ").lower().strip().startswith("ai:")),
+        })
+    return {"status": "ok", "processed": len(out), "items": out}
+
+
 @router.get("/derive/progress")
 def email_derive_progress(key: str):
     info = EMAIL_PROGRESS.get(key)

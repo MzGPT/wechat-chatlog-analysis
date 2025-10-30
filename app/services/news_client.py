@@ -30,10 +30,10 @@ def _cache_set(key: str, val: Any, ttl: int) -> None:
         pass
 
 
-def _get(url: str, params: dict | None = None, *, timeout: int = 5) -> dict:
+def _get(url: str, params: dict | None = None, *, timeout: int = 5, headers: dict | None = None) -> dict:
     for i in range(3):
         try:
-            r = requests.get(url, params=params or {}, timeout=timeout)
+            r = requests.get(url, params=params or {}, timeout=timeout, headers=headers or {})
             if r.status_code < 500:
                 r.raise_for_status()
                 return r.json()
@@ -59,62 +59,28 @@ def _post(url: str, payload: dict | None = None, *, timeout: int = 8) -> dict:
 
 
 def newsnow_health() -> dict:
-    base = settings.NEWSNOW_API_BASE.rstrip("/")
-    try:
-        return _get(f"{base}/api/health")
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    # deprecated: upstream removed; keep stub to avoid import errors
+    return {"status": "deprecated"}
 
 
 def newsnow_sources(force: bool = False) -> dict:
-    base = settings.NEWSNOW_API_BASE.rstrip("/")
-    key = "sources"
-    if not force:
-        val = _cache_get(key)
-        if val is not None:
-            return val
-    try:
-        j = _get(f"{base}/api/sources")
-    except Exception as e:
-        j = {"success": False, "error": str(e), "data": []}
-    _cache_set(key, j, settings.NEWSNOW_CACHE_TTL)
-    return j
+    # deprecated: upstream removed
+    return {"success": False, "data": []}
 
 
 def newsnow_news(keyword: str | None = None, source: str | None = None, limit: int = 50, simple: bool = True) -> dict:
-    base = settings.NEWSNOW_API_BASE.rstrip("/")
-    params: dict[str, Any] = {}
-    if keyword:
-        params["keyword"] = keyword
-    if source:
-        params["source"] = source
-    if limit:
-        params["limit"] = max(1, min(200, int(limit)))
-    if simple:
-        params["format"] = "simple"
-    try:
-        return _get(f"{base}/api/news", params=params)
-    except Exception as e:
-        return {"success": False, "error": str(e), "data": []}
+    # deprecated: use direct collectors
+    return {"success": False, "data": []}
 
 
 def newsnow_search(q: str, limit: int = 20) -> dict:
-    base = settings.NEWSNOW_API_BASE.rstrip("/")
-    params = {"q": q}
-    if limit:
-        params["limit"] = max(1, min(200, int(limit)))
-    try:
-        return _get(f"{base}/api/search", params=params)
-    except Exception as e:
-        return {"success": False, "error": str(e), "data": []}
+    # deprecated: use direct collectors
+    return {"success": False, "data": []}
 
 
 def newsnow_refresh() -> dict:
-    base = settings.NEWSNOW_API_BASE.rstrip("/")
-    try:
-        return _post(f"{base}/api/refresh")
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    # deprecated: use direct collectors
+    return {"success": False}
 
 
 # --------------- finance filtering & normalization ---------------
@@ -141,6 +107,42 @@ def _load_finance_keywords() -> list[str]:
     except Exception:
         pass
     return _DEFAULT_FINANCE_KEYWORDS
+
+
+def _load_source_whitelist() -> list[str]:
+    """Load preferred news sources from data/entities.json -> news_sources_whitelist.
+    Accept both source ids and Chinese names. Case-insensitive for ids; fuzzy contains for names.
+    """
+    import os
+    path = os.path.abspath(os.path.join(os.getcwd(), 'data', 'entities.json'))
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                j = json.load(f)
+            arr = j.get('news_sources_whitelist') if isinstance(j, dict) else None
+            if isinstance(arr, list) and arr:
+                return [str(x).strip() for x in arr if isinstance(x, (str, int)) and str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _is_whitelisted(source_id: str, source_name: str, wl: list[str]) -> bool:
+    if not wl:
+        return True
+    sid = (source_id or '').strip().lower()
+    sname = (source_name or '').strip()
+    wl_norm = [str(x).strip().lower() for x in wl]
+    # match id exact (case-insensitive) or name contains any token (Chinese names)
+    if sid and sid in wl_norm:
+        return True
+    for token in wl:
+        t = str(token).strip()
+        if not t:
+            continue
+        if t in sname:
+            return True
+    return False
 
 
 def _is_finance(title: str, url: str | None = None) -> bool:
@@ -179,7 +181,7 @@ def _infer_news_tone(title: str) -> str:
     return "neutral"
 
 
-def normalize_items(raw: dict, *, finance_only: bool = True) -> dict:
+def normalize_items(raw: dict, *, finance_only: bool = True, whitelist: list[str] | None = None) -> dict:
     ok = bool(raw.get('success', True))
     data = raw.get('data') or []
     out: List[dict] = []
@@ -187,11 +189,22 @@ def normalize_items(raw: dict, *, finance_only: bool = True) -> dict:
         # Try both full and simple formats
         title = it.get('title') or ''
         url = it.get('url') or ''
-        src_name = it.get('source') or it.get('sourceName') or it.get('name') or ''
-        src_id = it.get('sourceId') or it.get('id') or ''
+        # When items are already pre-normalized, they may carry `source_name`/`source_id` fields.
+        # Fall back to those to avoid blank source display in /api/newsfeed responses.
+        src_name = (
+            it.get('source')
+            or it.get('sourceName')
+            or it.get('name')
+            or it.get('source_name')
+            or ''
+        )
+        src_id = it.get('sourceId') or it.get('source_id') or it.get('id') or ''
         nid = it.get('id') or url or title
         ts = it.get('pubDate') or it.get('timestamp') or it.get('updatedTime') or 0
-        if finance_only and not _is_finance(str(title), str(url)):
+        wl = whitelist or []
+        if wl and not _is_whitelisted(str(src_id), str(src_name), wl):
+            continue
+        if finance_only and not wl and not _is_finance(str(title), str(url)):
             continue
         cat = _infer_news_category(str(title), str(src_name))
         tone = _infer_news_tone(str(title))
@@ -214,3 +227,393 @@ def normalize_items(raw: dict, *, finance_only: bool = True) -> dict:
             }
         })
     return {'total': len(out), 'items': out, 'upstream_ok': ok}
+
+
+# --------------- direct fetchers (avoid 4445 dependency) ---------------
+
+def _strip_html(text: str) -> str:
+    try:
+        import re
+        # remove tags
+        t = re.sub(r"<[^>]+>", " ", text or '')
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+    except Exception:
+        return text or ''
+
+
+def direct_wallstreetcn(limit: int = 30) -> dict:
+    """Fetch live news from WallstreetCN public API without auth.
+    Endpoint: https://api.wallstreetcn.com/apiv1/content/lives?channel=global&limit=N
+    """
+    url = "https://api.wallstreetcn.com/apiv1/content/lives"
+    params = {"channel": "global", "limit": max(1, min(100, int(limit)))}
+    try:
+        j = _get(url, params=params, timeout=8)
+        items = []
+        for it in (j.get('data', {}).get('items') or []):
+            live = it
+            cid = live.get('id') or live.get('resource') or it.get('id')
+            content_html = (live.get('content') or '')
+            title = _strip_html(content_html)[:120]
+            ts = live.get('display_time') or live.get('created_at') or live.get('updated_at') or 0
+            url_article = ''
+            try:
+                art = live.get('article') or {}
+                url_article = art.get('uri') or art.get('resource') or ''
+            except Exception:
+                pass
+            src_name = '华尔街见闻'
+            src_id = 'wallstreetcn-quick'
+            cat = _infer_news_category(title, src_name)
+            tone = _infer_news_tone(title)
+            items.append({
+                'id': str(cid),
+                'source_id': src_id,
+                'source_name': src_name,
+                'title': title,
+                'url': url_article,
+                'pub_ts': int(ts) if isinstance(ts, int) else 0,
+                'tags': [],
+                'category': cat,
+                'summary': '',
+                'raw': it,
+                'derived': {
+                    'key_info': title,
+                    'category': cat,
+                    'tone': tone,
+                    'summary_origin': 'fallback',
+                }
+            })
+        return {'total': len(items), 'items': items, 'upstream_ok': True}
+    except Exception as e:
+        return {'total': 0, 'items': [], 'upstream_ok': False, 'error': str(e)}
+
+
+def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
+    """Direct aggregation from multiple sources (JSON-first). Extendable.
+    Implemented: wallstreetcn-quick, HackerNews (Algolia), SpaceflightNews, Reddit (r/stocks, r/investing).
+    """
+    agg: List[dict] = []
+    # 1) 华尔街见闻快讯
+    try:
+        d1 = direct_wallstreetcn(limit=min(30, limit))
+        agg.extend(d1.get('items') or [])
+    except Exception:
+        pass
+    # 2) Hacker News (Algolia)
+    try:
+        agg.extend(_direct_hn_algolia(q=q, limit=min(30, limit)))
+    except Exception:
+        pass
+    # 3) Spaceflight News
+    try:
+        agg.extend(_direct_spaceflight(limit=min(20, limit)))
+    except Exception:
+        pass
+    # 4) Reddit r/stocks & r/investing
+    try:
+        agg.extend(_direct_reddit('stocks', limit=min(10, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_reddit('investing', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 5) Reddit r/economy
+    try:
+        agg.extend(_direct_reddit('economy', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 6) TechCrunch (WP JSON)
+    try:
+        agg.extend(_direct_wp_posts('https://techcrunch.com', 'techcrunch', 'TechCrunch', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 7) Coindesk (WP JSON)
+    try:
+        agg.extend(_direct_wp_posts('https://www.coindesk.com', 'coindesk', 'CoinDesk', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 8) Engadget (WP JSON)
+    try:
+        agg.extend(_direct_wp_posts('https://www.engadget.com', 'engadget', 'Engadget', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 9) Cointelegraph (WP JSON)
+    try:
+        agg.extend(_direct_wp_posts('https://cointelegraph.com', 'cointelegraph', 'Cointelegraph', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 10) Bitcoin.com News (WP JSON)
+    try:
+        agg.extend(_direct_wp_posts('https://news.bitcoin.com', 'bitcoincom', 'Bitcoin.com News', limit=min(10, limit)))
+    except Exception:
+        pass
+    # 11) NPR Business JSON
+    try:
+        agg.extend(_direct_npr_business(limit=min(10, limit)))
+    except Exception:
+        pass
+    # keyword filter (best-effort)
+    if q:
+        ql = str(q).lower()
+        agg = [it for it in agg if ql in (it.get('title') or '').lower() or ql in (it.get('source_name') or '').lower()]
+    # de-dup by id or url+title
+    seen: set[str] = set()
+    uniq: List[dict] = []
+    for it in agg:
+        key = it.get('id') or (it.get('url') or '') + '|' + (it.get('title') or '')
+        key = str(key)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+    return {'total': len(uniq), 'items': uniq, 'upstream_ok': True}
+
+
+# ------------------- external JSON sources (no key) -------------------
+
+def _direct_hn_algolia(q: str | None, limit: int = 20) -> List[dict]:
+    # If no query, use latest stories by date
+    url = 'https://hn.algolia.com/api/v1/search_by_date' if not q else 'https://hn.algolia.com/api/v1/search'
+    params = {'tags': 'story', 'page': 0, 'hitsPerPage': max(1, min(50, int(limit)))}
+    if q:
+        params['query'] = q
+    j = _get(url, params=params, timeout=8)
+    items: List[dict] = []
+    for h in (j.get('hits') or []):
+        title = h.get('title') or h.get('story_title') or ''
+        urlp = h.get('url') or h.get('story_url') or ''
+        ts = h.get('created_at_i') or 0
+        cat = _infer_news_category(title, 'Hacker News')
+        tone = _infer_news_tone(title)
+        items.append({
+            'id': str(h.get('objectID') or urlp or title),
+            'source_id': 'hackernews',
+            'source_name': 'Hacker News',
+            'title': title,
+            'url': urlp,
+            'pub_ts': int(ts) * 1000 if isinstance(ts, int) else 0,
+            'tags': [],
+            'category': cat,
+            'summary': '',
+            'raw': h,
+            'derived': {
+                'key_info': title,
+                'category': cat,
+                'tone': tone,
+                'summary_origin': 'fallback',
+            }
+        })
+    return items
+
+
+def _direct_spaceflight(limit: int = 20) -> List[dict]:
+    url = 'https://api.spaceflightnewsapi.net/v4/articles'
+    params = {'limit': max(1, min(50, int(limit))), 'ordering': '-published_at'}
+    j = _get(url, params=params, timeout=8)
+    results = j.get('results') or []
+    items: List[dict] = []
+    for a in results:
+        title = a.get('title') or ''
+        urlp = a.get('url') or ''
+        ts_iso = a.get('published_at') or ''
+        ts_int = 0
+        try:
+            # simple parse: YYYY-MM-DDTHH:MM:SSZ
+            from datetime import datetime
+            ts_int = int(datetime.fromisoformat(ts_iso.replace('Z', '+00:00')).timestamp() * 1000)
+        except Exception:
+            ts_int = 0
+        cat = _infer_news_category(title, 'Spaceflight')
+        tone = _infer_news_tone(title)
+        items.append({
+            'id': str(a.get('id') or urlp or title),
+            'source_id': 'spaceflight',
+            'source_name': 'Spaceflight News',
+            'title': title,
+            'url': urlp,
+            'pub_ts': ts_int,
+            'tags': [],
+            'category': cat,
+            'summary': '',
+            'raw': a,
+            'derived': {
+                'key_info': title,
+                'category': cat,
+                'tone': tone,
+                'summary_origin': 'fallback',
+            }
+        })
+    return items
+
+
+def _direct_reddit(subreddit: str, limit: int = 10) -> List[dict]:
+    url = f'https://www.reddit.com/r/{subreddit}/hot.json'
+    params = {'limit': max(1, min(50, int(limit)))}
+    headers = {'User-Agent': 'Mozilla/5.0 (+news-collector)'}
+    j = _get(url, params=params, timeout=8, headers=headers)
+    children = j.get('data', {}).get('children') or []
+    items: List[dict] = []
+    for c in children:
+        d = c.get('data') or {}
+        title = d.get('title') or ''
+        urlp = d.get('url') or ''
+        ts = d.get('created_utc') or 0
+        cat = _infer_news_category(title, f'Reddit r/{subreddit}')
+        tone = _infer_news_tone(title)
+        items.append({
+            'id': str(d.get('id') or urlp or title),
+            'source_id': f'reddit-{subreddit}',
+            'source_name': f'Reddit r/{subreddit}',
+            'title': title,
+            'url': urlp,
+            'pub_ts': int(ts) * 1000 if isinstance(ts, (int, float)) else 0,
+            'tags': [],
+            'category': cat,
+            'summary': '',
+            'raw': d,
+            'derived': {
+                'key_info': title,
+                'category': cat,
+                'tone': tone,
+                'summary_origin': 'fallback',
+            }
+        })
+    return items
+
+
+def _direct_wp_posts(base_url: str, source_id: str, source_name: str, limit: int = 10) -> List[dict]:
+    """Generic WordPress posts JSON fetcher: <base>/wp-json/wp/v2/posts?per_page=N"""
+    url = base_url.rstrip('/') + '/wp-json/wp/v2/posts'
+    params = {'per_page': max(1, min(20, int(limit)))}
+    headers = {'User-Agent': 'Mozilla/5.0 (+news-collector)'}
+    j = _get(url, params=params, timeout=8, headers=headers)
+    if not isinstance(j, list):
+        return []
+    items: List[dict] = []
+    for p in j:
+        try:
+            title_html = p.get('title', {}).get('rendered') or ''
+            title = _strip_html(title_html)[:200]
+            link = p.get('link') or ''
+            date = p.get('date_gmt') or p.get('date') or ''
+            ts = 0
+            if date:
+                from datetime import datetime
+                try:
+                    ts = int(datetime.fromisoformat(date.replace('Z','+00:00')).timestamp() * 1000)
+                except Exception:
+                    ts = 0
+            cat = _infer_news_category(title, source_name)
+            tone = _infer_news_tone(title)
+            items.append({
+                'id': str(p.get('id') or link or title),
+                'source_id': source_id,
+                'source_name': source_name,
+                'title': title,
+                'url': link,
+                'pub_ts': ts,
+                'tags': [],
+                'category': cat,
+                'summary': '',
+                'raw': p,
+                'derived': {
+                    'key_info': title,
+                    'category': cat,
+                    'tone': tone,
+                    'summary_origin': 'fallback',
+                }
+            })
+        except Exception:
+            continue
+    return items
+
+
+def _direct_npr_business(limit: int = 20) -> List[dict]:
+    """NPR Business JSON feed: https://feeds.npr.org/1006/feed.json"""
+    url = 'https://feeds.npr.org/1006/feed.json'
+    j = _get(url, timeout=8)
+    items: List[dict] = []
+    for it in (j.get('items') or []):
+        title = it.get('title') or ''
+        urlp = it.get('url') or ''
+        ts = it.get('date_published') or ''
+        ts_int = 0
+        if ts:
+            from datetime import datetime
+            try:
+                ts_int = int(datetime.fromisoformat(ts.replace('Z','+00:00')).timestamp() * 1000)
+            except Exception:
+                ts_int = 0
+        cat = _infer_news_category(title, 'NPR Business')
+        tone = _infer_news_tone(title)
+        items.append({
+            'id': str(urlp or title),
+            'source_id': 'npr-business',
+            'source_name': 'NPR Business',
+            'title': title,
+            'url': urlp,
+            'pub_ts': ts_int,
+            'tags': [],
+            'category': cat,
+            'summary': '',
+            'raw': it,
+            'derived': {
+                'key_info': title,
+                'category': cat,
+                'tone': tone,
+                'summary_origin': 'fallback',
+            }
+        })
+        if len(items) >= max(1, min(50, int(limit))):
+            break
+    return items
+
+
+def write_news_snapshot(limit: int = 150) -> dict:
+    """Write a direct snapshot JSON under data/datasets/ with essential fields.
+    Fields: id, source_id, source_name, title, content, url, pub_ts, published_at
+    """
+    import os, time, json as _json
+    from datetime import datetime, timezone
+    agg = direct_from_sources_json(limit=limit)
+    items = agg.get('items') or []
+    rows: List[dict] = []
+    for it in items:
+        title = it.get('title') or ''
+        raw = it.get('raw') or {}
+        content = ''
+        try:
+            html = raw.get('content') or ''
+            content = _strip_html(html) if html else title
+        except Exception:
+            content = title
+        ts = int(it.get('pub_ts') or 0)
+        # normalize to milliseconds
+        if ts > 0 and ts < 10_000_000_000:  # likely seconds
+            ts = ts * 1000
+        if ts <= 0:
+            ts = int(time.time() * 1000)
+        try:
+            published_at = datetime.fromtimestamp(ts/1000, tz=timezone.utc).isoformat()
+        except Exception:
+            published_at = None
+        rows.append({
+            'id': it.get('id'),
+            'source_id': it.get('source_id'),
+            'source_name': it.get('source_name'),
+            'title': title,
+            'content': content,
+            'url': it.get('url'),
+            'pub_ts': ts,
+            'published_at': published_at,
+        })
+    ds_dir = os.path.abspath(os.path.join(os.getcwd(), 'data', 'datasets'))
+    os.makedirs(ds_dir, exist_ok=True)
+    fname = f"news_snapshot_{int(time.time())}.json"
+    fpath = os.path.join(ds_dir, fname)
+    with open(fpath, 'w', encoding='utf-8') as f:
+        _json.dump({'items': rows, 'total': len(rows)}, f, ensure_ascii=False, indent=2)
+    return {'status': 'ok', 'file': fpath, 'total': len(rows)}

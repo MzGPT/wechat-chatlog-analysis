@@ -47,7 +47,10 @@ class Settings(BaseSettings):
     NEWSNOW_ENABLED: bool = True
     NEWSNOW_API_BASE: str = Field(default="http://localhost:4445")
     NEWSNOW_CACHE_TTL: int = Field(default=300)  # seconds
-    NEWSNOW_REFRESH_INTERVAL_SECONDS: int | None = Field(default=0)  # 0 = disabled (manual only)
+    # 默认每小时刷新一次（可用 .env 覆盖）
+    NEWSNOW_REFRESH_INTERVAL_SECONDS: int | None = Field(default=3600)  # 0 = disabled (manual only)
+    # 每3小时写入一次新闻舆情底层快照（datasets JSON）
+    NEWS_SNAPSHOT_INTERVAL_SECONDS: int | None = Field(default=10800)
 
     class Config:
         env_file = ".env"

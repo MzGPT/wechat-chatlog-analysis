@@ -149,6 +149,34 @@ async def _news_loop():
         await asyncio.sleep(max(30, interval))
 
 
+async def _news_snapshot_loop():
+    """Periodic writer for news sentiment dataset snapshots.
+
+    Writes compact JSON snapshots under data/datasets/ every
+    settings.NEWS_SNAPSHOT_INTERVAL_SECONDS seconds using direct collectors.
+    """
+    interval = int(settings.__dict__.get("NEWS_SNAPSHOT_INTERVAL_SECONDS", 0) or 0)
+    if interval <= 0:
+        return
+    # short initial delay to allow app startup
+    await asyncio.sleep(3)
+    while True:
+        try:
+            # Best-effort: collect and persist a fresh snapshot
+            try:
+                news_client.write_news_snapshot(limit=200)
+            except Exception:
+                pass
+            # Optionally warm aggregation cache for UI consumption
+            try:
+                news_client.direct_from_sources_json(limit=50)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        await asyncio.sleep(max(60, interval))
+
+
 def install_background(app: FastAPI):
     @app.on_event("startup")
     async def start_sync():
@@ -165,3 +193,7 @@ def install_background(app: FastAPI):
         news_interval = int(settings.__dict__.get("NEWSNOW_REFRESH_INTERVAL_SECONDS", 0) or 0)
         if news_interval and news_interval > 0:
             asyncio.create_task(_news_loop())
+        # Start snapshot loop for news sentiment datasets (every ~3h by default)
+        snap_interval = int(settings.__dict__.get("NEWS_SNAPSHOT_INTERVAL_SECONDS", 0) or 0)
+        if snap_interval and snap_interval > 0:
+            asyncio.create_task(_news_snapshot_loop())

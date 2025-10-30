@@ -300,7 +300,8 @@ def get_ai_config():
         "tool_prompts": conf.get("tool_prompts", {}),
         "default_tool_prompts": DEFAULT_TOOL_PROMPTS,
         "analysis_defaults": {
-            "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts"],
+            # 默认包含新闻舆情模块（默认必出）
+            "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts", "newswatch"],
             "concurrency": int(analysis_defaults.get("concurrency") or 32),
             "temperature": float(analysis_defaults.get("temperature") or 0.3),
             "force_snapshot": bool(analysis_defaults.get("force_snapshot") if analysis_defaults.get("force_snapshot") is not None else True),
@@ -738,7 +739,7 @@ def _run_summary_local(payload: dict) -> dict:
         module_titles = {
             "market": "市场观点总结",
             "meetings": "会议路演信息",
-            "counter": "反驳观点分析",
+            "counter": "分歧观点分析",
             "contacts": "高评分联系人摘要",
             "newswatch": "新闻舆情监测",
             "socialwatch": "自媒体舆情监测",
@@ -781,6 +782,25 @@ def _run_summary_local(payload: dict) -> dict:
                 else:
                     source = sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=220)
+            elif module_key == "newswatch":
+                # 舆情分析读取直接新闻源，而非聊天消息
+                try:
+                    from ..services.news_client import direct_from_sources_json, normalize_items
+                    # 拉取较新的直接新闻（无需白名单，保持财经关键词过滤）
+                    direct = direct_from_sources_json(limit=80)
+                    norm = normalize_items({"success": True, "data": direct.get("items", [])}, finance_only=True)
+                    news_items = []
+                    for it in (norm.get("items") or [])[:80]:
+                        news_items.append({
+                            "id": str(it.get("id")),
+                            "source": it.get("source_name") or it.get("source_id") or "",
+                            "title": it.get("title") or "",
+                            "url": it.get("url") or "",
+                            "time": it.get("pub_ts") or None,
+                        })
+                    module_payload["messages"] = news_items
+                except Exception:
+                    module_payload["messages"] = []
             else:
                 module_payload["messages"] = _compact(sorted_messages, prefer_meetings=False, limit=300)
 
@@ -854,7 +874,12 @@ def _run_summary_local(payload: dict) -> dict:
                 pass
             module_payload["target_module"] = module_key
             module_payload["module_title"] = module_titles.get(module_key, module_key)
-            payload_str = json.dumps(module_payload, ensure_ascii=False)
+            # 降低 newswatch 上下文体积：仅传递精简 messages，避免夹带 raw_messages 导致超长
+            if module_key == "newswatch":
+                compact = {"messages": module_payload.get("messages", [])}
+                payload_str = json.dumps(compact, ensure_ascii=False)
+            else:
+                payload_str = json.dumps(module_payload, ensure_ascii=False)
             if "{{messages_data}}" in user_template:
                 user_content = user_template.replace("{{messages_data}}", payload_str)
             else:
@@ -888,6 +913,31 @@ def _run_summary_local(payload: dict) -> dict:
         # ---------- Local fallbacks to guarantee useful content ----------
         POS = {"看多","看好","上涨","增持","买入","积极","乐观","超配","超预期","改善","提价","扩产","胜诉","达成"}
         NEG = {"看空","不看好","下跌","减持","卖出","悲观","谨慎","风险","压力","回调","不及预期","降价","停产","失利","受阻"}
+
+        from collections import Counter
+        import re as _re
+
+        def _strip_ai_prefix(text: str) -> str:
+            t = (text or "").strip()
+            if t.lower().startswith("ai:"):
+                t = t[3:].strip()
+            return t
+
+        def _top_terms(texts: list[str], limit: int = 3) -> list[str]:
+            tokens: list[str] = []
+            for txt in texts:
+                for tok in _re.findall(r"[A-Za-z]{3,}|[\u4e00-\u9fa5]{2,6}", txt):
+                    if len(tok) < 2:
+                        continue
+                    tokens.append(tok)
+            commons = [w for w, _ in Counter(tokens).most_common(limit)]
+            return commons
+
+        def _pick_risk(texts: list[str]) -> str:
+            for txt in texts:
+                if "风险" in txt or "待" in txt or "不确定" in txt or "关注" in txt:
+                    return txt
+            return "关注政策节奏与资金面变化"
 
         def _short(txt: str, n: int = 80) -> str:
             t = (txt or "").strip().replace("\n", " ")
@@ -934,50 +984,42 @@ def _run_summary_local(payload: dict) -> dict:
                 cats.append("其他观点")
             return cats
 
+        def _summarize_bucket(bucket: list[dict], limit: int = 4) -> list[str]:
+            if not bucket:
+                return ["- 信息有限"]
+            texts = [_strip_ai_prefix(m.get("summary") or m.get("content") or "") for m in bucket]
+            top_terms = _top_terms(texts, 3)
+            headline = "、".join(top_terms[:2]) if top_terms else "重点线索"
+            primary = _short(texts[0], 120)
+            risk = _short(_pick_risk(texts), 80)
+            lines = [f"- 主题：{headline}；结论：{primary}", f"- 风险/待跟进：{risk}"]
+            return lines[:limit]
+
         def _build_market_md() -> str:
             total = len(enriched_messages)
             pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
             neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
-            md = ["# 市场观点总结", f"- 样本数：{total}；正向：{pos}；负向：{neg}"]
+            md = ["# 市场观点总览", f"- 样本：{total} 条；正向 {pos} 条 / 负向 {neg} 条"]
+            md.append("- 今日关键风险：关注政策节奏与资金流、业绩兑现度以及外部宏观变量带来的波动。")
             for name, _ in CAT_RULES:
                 bucket = [m for m in enriched_messages if name in _match_cats(m)]
-                if not bucket:
-                    md.append(f"\n## {name}\n- 信息有限")
-                    continue
                 md.append(f"\n## {name}")
-                # Top 5 highlights
-                for m in bucket[:5]:
-                    sent = m.get("sender") or m.get("sender_name") or "未知"
-                    ts = m.get("time") or ""
-                    text = _short(m.get("summary") or m.get("content") or "", 120)
-                    tone = m.get("tone") or "neutral"
-                    md.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
-            md.append("\n## 行动建议\n- 根据政策与基本面强弱，分配仓位并动态跟踪关键数据。")
-            md.append("\n## 关注事项\n- 货币与财政节奏、订单与盈利质量、外部流动性与风险事件。")
+                md.extend(_summarize_bucket(bucket))
+            md.append("\n## 今日重点提示\n- 按主题监控数据验证窗口，遇到分歧议题先补齐证据再决策；保持仓位弹性和对冲准备。")
             return "\n".join(md)
 
         def _build_market_html() -> str:
             total = len(enriched_messages)
             pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
             neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
-            sections = []
-            sections.append(f"<p>样本数：{total}；正向：{pos}；负向：{neg}</p>")
+            sections = ["<h1>市场观点总览</h1>", f"<p>样本：{total} 条；正向 {pos} / 负向 {neg}</p>", "<p>今日关键风险：关注政策节奏与资金流、业绩兑现度以及外部宏观变量带来的波动。</p>"]
             for name, _ in CAT_RULES:
                 bucket = [m for m in enriched_messages if name in _match_cats(m)]
-                if not bucket:
-                    sections.append(f"<h2>{name}</h2><ul><li>信息有限</li></ul>")
-                    continue
-                items = []
-                for m in bucket[:5]:
-                    sent = m.get("sender") or m.get("sender_name") or "未知"
-                    ts = m.get("time") or ""
-                    text = _short(m.get("summary") or m.get("content") or "", 120)
-                    tone = m.get("tone") or "neutral"
-                    items.append(f"<li>({tone}) {html.escape(text)}（来源：{html.escape(sent)} {html.escape(ts or '')}）</li>")
-                sections.append(f"<h2>{name}</h2><ul>{''.join(items)}</ul>")
-            sections.append("<h2>行动建议</h2><ul><li>根据政策与基本面强弱，分配仓位并动态跟踪关键数据。</li></ul>")
-            sections.append("<h2>关注事项</h2><ul><li>货币与财政节奏、订单与盈利质量、外部流动性与风险事件。</li></ul>")
-            return "<h1>市场观点总结</h1>" + "".join(sections)
+                sections.append(f"<h2>{name}</h2>")
+                lines = _summarize_bucket(bucket)
+                sections.append("<ul>" + "".join(f"<li>{html.escape(line)}</li>" for line in lines) + "</ul>")
+            sections.append("<h2>今日重点提示</h2><ul><li>按主题监控验证窗口，补齐证据再做仓位调整，保留对冲准备。</li></ul>")
+            return "".join(sections)
 
         PLATFORM_ABBREV = {
             "腾讯会议": "腾",
@@ -1080,11 +1122,15 @@ def _run_summary_local(payload: dict) -> dict:
             items = _extract_meetings()
             if not items:
                 return "# 会议路演信息\n- 信息有限"
-            md = ["# 会议路演信息", f"- 记录到会议/路演：{len(items)} 场"]
-            md.append("\n| 时间 | 形式 | 会议号 | 主讲人/机构 | 主题要点 |\n|---|---|---|---|---|")
+            platform_counter = Counter(it.get("platform") or "待定" for it in items)
+            top_platforms = ", ".join(f"{k}{v}场" for k, v in platform_counter.most_common(3))
+            md = ["# 会议路演信息", f"- 今日共 {len(items)} 场，主流平台：{top_platforms or '—'}"]
+            md.append("\n| 时间 | 平台/会议号 | 主讲人 | 主题要点 |\n|---|---|---|---|")
             for it in items:
-                md.append(f"| {it['time']} | {it['number']} | {it['speaker']} | {it['topic']} |")
-            md.append("\n## 待处理事项\n- 核对会议号与参会方式，提前准备提问要点和资料。")
+                code = it['number'] if it['number'] != "待确认" else ''
+                platform_tag = it['platform']
+                md.append(f"| {it['time']} | {platform_tag} {code} | {it['speaker']} | {it['topic']} |")
+            md.append("\n## 跟进提醒\n- 核对会议号与参会方式，提前准备提问要点和资料。")
             return "\n".join(md)
 
         def _normalize_conflict_theme(m: dict) -> str:
@@ -1111,47 +1157,53 @@ def _run_summary_local(payload: dict) -> dict:
                 tone = _classify_tone(m)
                 if tone not in ("positive", "negative"):
                     continue
-                summary = (m.get("summary") or m.get("content") or "").strip()
+                summary = _strip_ai_prefix(m.get("summary") or m.get("content") or "")
                 if not summary:
                     continue
-                # 主题归并：优先股票/行业/会议主题关键词，否则用摘要短句
                 theme = _normalize_conflict_theme(m)
-                entry = _short(summary, 160)
-                bucket = topics.setdefault(theme, {"positive": [], "negative": []})
-                bucket[tone].append(entry)
+                entry = _short(summary, 140)
+                bucket = topics.setdefault(theme, {"positive": [], "negative": [], "pos_ids": [], "neg_ids": []})
+                if tone == "positive":
+                    bucket["positive"].append(entry)
+                    bucket["pos_ids"].append(str(m.get("id") or m.get("message_id") or ""))
+                else:
+                    bucket["negative"].append(entry)
+                    bucket["neg_ids"].append(str(m.get("id") or m.get("message_id") or ""))
             conflicts: list[dict] = []
             for theme, bucket in topics.items():
                 if bucket["positive"] and bucket["negative"]:
                     conflicts.append({
-                    "theme": theme,
-                    "positive": bucket["positive"][0],
-                    "negative": bucket["negative"][0],
-                    "positive_id": ids_map.get(theme, {}).get("positive", [""])[0] if ids_map.get(theme, {}).get("positive") else "",
-                    "negative_id": ids_map.get(theme, {}).get("negative", [""])[0] if ids_map.get(theme, {}).get("negative") else "",
-                })
-            # 若严格二元分法产生空结果，退化为“争议线索”：提取包含对立词根的样本各3条
-            if not conflicts:
-                leads = []
-                for m in enriched_messages:
-                    txt = (m.get("content") or "")
-                    if _has_any(txt, POS) and _has_any(txt, NEG):
-                        leads.append(_short(txt, 120))
-                if leads:
-                    return [{"theme": "存在分歧/待核查", "positive": leads[0], "negative": leads[1] if len(leads)>1 else leads[0]}]
-            return conflicts[:8]
+                        "theme": theme,
+                        "positive": bucket["positive"],
+                        "negative": bucket["negative"],
+                        "pos_ids": bucket["pos_ids"],
+                        "neg_ids": bucket["neg_ids"],
+                    })
+            return conflicts[:6]
 
         def _build_counter_md() -> str:
             conflicts = _extract_conflicts()
             if not conflicts:
-                return "# 反驳观点分析\n- 暂未发现确凿的对立观点，建议持续收集证据。"
-            md = ["# 反驳观点分析", f"总体：发现 {len(conflicts)} 个存在明显冲突的议题。"]
+                return "# 分歧观点分析\n- 暂未识别具备证据支撑的分歧观点，可继续收集信息。"
+            md = ["# 分歧观点分析", f"- 共发现 {len(conflicts)} 个存在明显分歧的议题，需重点核查。"]
             for item in conflicts:
-                md.append(f"\n## 议题：{_short(item['theme'], 40)}")
-                md.append(f"- 观点：{item['positive']}")
-                md.append(f"- 证据：已在消息中体现（可核查）")
-                md.append(f"- 矛盾要点：{item['negative']}")
-                md.append(f"- <span class=\"ask\">建议提问</span>：继续核查关键数据并保持证据导向的讨论。")
-            md.append("\n## 总结\n- 上述议题仍存在分歧，建议按证据优先原则推进讨论，并跟踪高频联系人观点变动。")
+                theme = _short(item["theme"], 40)
+                md.append(f"\n## 议题：{theme}")
+                pos_line = item["positive"][0]
+                if item["pos_ids"]:
+                    ids = " ".join(f"#{i}" for i in item["pos_ids"][:2] if i)
+                    if ids:
+                        pos_line += f" (来源:{ids})"
+                neg_line = item["negative"][0]
+                if item["neg_ids"]:
+                    ids = " ".join(f"#{i}" for i in item["neg_ids"][:2] if i)
+                    if ids:
+                        neg_line += f" (来源:{ids})"
+                md.append(f"- 主流观点：{pos_line}")
+                md.append(f"- 对立观点：{neg_line}")
+                merged = item["positive"] + item["negative"]
+                md.append(f"- 待核查：{_short(_pick_risk([_strip_ai_prefix(x) for x in merged]), 100)}")
+            md.append("\n## 行动建议\n- 对上述议题安排快速访谈或数据核查，先补证据再定调；及时反馈投委会。")
             return "\n".join(md)
 
         def _build_contacts_md() -> str:
@@ -1175,37 +1227,42 @@ def _run_summary_local(payload: dict) -> dict:
             items = _extract_meetings()
             if not items:
                 return "<h1>会议路演信息</h1><p>信息有限</p>"
+            platform_counter = Counter(it.get("platform") or "待定" for it in items)
+            top_platforms = ", ".join(f"{html.escape(k)}{v}场" for k, v in platform_counter.most_common(3)) or "—"
             rows = []
             for it in items:
+                msg_id = html.escape(str(it.get('id') or ''))
+                platform = html.escape(it['platform'])
+                code = html.escape(it['number']) if it['number'] != "待确认" else ""
                 rows.append(
-                    f"<tr data-msg-id=\"{html.escape(str(it.get('id') or ''))}\"><td>{html.escape(it['time'])}</td><td>{html.escape(it['number'])}</td>"
-                    f"<td>{html.escape(it['speaker'])}</td><td><span class=\"msg-badge\" data-msg-id=\"{html.escape(str(it.get('id') or ''))}\">源</span> {html.escape(it['topic'])}</td></tr>"
+                    f"<tr data-msg-id=\"{msg_id}\"><td>{html.escape(it['time'])}</td><td>{platform} {code}</td>"
+                    f"<td>{html.escape(it['speaker'])}</td><td><span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
                 )
             table = """
             <h1>会议路演信息</h1>
-            <p>记录到会议/路演：{n} 场</p>
-            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>会议号</th><th>主讲人/机构</th><th>主题要点</th></tr></thead>
+            <p>今日共 {n} 场；主流平台：{platforms}</p>
+            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>平台/会议号</th><th>主讲人</th><th>主题要点</th></tr></thead>
             <tbody>{rows}</tbody></table>
-            <h2>待处理事项</h2>
+            <h2>跟进提醒</h2>
             <ul><li>核对会议号与参会方式，提前准备提问要点和资料。</li></ul>
-            """.replace("{n}", str(len(items))).replace("{rows}", "\n".join(rows))
+            """.replace("{n}", str(len(items))).replace("{rows}", "\n".join(rows)).replace("{platforms}", top_platforms)
             return table
 
         def _build_counter_html() -> str:
             conflicts = _extract_conflicts()
             if not conflicts:
-                return "<h1>矛盾观点分析</h1><p>暂无明确冲突。建议继续跟踪关键数据与风险点。</p>"
+                return "<h1>分歧观点分析</h1><p>暂无明确分歧。建议继续跟踪关键数据与风险点。</p>"
             rows = []
             for item in conflicts:
-                rows.append(
-                    f"<tr><td>{html.escape(item['positive'])}</td><td>{html.escape(item['negative'])}</td></tr>"
-                )
+                pos = html.escape(item["positive"][0])
+                neg = html.escape(item["negative"][0])
+                rows.append(f"<tr><td>{pos}</td><td>{neg}</td></tr>")
             table = """
-            <h1>矛盾观点分析</h1>
+            <h1>分歧观点分析</h1>
             <p>发现 {n} 个存在实质分歧的议题。</p>
-            <table class=\"counter-table\"><thead><tr><th>主观点</th><th>冲突观点</th></tr></thead><tbody>{rows}</tbody></table>
-            <h2>怀疑与结论</h2>
-            <p>针对以上议题，建议核实相关数据来源，保持证据导向的讨论节奏。</p>
+            <table class="counter-table"><thead><tr><th>主流观点</th><th>对立观点</th></tr></thead><tbody>{rows}</tbody></table>
+            <h2>待核查</h2>
+            <p>针对以上议题，安排补充调研与数据验证，保持证据导向的讨论节奏。</p>
             """.replace("{n}", str(len(conflicts))).replace("{rows}", "\n".join(rows))
             return table
 
@@ -1223,7 +1280,28 @@ def _run_summary_local(payload: dict) -> dict:
             return "<h1>高评分联系人摘要</h1><ol>" + "".join(items) + "</ol>"
 
         if "market" in module_filter and not result.get("market_markdown"):
-            result["market_markdown"] = _build_market_md()
+            # 更紧凑：每类最多3条，降低噪声
+            orig_fn = _build_market_md
+            def _build_market_md_compact():
+                total = len(enriched_messages)
+                pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
+                neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
+                md = ["# 市场观点总结", f"- 样本数：{total}；正向：{pos}；负向：{neg}"]
+                for name, _ in CAT_RULES:
+                    bucket = [m for m in enriched_messages if name in _match_cats(m)]
+                    if not bucket:
+                        md.append(f"\n## {name}\n- 信息有限")
+                        continue
+                    md.append(f"\n## {name}")
+                    for m in bucket[:3]:
+                        sent = m.get("sender") or m.get("sender_name") or "未知"
+                        ts = m.get("time") or ""
+                        text = _short(m.get("summary") or m.get("content") or "", 120)
+                        tone = m.get("tone") or "neutral"
+                        md.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
+                md.append("\n## 行动建议\n- 聚焦确定性主线，跟踪关键数据点，控制仓位风险。")
+                return "\n".join(md)
+            result["market_markdown"] = _build_market_md_compact()
             result["market_html"] = _build_market_html()
         if "meetings" in module_filter and not result.get("meetings_markdown"):
             result["meetings_markdown"] = _build_meetings_md()
@@ -1234,6 +1312,58 @@ def _run_summary_local(payload: dict) -> dict:
         if "contacts" in module_filter and not result.get("top_contacts_markdown"):
             result["top_contacts_markdown"] = _build_contacts_md()
             result["top_contacts_html"] = _build_contacts_html()
+
+        # Newswatch 本地兜底：当大模型返回为空时，使用直接聚合构造基础舆情摘要
+        if "newswatch" in module_filter and not result.get("newswatch_markdown"):
+            try:
+                from ..services.news_client import direct_from_sources_json, normalize_items
+                d = direct_from_sources_json(limit=60)
+                norm = normalize_items({"success": True, "data": d.get("items", [])}, finance_only=True)
+                items = norm.get("items") or []
+                if items:
+                    cat_counter = Counter((it.get("category") or "其他") for it in items)
+                    src_counter = Counter((it.get("source_name") or it.get("source_id") or "未知") for it in items)
+                    tone_counter = Counter(((it.get("derived") or {}).get("tone") or "neutral") for it in items)
+
+                    def _theme_key(title: str) -> str:
+                        t = _strip_ai_prefix(title)
+                        t = _re.sub(r"[（）()\[\]【】·]|\s+", "", t)
+                        parts = _re.split(r"[:：、，。]\s*", t)
+                        return parts[0][:12] if parts and parts[0] else t[:12]
+
+                    theme_map: dict[str, list[dict]] = {}
+                    for it in items:
+                        title = it.get("title") or ""
+                        key = _theme_key(title)
+                        theme_map.setdefault(key, []).append(it)
+
+                    def _clean_title(title: str) -> str:
+                        t = _strip_ai_prefix(title)
+                        return _short(t, 120)
+
+                    lines: list[str] = ["# 新闻舆情监测"]
+                    lines.append(
+                        f"- 数据概览：共 {len(items)} 条，来源 {len(src_counter)} 家；类别分布：宏观 {cat_counter.get('宏观', 0)}、行业 {cat_counter.get('行业', 0)}、个股 {cat_counter.get('个股', 0)} 条。"
+                    )
+                    pos = tone_counter.get("positive", 0)
+                    neg = tone_counter.get("negative", 0)
+                    neu = tone_counter.get("neutral", 0)
+                    lines.append(f"- 舆情温度：正面 {pos} / 中性 {neu} / 负面 {neg}，仍以{('负面' if neg>pos else '中性' if neu>=pos and neu>=neg else '正面')}为主调。")
+
+                    lines.append("\n## 主题脉络")
+                    for idx, (theme, arr) in enumerate(sorted(theme_map.items(), key=lambda kv: len(kv[1]), reverse=True)[:5], start=1):
+                        sample = arr[0]
+                        srcs = {it.get("source_name") or it.get("source_id") or "未知" for it in arr[:3]}
+                        lines.append(
+                            f"{idx}. {theme}（{len(arr)}条，主要来自 {', '.join(srcs)}）：{_clean_title(sample.get('title') or '')}"
+                        )
+
+                    lines.append("\n## 关注动作")
+                    lines.append("- 结合舆情热点，梳理对交易/仓位的影响，并追踪政策或数据验证节点。")
+                    lines.append("- 对负面舆情较集中的议题，安排快速核实或舆论监测，防范扩散风险。")
+                    result["newswatch_markdown"] = "\n".join(lines)
+            except Exception:
+                pass
 
         active_modules = [m for m in module_map.keys() if m in module_filter]
         return {"status": "ok", "result": result, "modules": active_modules, "temperature": temperature, "meta": base_payload.get("meta") or {}}
