@@ -195,10 +195,20 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             os.makedirs(ds_dir, exist_ok=True)
             ds_name = f"messages_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
             ds_path = os.path.join(ds_dir, ds_name)
+            # 精简版数据集：仅保留对总结有用的最小字段，避免无关信息（邮件地址、链接、附件等）造成体积膨胀
+            def _slim(m: dict) -> dict:
+                return {
+                    "id": m.get("id"),
+                    "time": m.get("time") or m.get("timestamp"),
+                    "sender": m.get("sender_name") or m.get("sender_id"),
+                    "talker": m.get("talker_name") or m.get("chat_id"),
+                    "type": m.get("message_type") or m.get("type"),
+                    "content": m.get("content") or m.get("content_text") or m.get("text"),
+                }
             by_channel: dict[str, list] = {}
             for m in (snapshot.messages or []):
                 ch = str((m or {}).get('channel') or 'wechat')
-                by_channel.setdefault(ch, []).append(m)
+                by_channel.setdefault(ch, []).append(_slim(m))
             dataset = {
                 "period": (filters or {}).get("period") if filters else None,
                 "counts": {k: len(v) for k, v in by_channel.items()},
@@ -525,6 +535,25 @@ def _run_summary_local(payload: dict) -> dict:
     try:
         conf = load_ai_config()
         module_prompts = conf.get("module_prompts", {})
+        # 允许前端在本次任务中覆盖提示词（不落盘），优先级：前端传入 > 已保存 > 默认
+        if isinstance(prompts, dict) and prompts:
+            try:
+                for key, ov in prompts.items():
+                    if key not in DEFAULT_MODULE_PROMPTS:
+                        continue
+                    if not isinstance(ov, dict):
+                        continue
+                    current = module_prompts.get(key, {})
+                    if not isinstance(current, dict):
+                        current = {}
+                    updated = current.copy()
+                    if isinstance(ov.get("system"), str):
+                        updated["system"] = ov.get("system")
+                    if isinstance(ov.get("user"), str):
+                        updated["user"] = ov.get("user")
+                    module_prompts[key] = updated
+            except Exception:
+                pass
 
         # 使用原始消息作为大模型输入，不依赖小模型摘要
         enriched_messages = []
@@ -879,7 +908,14 @@ def _run_summary_local(payload: dict) -> dict:
                 compact = {"messages": module_payload.get("messages", [])}
                 payload_str = json.dumps(compact, ensure_ascii=False)
             else:
-                payload_str = json.dumps(module_payload, ensure_ascii=False)
+                # 压缩上下文：避免将 raw_messages、大字段、无关 meta 一并传给大模型
+                slim: dict[str, Any] = {
+                    "messages": module_payload.get("messages", []),
+                    # 仅提示必要信息，减少 token
+                    "contact_ratings": module_payload.get("contact_ratings", {}),
+                    "meta": {"total_messages": (module_payload.get("meta") or {}).get("total_messages")},
+                }
+                payload_str = json.dumps(slim, ensure_ascii=False)
             if "{{messages_data}}" in user_template:
                 user_content = user_template.replace("{{messages_data}}", payload_str)
             else:
