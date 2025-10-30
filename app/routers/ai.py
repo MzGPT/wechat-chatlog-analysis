@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from typing import List, Any
 from ..db import SessionLocal
-from ..models import Message, Task, Report, ReportArtifact
+from ..models import Message, Task, Report, ReportArtifact, SyncState
 from ..schemas import AIReplyRequest, TaskOut
 from ..services.n8n_client import N8NClient
 from ..services.llm_client import (
@@ -928,6 +928,21 @@ def _run_summary_local(payload: dict) -> dict:
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 cached = SUMMARY_CACHE.get(cache_key)
+                if not cached:
+                    # 持久化缓存：SyncState("summary_cache:<...>")
+                    db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
+                    try:
+                        from ..db import SessionLocal as _SL
+                        db = _SL()
+                        try:
+                            row = db.get(SyncState, db_key)
+                            if row and row.value:
+                                cached = row.value
+                                SUMMARY_CACHE[cache_key] = cached
+                        finally:
+                            db.close()
+                    except Exception:
+                        pass
                 if cached:
                     result[result_key] = cached
                     continue
@@ -969,6 +984,23 @@ def _run_summary_local(payload: dict) -> dict:
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 SUMMARY_CACHE[cache_key] = result[result_key]
+                # 写入持久化缓存
+                db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
+                try:
+                    from ..db import SessionLocal as _SL
+                    db = _SL()
+                    try:
+                        row = db.get(SyncState, db_key)
+                        if not row:
+                            row = SyncState(key=db_key, value=result[result_key])
+                        else:
+                            row.value = result[result_key]
+                        db.add(row)
+                        db.commit()
+                    finally:
+                        db.close()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -1298,12 +1330,12 @@ def _run_summary_local(payload: dict) -> dict:
                 code = html.escape(it['number']) if it['number'] != "待确认" else ""
                 rows.append(
                     f"<tr data-msg-id=\"{msg_id}\"><td>{html.escape(it['time'])}</td><td>{platform} {code}</td>"
-                    f"<td>{html.escape(it['speaker'])}</td><td><span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
+                    f"<td><span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
                 )
             table = """
             <h1>会议路演信息</h1>
             <p>今日共 {n} 场；主流平台：{platforms}</p>
-            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>平台/会议号</th><th>主讲人</th><th>主题要点</th></tr></thead>
+            <table class=\"meeting-table\"><thead><tr><th>时间</th><th>平台/会议号</th><th>主题要点</th></tr></thead>
             <tbody>{rows}</tbody></table>
             <h2>跟进提醒</h2>
             <ul><li>核对会议号与参会方式，提前准备提问要点和资料。</li></ul>
