@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, Response
 from .db import init_db
@@ -25,6 +26,8 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Compress large HTML/JSON responses (index.html ~27MB before gzip)
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     app.include_router(health.router)
     app.include_router(messages.router)
