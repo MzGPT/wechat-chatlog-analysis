@@ -28,7 +28,7 @@ def test_build_email_features_uses_tool_summary_when_available(monkeypatch):
 
     captured_messages = {}
 
-    def fake_extract_message_features(messages, batch_size=8, concurrency=3, temperature=0.1):
+    def fake_extract_message_features(messages, batch_size=8, concurrency=3, temperature=0.1, **kwargs):
         # Capture the content passed into the tool to ensure it does not include the subject line
         assert isinstance(messages, list) and messages, "expected non-empty messages list"
         m0 = messages[0]
@@ -80,7 +80,7 @@ def test_build_email_features_fallback_avoids_title_monkeypatch(monkeypatch):
     from app.services import email_features
 
     # Tool returns nothing -> trigger fallback path only
-    def fake_extract_message_features(messages, batch_size=8, concurrency=3, temperature=0.1):
+    def fake_extract_message_features(messages, batch_size=8, concurrency=3, temperature=0.1, **kwargs):
         return {}
 
     monkeypatch.setattr("app.services.email_features.extract_message_features", fake_extract_message_features)

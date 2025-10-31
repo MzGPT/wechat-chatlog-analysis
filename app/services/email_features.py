@@ -233,9 +233,26 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
 
     results: Dict[str, dict] = {}
 
+    def _only_digits(s: str) -> str:
+        return re.sub(r"\D", "", s or "")
+
     def _digits_meeting(text: str) -> str:
-        m = re.search(r"(?:会议号[:：]?\s*)?(\d{3}[-\s]?\d{3}[-\s]?\d{3,6}|\d{8,12})", text)
-        return m.group(1) if m else ""
+        """Extract meeting/phone-like numbers more robustly (digits-only return)."""
+        if not text:
+            return ""
+        patterns = [
+            r"(?:会议号[:：]?\s*)?(\d{9,13})",
+            r"(?:会议号[:：]?\s*)?(\d{9,10})",
+            r"(?:会议号[:：]?\s*)?(\d{3}[-\s]?\d{3}[-\s]?\d{3,6})",
+            r"\+?86[-\s]?(\d{3}[-\s]?\d{3}[-\s]?\d{3,6}|\d{8,12})",
+            r"(400[-\s]?\d{3}[-\s]?\d{4})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                g = m.group(1) if m.groups() else m.group(0)
+                return _only_digits(g)
+        return ""
 
     def _extract(field_pattern: str, text: str) -> str:
         m = re.search(field_pattern, text, flags=re.IGNORECASE)
@@ -299,12 +316,28 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         # 修复：当工具已给出 summary 时，必须直接使用工具的摘要，避免回退到标题导致“标题 + 摘要重复标题”的问题。
         tool_summary = (feat.get('summary') or '').strip()
         if tool_summary:
-            summary_text = tool_summary  # 已含 ai: 前缀与长度控制，见 ai_tools.extract_message_features
+            # 将平台与会议号前置到摘要中：ai: <platform> <number> <body>
+            body = re.sub(r'^\s*ai:\s*', '', tool_summary, flags=re.IGNORECASE).strip()
+            detected_platform = feat.get('platform') or feat.get('meeting_platform') or _infer_platform(raw_text)
+            prefix_parts = []
+            if detected_platform:
+                prefix_parts.append(detected_platform)
+            if meeting_number:
+                prefix_parts.append(meeting_number)
+            prefix = ' '.join(prefix_parts).strip()
+            summary_text = f"ai: {prefix} {body}".strip() if prefix else f"ai: {body}"
             summary_origin = 'tool'
         else:
             # 仅在无工具摘要时，才基于正文提炼简短显示
             summary_value = (summary_short or _build_summary(raw_text) or main_point or raw_text[:50]).strip()
-            summary_text = f"fallback: {summary_value}" if summary_value else 'fallback:'
+            detected_platform = feat.get('platform') or feat.get('meeting_platform') or _infer_platform(raw_text)
+            prefix_parts = []
+            if detected_platform:
+                prefix_parts.append(detected_platform)
+            if meeting_number:
+                prefix_parts.append(meeting_number)
+            prefix = ' '.join(prefix_parts).strip()
+            summary_text = f"fallback: {prefix} {summary_value}".strip() if prefix else (f"fallback: {summary_value}" if summary_value else 'fallback:')
             summary_origin = 'fallback'
 
         # key_info：优先基于工具摘要（去掉前缀）或正文提炼要点，避免直接使用标题
@@ -556,7 +589,7 @@ def _infer_platform(text: str) -> str:
         return "Teams"
     if "钉钉" in text or "dingtalk" in lower:
         return "钉钉"
-    if "电话会议" in text or "teleconference" in lower:
+    if "电话会议" in text or "teleconference" in lower or "外呼" in text or re.search(r"(?i)tel|电话|phone", text):
         return "电话"
     return ''
 

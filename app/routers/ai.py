@@ -223,6 +223,63 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         except Exception:
             ds_path = None
 
+        # 创建摘要数据库（包含微信和邮件的摘要内容）
+        summary_db_path = None
+        try:
+            summary_db_name = f"summaries_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
+            summary_db_path = os.path.join(ds_dir, summary_db_name)
+            
+            # 提取微信消息摘要
+            wechat_summaries = []
+            email_summaries = []
+            
+            for m in (snapshot.messages or []):
+                channel = str((m or {}).get('channel') or 'wechat')
+                # 提取摘要字段（从derived中获取summary）
+                derived = m.get('derived') or {}
+                summary = derived.get('summary') or ""
+                
+                # 去除ai:前缀
+                if summary:
+                    if summary.lower().startswith("ai:"):
+                        summary = summary[3:].strip()
+                    elif summary.lower().startswith("fallback:"):
+                        summary = summary[9:].strip()
+                
+                if not summary:
+                    continue
+                
+                summary_item = {
+                    "id": m.get("id"),
+                    "time": m.get("time") or m.get("timestamp"),
+                    "sender": m.get("sender_name") or m.get("sender_id"),
+                    "talker": m.get("talker_name") or m.get("chat_id"),
+                    "summary": summary,
+                    "tone": derived.get("tone"),
+                    "category": derived.get("category"),
+                }
+                
+                if channel == 'email':
+                    email_summaries.append(summary_item)
+                else:
+                    wechat_summaries.append(summary_item)
+            
+            summary_dataset = {
+                "period": (filters or {}).get("period") if filters else None,
+                "snapshot_id": snapshot.id,
+                "counts": {
+                    "wechat": len(wechat_summaries),
+                    "email": len(email_summaries),
+                },
+                "wechat_summaries": wechat_summaries,
+                "email_summaries": email_summaries,
+            }
+            
+            with open(summary_db_path, 'w', encoding='utf-8') as f:
+                json.dump(summary_dataset, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            summary_db_path = None
+
         summary_payload = {
             "messages": snapshot.messages or [],
             "prompts": prompts,
@@ -232,6 +289,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             "modules": modules,
             "temperature": temperature,
             "dataset_path": ds_path,
+            "summary_db_path": summary_db_path,  # 新增：摘要数据库路径，可用于验证从摘要表提取总结的方法
             "snapshot_id": snapshot.id,
         }
 
@@ -560,16 +618,25 @@ def _run_summary_local(payload: dict) -> dict:
             except Exception:
                 pass
 
-        # 使用原始消息作为大模型输入，不依赖小模型摘要
+        # 使用原始消息作为大模型输入，同时提取摘要字段以便优先使用
         enriched_messages = []
         for m in msgs[:2000]:
+            # 从derived中提取summary字段
+            derived = m.get("derived") or {}
+            summary = derived.get("summary") or ""
             enriched_messages.append({
                 "id": m.get("id"),
                 "time": m.get("time") or m.get("timestamp"),
                 "sender": m.get("sender_name") or m.get("sender_id"),
+                "sender_name": m.get("sender_name"),
                 "talker": m.get("talker_name") or m.get("chat_id"),
                 "message_type": m.get("message_type") or m.get("type"),
                 "content": m.get("content") or m.get("content_text") or m.get("text"),
+                "summary": summary,  # 添加摘要字段，供_compact函数优先使用
+                "tone": derived.get("tone"),
+                "category": derived.get("category"),
+                "meeting_number": derived.get("meeting_number"),
+                "keywords": derived.get("keywords") or [],
             })
 
         # 紧凑化传入大模型的数据，避免上下文过大导致超限/失败
@@ -612,21 +679,36 @@ def _run_summary_local(payload: dict) -> dict:
 
         high_contact_senders = {c.get("sender") for c in locals().get("high_contacts", []) if c.get("sender")}
 
-        # 统一裁剪长度，尽量依赖摘要/关键词，正文仅取前200字符
+        # 统一裁剪长度，优先使用摘要字段，正文仅取前200字符作为补充上下文
         def _compact(ms: list[dict], prefer_meetings: bool = False, limit: int = 400) -> list[dict]:
+            # 内部函数：去除ai:前缀
+            def _strip_prefix(text: str) -> str:
+                t = (text or "").strip()
+                if t.lower().startswith("ai:"):
+                    t = t[3:].strip()
+                elif t.lower().startswith("fallback:"):
+                    t = t[9:].strip()
+                return t
+            
             selected: list[dict] = []
             pool = ms
             for m in pool:
                 if len(selected) >= limit:
                     break
+                # 优先使用摘要字段，去除ai:前缀
+                summary = _strip_prefix((m.get("summary") or "").strip())
+                content_fallback = (_safe_str(m.get("content"))[:200])
+                # 如果摘要存在，使用摘要；否则使用截断的正文
+                content_to_use = summary if summary else content_fallback
                 selected.append({
                     "id": m.get("id"),
                     "time": m.get("time"),
                     "sender": m.get("sender") or m.get("sender_name"),
                     "talker": m.get("talker"),
                     "message_type": m.get("message_type"),
-                    # 保留少量正文以便模型理解上下文，仅传原文
-                    "content": (_safe_str(m.get("content"))[:200]),
+                    # 优先传摘要，无摘要时才传正文前200字符
+                    "summary": summary if summary else None,
+                    "content": content_to_use,
                 })
             return selected
 
@@ -710,6 +792,9 @@ def _run_summary_local(payload: dict) -> dict:
             rating = norm_ratings.get(sender)
             if rating is None:
                 rating = 50.0
+            # 只取评分>=60的联系人
+            if rating < 60.0:
+                continue
             active = activity.get(sender, 0)
             if active <= 0:
                 continue
@@ -726,9 +811,9 @@ def _run_summary_local(payload: dict) -> dict:
                     record["alias"] = detail.get("alias")
             high_contacts.append(record)
         high_contacts.sort(key=lambda x: (x["rating"], x["activity"]), reverse=True)
-        # 若严格阈值导致为空，则以活跃度Top补足，避免“高评分联系人”卡片空白
+        # 若严格阈值导致为空，则以活跃度Top且评分>=60补足，避免"高评分联系人"卡片空白
         if not high_contacts:
-            tmp = sorted(({"sender": s, "rating": norm_ratings.get(s, 50.0), "activity": a, **(contacts_raw.get(s) or {})} for s, a in activity.items()), key=lambda x:(x["activity"], x.get("rating",50.0)), reverse=True)
+            tmp = sorted(({"sender": s, "rating": norm_ratings.get(s, 50.0), "activity": a, **(contacts_raw.get(s) or {})} for s, a in activity.items() if norm_ratings.get(s, 50.0) >= 60.0), key=lambda x:(x["activity"], x.get("rating",50.0)), reverse=True)
             high_contacts = [{"sender": t.get("sender"), "rating": float(t.get("rating",50.0)), "activity": t.get("activity",0), "name": t.get("name"), "alias": t.get("alias")} for t in tmp[:10]]
 
         time_min = min((m.get("time") for m in enriched_messages if m.get("time")), default=None)
@@ -805,8 +890,12 @@ def _run_summary_local(payload: dict) -> dict:
                 source = [m for m in sorted_messages if _is_meeting(m)] or sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=True, limit=250)
             elif module_key == "market":
-                source = [m for m in sorted_messages if _is_market(m)] or sorted_messages
-                module_payload["messages"] = _compact(source, prefer_meetings=False, limit=320)
+                # 市场观点总揽：确保覆盖所有消息，不要遗漏；优先包含摘要
+                source = [m for m in sorted_messages if _is_market(m)]
+                # 如果筛选后消息太少，则使用全部消息
+                if len(source) < len(sorted_messages) * 0.3:
+                    source = sorted_messages
+                module_payload["messages"] = _compact(source, prefer_meetings=False, limit=400)  # 增加limit确保覆盖更多消息
             elif module_key == "counter":
                 source = [m for m in sorted_messages if _is_counter(m)] or sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=280)
@@ -1197,8 +1286,11 @@ def _run_summary_local(payload: dict) -> dict:
                     if key in seen:
                         continue
                     seen.add(key)
-                    # 使用 summary 作为主题要点来源（已移除 key_info 字段）
-                    base_summary = (m.get("summary") or m.get("content") or "").strip()
+                    # 使用 summary 作为主题要点来源，严格只使用summary字段，去除ai:前缀
+                    base_summary = (m.get("summary") or "").strip()
+                    if not base_summary:
+                        continue  # 没有摘要则跳过该消息，不使用content作为fallback
+                    base_summary = _strip_ai_prefix(base_summary)
                     shown_time = _extract_time_from_text(text) or _fmt_meeting_time(m.get("time"))
                     items.append({
                         "id": m.get("id") or m.get("message_id"),
@@ -1303,16 +1395,35 @@ def _run_summary_local(payload: dict) -> dict:
         def _build_contacts_md() -> str:
             lines = ["# 高评分联系人摘要"]
             if not high_contacts:
-                lines.append("- 近3天暂无评分≥7.0且活跃的联系人")
+                lines.append("- 近3天暂无评分≥60分且活跃的联系人")
                 return "\n".join(lines)
-            lines.append("以下按评分与活跃度排序：")
+            lines.append("以下按评分与活跃度排序（筛选标准：评分≥60分）：")
             for c in high_contacts[:20]:
                 sender = c.get("name") or c.get("alias") or c.get("sender")
                 rating = c.get("rating")
                 act = c.get("activity")
-                latest = next((m for m in reversed(enriched_messages) if (m.get("sender") or m.get("sender_name")) == c.get("sender")), None)
-                summary = _short((latest or {}).get("summary") or (latest or {}).get("content") or "", 100)
-                lines.append(f"### {sender}（评分 {rating:.1f} / 活跃 {act}）\n- 核心观点：{summary or '—'}\n- 最新动态：近期信息已记录于聊天摘要中\n- 跟进建议：针对其关注点准备问答并确认最新数据。")
+                # 收集该联系人的所有消息摘要，优先使用summary字段
+                contact_summaries = []
+                for m in enriched_messages:
+                    if (m.get("sender") or m.get("sender_name")) == c.get("sender"):
+                        summary = (m.get("summary") or "").strip()
+                        if summary:
+                            summary = _strip_ai_prefix(summary)
+                            if summary:
+                                contact_summaries.append(summary)
+                if not contact_summaries:
+                    continue  # 没有摘要则跳过
+                # 使用最新的几条摘要
+                latest_summaries = contact_summaries[-3:] if len(contact_summaries) > 3 else contact_summaries
+                core_view = _short(latest_summaries[-1] if latest_summaries else "", 100)
+                dynamic_items = [_short(s, 80) for s in latest_summaries[-2:]] if len(latest_summaries) >= 2 else []
+                lines.append(f"### {sender}（评分 {rating:.1f} / 活跃 {act}）")
+                lines.append(f"- 核心观点：{core_view or '—'}")
+                if dynamic_items:
+                    lines.append(f"- 最新动态：{'；'.join(dynamic_items)}")
+                else:
+                    lines.append("- 最新动态：近期信息已记录于聊天摘要中")
+                lines.append("- 跟进建议：针对其关注点准备问答并确认最新数据。")
             lines.append("\n## 关注联系人\n- 近3天评分处于次高分段的潜力对象建议提升触达频次。")
             return "\n".join(lines)
 
@@ -1362,15 +1473,28 @@ def _run_summary_local(payload: dict) -> dict:
 
         def _build_contacts_html() -> str:
             if not high_contacts:
-                return "<h1>高评分联系人摘要</h1><p>近3天暂无评分≥7.0且活跃的联系人</p>"
+                return "<h1>高评分联系人摘要</h1><p>近3天暂无评分≥60分且活跃的联系人</p>"
             items = []
             for c in high_contacts[:20]:
                 sender = c.get("name") or c.get("alias") or c.get("sender")
                 rating = c.get("rating")
                 act = c.get("activity")
-                latest = next((m for m in reversed(enriched_messages) if (m.get("sender") or m.get("sender_name")) == c.get("sender")), None)
-                summary = _short((latest or {}).get("summary") or (latest or {}).get("content") or "", 120)
-                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f} / 活跃 {act}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(str((latest or {}).get('id') or (latest or {}).get('message_id') or ''))}\">源</span> {html.escape(summary)}</li>")
+                # 收集该联系人的所有消息摘要，优先使用summary字段
+                contact_summaries = []
+                contact_msg_ids = []
+                for m in enriched_messages:
+                    if (m.get("sender") or m.get("sender_name")) == c.get("sender"):
+                        summary = (m.get("summary") or "").strip()
+                        if summary:
+                            summary = _strip_ai_prefix(summary)
+                            if summary:
+                                contact_summaries.append(summary)
+                                contact_msg_ids.append(str(m.get("id") or m.get("message_id") or ""))
+                if not contact_summaries:
+                    continue  # 没有摘要则跳过
+                latest_summary = _short(contact_summaries[-1], 120)
+                latest_msg_id = contact_msg_ids[-1] if contact_msg_ids else ""
+                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f} / 活跃 {act}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(latest_msg_id)}\">源</span> {html.escape(latest_summary)}</li>")
             return "<h1>高评分联系人摘要</h1><ol>" + "".join(items) + "</ol>"
 
         if "market" in module_filter and not result.get("market_markdown"):

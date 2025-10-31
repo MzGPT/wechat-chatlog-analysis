@@ -12,6 +12,14 @@ from sqlalchemy.orm import Session
 from ..models import Message
 from .llm_client import DEFAULT_TOOL_PROMPTS, load_ai_config, siliconflow_tool_chat
 
+# Optional JSON5 for lenient parsing; fall back to stdlib json when unavailable
+try:  # pragma: no cover - optional dependency
+    import json5  # type: ignore
+    _HAS_JSON5 = True
+except Exception:  # pragma: no cover
+    json5 = None  # type: ignore
+    _HAS_JSON5 = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,27 +120,142 @@ def extract_message_features(
     def _process_single(single_msg: Dict[str, Any]) -> tuple[str, Dict[str, Any] | None, Dict[str, Any]]:
         """处理单条消息，返回 (msg_id, result)"""
         msg_id = single_msg["id"]
+        content = None
         try:
             # 构造单条消息的 prompt（包装成数组以兼容现有格式）
             prompt = _tool_prompt_payload([single_msg], tool_prompt_conf)
             content = siliconflow_tool_chat(prompt, temperature=temperature, model_override=model_override)
             
-            # 解析返回
-            data = json.loads(content)
+            if not content or not isinstance(content, str):
+                raise ValueError(f"API返回为空或非字符串: {type(content)}")
+            
+            # 尝试从返回内容中提取JSON（可能被markdown代码块包围）
+            content_clean = content.strip()
+            original_content = content_clean  # 保存原始内容用于错误日志
+            
+            # 记录原始返回（前1000字符），便于诊断
+            logger.debug("小模型原始返回 [%s] (前1000字符): %s", msg_id, original_content[:1000])
+            
+            # 移除可能的markdown代码块标记
+            if content_clean.startswith("```"):
+                # 找到第一个换行后的内容
+                lines = content_clean.split("\n", 1)
+                if len(lines) > 1:
+                    content_clean = lines[1]
+                # 也尝试移除开头标记
+                if content_clean.startswith("json"):
+                    content_clean = content_clean[4:].lstrip()
+                elif content_clean.startswith("JSON"):
+                    content_clean = content_clean[4:].lstrip()
+            if content_clean.endswith("```"):
+                content_clean = content_clean.rsplit("```", 1)[0].rstrip()
+            
+            # 尝试多种方式解析JSON
+            data = None
+            json_error = None
+            
+            # 方法1: 直接解析
+            try:
+                data = json.loads(content_clean)
+            except json.JSONDecodeError as je:
+                json_error = je
+                # 尝试使用 json5（如可用）更宽松地解析（支持单引号、注释等）
+                if data is None and _HAS_JSON5:
+                    try:
+                        data = json5.loads(content_clean)  # type: ignore
+                    except Exception:
+                        pass
+                # 方法2: 查找JSON数组 [ ... ]
+                array_match = re.search(r'\[[^\]]*(?:\{[^}]*\}[^\]]*)*\]', content_clean, re.DOTALL)
+                if array_match:
+                    try:
+                        data = json.loads(array_match.group(0))
+                    except json.JSONDecodeError:
+                        # 再次尝试 json5
+                        if _HAS_JSON5:
+                            try:
+                                data = json5.loads(array_match.group(0))  # type: ignore
+                            except Exception:
+                                pass
+                
+                # 方法3: 查找JSON对象 { ... }（更健壮的匹配）
+                if data is None:
+                    # 尝试找到最外层的大括号对
+                    brace_start = content_clean.find('{')
+                    if brace_start >= 0:
+                        brace_count = 0
+                        brace_end = -1
+                        for i in range(brace_start, len(content_clean)):
+                            if content_clean[i] == '{':
+                                brace_count += 1
+                            elif content_clean[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    brace_end = i
+                                    break
+                        if brace_end > brace_start:
+                            try:
+                                json_str = content_clean[brace_start:brace_end+1]
+                                data = json.loads(json_str)
+                            except json.JSONDecodeError:
+                                if _HAS_JSON5:
+                                    try:
+                                        data = json5.loads(json_str)  # type: ignore
+                                    except Exception:
+                                        pass
+                
+                # 方法4: 尝试提取所有可能的JSON对象
+                if data is None:
+                    json_matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content_clean, re.DOTALL)
+                    for match in json_matches:
+                        try:
+                            candidate = match.group(0)
+                            data = json.loads(candidate)
+                            break
+                        except json.JSONDecodeError:
+                            if _HAS_JSON5:
+                                try:
+                                    data = json5.loads(candidate)  # type: ignore
+                                    break
+                                except Exception:
+                                    pass
+                            continue
+                
+                # 如果所有方法都失败，抛出详细错误
+                if data is None:
+                    error_detail = f"JSON解析失败: {json_error.msg if json_error else '未找到有效JSON'} (位置 {json_error.pos if json_error else 'N/A'})"
+                    logger.warning("小模型返回内容无法解析 [%s]: %s | 原始返回(前500字符): %s", msg_id, error_detail, original_content[:500])
+                    raise ValueError(f"{error_detail}。原始返回(前300字符): {original_content[:300]}")
+            
+            # 统一成 dict：允许返回 list[str|dict] 或单个 string
             if isinstance(data, list) and len(data) > 0:
                 item = data[0]
             elif isinstance(data, dict):
-                item = data
+                # 某些模型会包一层 {"items": [...]}
+                if "items" in data and isinstance(data["items"], list) and data["items"]:
+                    item = data["items"][0]
+                else:
+                    item = data
             else:
-                raise ValueError(f"意外的返回格式: {type(data)}")
-            
+                item = data
+
             if not isinstance(item, dict):
-                raise ValueError(f"返回元素不是dict: {type(item)}")
+                # 宽松兼容：若返回 string，则当作 summary 文本
+                if isinstance(item, str):
+                    item = {"summary": item}
+                else:
+                    raise ValueError(f"返回元素不是dict: {type(item)}")
             
             # 提取核心字段
             summary = str(item.get("summary") or "").strip()
             if not summary:
-                raise ValueError(f"未返回摘要")
+                # 宽松兜底：有时模型仅返回了 key_info/markdown 等字段，或解析失败
+                alt = str(item.get("key_info") or item.get("markdown") or "").strip()
+                if alt:
+                    summary = alt
+                else:
+                    # 最后兜底，给一个占位，避免上层视为失败
+                    summary = "ai: 信息有限"
             if not summary.lower().startswith("ai:"):
                 summary = f"ai: {summary}"
             
@@ -182,13 +305,27 @@ def extract_message_features(
             raw_preview = None
             try:
                 # 尝试截取原始返回文本，便于调试
-                raw_preview = content[:500] if isinstance(locals().get('content'), str) else None  # type: ignore[name-defined]
+                if content:
+                    raw_preview = content[:2000] if isinstance(content, str) else str(content)[:2000]
             except Exception:
                 raw_preview = None
-            errors.append(f"{msg_id}: {exc}")
+            
+            error_msg = f"{msg_id}: {exc}"
+            errors.append(error_msg)
+            
+            # 记录详细的错误日志（前20个错误全部记录，之后每10个记录一次）
+            should_log = len(errors) <= 20 or (len(errors) % 10 == 0)
+            if should_log:
+                logger.warning(
+                    "小模型提取失败 [%s]: %s | 原始返回(前800字符): %s",
+                    msg_id,
+                    str(exc),
+                    raw_preview[:800] if raw_preview else "(无返回内容)"
+                )
+            
             dbg = {"id": msg_id, "ok": False, "error": str(exc)}
             if raw_preview:
-                dbg["raw"] = raw_preview
+                dbg["raw"] = raw_preview[:1000]  # 限制debug信息长度
             return msg_id, None, dbg
 
     results: Dict[str, Dict[str, Any]] = {}
@@ -362,7 +499,7 @@ def ensure_message_features(
         tone = str(data.get("tone") or "neutral").lower()
         confidence = float(data.get("confidence", 0.5))
         
-        # 从 summary 提取平台信息（辅助逻辑）
+        # 从 summary/正文提取平台信息（辅助逻辑）
         platform = ""
         summary_lower = summary_text.lower()
         if "腾讯" in summary_text or "wemeet" in summary_lower:
@@ -377,9 +514,21 @@ def ensure_message_features(
             platform = "Teams"
         elif "钉钉" in summary_text:
             platform = "钉钉"
+        elif "外呼" in summary_text or re.search(r"(?i)tel|电话|phone", summary_text):
+            platform = "电话"
         
+        # 前置平台与会议号到摘要中：ai: <platform> <number> <body>
+        body = re.sub(r'^\s*ai:\s*', '', summary_text, flags=re.IGNORECASE).strip()
+        prefix_parts = []
+        if platform:
+            prefix_parts.append(platform)
+        if meeting_number:
+            prefix_parts.append(meeting_number)
+        prefix = ' '.join(prefix_parts).strip()
+        display_summary = f"ai: {prefix} {body}".strip() if prefix else f"ai: {body}"
+
         new_part: Dict[str, Any] = {
-            "summary": summary_text,
+            "summary": display_summary,
             "meeting_number": meeting_number,
             "platform": platform,
             "tone": tone,
@@ -456,8 +605,21 @@ def populate_fallback_derived(
     def _fallback_meeting(text: str) -> tuple[str,str]:
         if not text:
             return "",""
-        m = re.search(r"(?<!\d)(\d{9,13})(?!\d)", text)
-        number = m.group(1) if m else ""
+        # Robust number detection: 9–13 digits, 9–10 digits, hyphenated forms, +86-, 400-xxx-xxxx
+        patterns = [
+            r"(?<!\d)(\d{9,13})(?!\d)",
+            r"(?<!\d)(\d{9,10})(?!\d)",
+            r"(\d{3}[-\s]?\d{3}[-\s]?\d{3,6})",
+            r"\+?86[-\s]?(\d{3}[-\s]?\d{3}[-\s]?\d{3,6}|\d{8,12})",
+            r"(400[-\s]?\d{3}[-\s]?\d{4})",
+        ]
+        number = ""
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                g = m.group(1) if m.groups() else m.group(0)
+                number = re.sub(r"\D", "", g)
+                break
         platform = ""
         low = text.lower()
         if "腾讯会议" in text or "wemeet" in low or "meeting.tencent.com" in low:
@@ -472,7 +634,7 @@ def populate_fallback_derived(
             platform = "Teams"
         elif "钉钉" in text or "dingtalk" in low:
             platform = "钉钉"
-        elif "电话会" in text or "电话会议" in text or re.search(r"(?i)tel|电话|phone", text):
+        elif "电话会" in text or "电话会议" in text or "外呼" in text or re.search(r"(?i)tel|电话|phone", text):
             platform = "电话"
         return number, platform
 
