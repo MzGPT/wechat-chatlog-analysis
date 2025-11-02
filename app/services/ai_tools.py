@@ -259,21 +259,7 @@ def extract_message_features(
             if not summary.lower().startswith("ai:"):
                 summary = f"ai: {summary}"
             
-            # 截断摘要（保留50字可见字符）
-            try:
-                body = summary.split(":", 1)[1].strip() if ":" in summary else summary
-                def _clen(s: str) -> int:
-                    return len(s.replace(" ", ""))
-                if _clen(body) > 50:
-                    acc = []
-                    for ch in body:
-                        if _clen("".join(acc) + ch) > 50:
-                            break
-                        acc.append(ch)
-                    body = "".join(acc).strip()
-                summary = f"ai: {body}"
-            except Exception:
-                pass
+            # 禁止截断tool派生的文字，不设文字上限
             
             # 会议号处理
             meeting_number_raw = item.get("meeting_number") or ""
