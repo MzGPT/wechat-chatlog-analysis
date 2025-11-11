@@ -131,6 +131,28 @@ def summary(payload: dict, db: Session = Depends(get_db)):
     filters = payload.get("filters") or {}
     options = payload.get("options") or {"format": "markdown"}
     prompts = payload.get("prompts") or {}
+    # 前端为准：若本次请求携带了提示词，立刻与后端配置合并并持久化，保证后端保持同步
+    try:
+        if isinstance(prompts, dict) and prompts:
+            _conf = load_ai_config()
+            stored = _conf.get("module_prompts", {}) or {}
+            for key, val in prompts.items():
+                if key not in DEFAULT_MODULE_PROMPTS:
+                    continue
+                if not isinstance(val, dict):
+                    continue
+                cur = stored.get(key, {}) if isinstance(stored.get(key), dict) else {}
+                upd = cur.copy()
+                if isinstance(val.get("system"), str):
+                    upd["system"] = val.get("system")
+                if isinstance(val.get("user"), str):
+                    upd["user"] = val.get("user")
+                stored[key] = upd
+            _conf["module_prompts"] = stored
+            save_ai_config(_conf)
+    except Exception:
+        # 持久化失败不阻断主流程
+        pass
     module_candidates = payload.get("modules")
     ALLOWED_MODULES = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}
     if isinstance(module_candidates, list) and module_candidates:
@@ -1457,18 +1479,29 @@ def _run_summary_local(payload: dict) -> dict:
             conflicts = _extract_conflicts()
             if not conflicts:
                 return "<h1>分歧观点分析</h1><p>暂无明确分歧。建议继续跟踪关键数据与风险点。</p>"
-            rows = []
-            for item in conflicts:
-                pos = html.escape(item["positive"][0])
-                neg = html.escape(item["negative"][0])
-                rows.append(f"<tr><td>{pos}</td><td>{neg}</td></tr>")
-            table = """
-            <h1>分歧观点分析</h1>
-            <p>发现 {n} 个存在实质分歧的议题。</p>
-            <table class="counter-table"><thead><tr><th>主流观点</th><th>对立观点</th></tr></thead><tbody>{rows}</tbody></table>
-            <h2>待核查</h2>
-            <p>针对以上议题，安排补充调研与数据验证，保持证据导向的讨论节奏。</p>
-            """.replace("{n}", str(len(conflicts))).replace("{rows}", "\n".join(rows))
+            rows: list[str] = []
+            for it in conflicts:
+                pos_txt = _short(_strip_ai_prefix(it["positive"][0]), 200)
+                neg_txt = _short(_strip_ai_prefix(it["negative"][0]), 200)
+                pos_id = (it.get("pos_ids") or [None])[0]
+                neg_id = (it.get("neg_ids") or [None])[0]
+                pos_badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(str(pos_id))}\">源</span> " if pos_id else ""
+                neg_badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(str(neg_id))}\">源</span> " if neg_id else ""
+                conflict = _short(_pick_risk([_strip_ai_prefix(x) for x in (it["positive"] + it["negative"]) ]), 200)
+                rows.append(
+                    "<tr>"
+                    f"<td>{pos_badge}{html.escape(pos_txt)}</td>"
+                    f"<td>{neg_badge}{html.escape(neg_txt)}</td>"
+                    f"<td>{html.escape(conflict)}</td>"
+                    "</tr>"
+                )
+            table = (
+            "<h1>分歧观点分析</h1>"
+            + f"<p>发现 {len(conflicts)} 个存在实质分歧的议题。</p>"
+            + "<table class=\"counter-table\"><thead><tr><th>正方</th><th>反方</th><th>冲突点</th></tr></thead><tbody>"
+            + "\n".join(rows)
+            + "</tbody></table>"
+            )
             return table
 
         def _build_contacts_html() -> str:
