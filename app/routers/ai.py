@@ -620,6 +620,30 @@ def _run_summary_local(payload: dict) -> dict:
     try:
         conf = load_ai_config()
         module_prompts = conf.get("module_prompts", {})
+        # 强化“高评分联系人”提示词：禁止模型自行打分，评分来自系统
+        try:
+            cp = module_prompts.get('contacts') or {}
+            if isinstance(cp, dict):
+                sys_p = str(cp.get('system') or '')
+                user_p = str(cp.get('user') or '')
+                if '严禁自行评定' not in sys_p:
+                    cp['system'] = (
+                        '你是联系人摘要助手。评分信息由系统提供，严禁自行评定或修改分数。仅展示评分≥60的联系人，使用消息摘要（summary）概括观点，禁止复制原文。'
+                    )
+                if '评分来自系统' not in user_p:
+                    cp['user'] = (
+                        '只返回 JSON 对象 {"html": string}，不得使用代码块或反引号。\n'
+                        'HTML 结构：\n'
+                        '<h1>高评分联系人摘要</h1>\n'
+                        '<p>规则：评分≥60（评分来自系统），按评分降序展示。</p>\n'
+                        '<h3><姓名或别名>（评分 <x.x> / 活跃 <y>）</h3>\n'
+                        '<ul>\n  <li>核心观点：<一句话概括> #123</li>\n  <li>核心观点：<一句话概括> #456</li>\n</ul>\n'
+                        '<p>如需：可增加“关注联系人”段落，格式同上。</p>\n'
+                        '数据：{{messages_data}}'
+                    )
+                module_prompts['contacts'] = cp
+        except Exception:
+            pass
         # 允许前端在本次任务中覆盖提示词（不落盘），优先级：前端传入 > 已保存 > 默认
         if isinstance(prompts, dict) and prompts:
             try:
@@ -1476,11 +1500,19 @@ def _run_summary_local(payload: dict) -> dict:
             return table
 
         def _build_counter_html() -> str:
+            """Build per-topic 3-column tables with headings and an overview.
+            修复：首次主题缺失标题/概览的问题，确保每个议题包含 H2 标题 + 表格。
+            """
             conflicts = _extract_conflicts()
             if not conflicts:
                 return "<h1>分歧观点分析</h1><p>暂无明确分歧。建议继续跟踪关键数据与风险点。</p>"
-            rows: list[str] = []
+
+            parts: list[str] = []
+            parts.append("<h1>分歧观点分析</h1>")
+            parts.append(f"<p>整体概览：共发现 {len(conflicts)} 个存在实质分歧的议题，建议优先核查证据、补齐数据缺口。</p>")
+
             for it in conflicts:
+                theme = _short(str(it.get("theme") or "未命名议题"), 40)
                 pos_txt = _short(_strip_ai_prefix(it["positive"][0]), 200)
                 neg_txt = _short(_strip_ai_prefix(it["negative"][0]), 200)
                 pos_id = (it.get("pos_ids") or [None])[0]
@@ -1488,21 +1520,18 @@ def _run_summary_local(payload: dict) -> dict:
                 pos_badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(str(pos_id))}\">源</span> " if pos_id else ""
                 neg_badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(str(neg_id))}\">源</span> " if neg_id else ""
                 conflict = _short(_pick_risk([_strip_ai_prefix(x) for x in (it["positive"] + it["negative"]) ]), 200)
-                rows.append(
-                    "<tr>"
-                    f"<td>{pos_badge}{html.escape(pos_txt)}</td>"
-                    f"<td>{neg_badge}{html.escape(neg_txt)}</td>"
-                    f"<td>{html.escape(conflict)}</td>"
-                    "</tr>"
+
+                parts.append(f"<h2>议题：{html.escape(theme)}</h2>")
+                parts.append(
+                    "<table class=\"counter-table\"><thead><tr><th>正方</th><th>反方</th><th>冲突点</th></tr></thead><tbody>"
+                    + "<tr>"
+                    + f"<td>{pos_badge}{html.escape(pos_txt)}</td>"
+                    + f"<td>{neg_badge}{html.escape(neg_txt)}</td>"
+                    + f"<td>{html.escape(conflict)}</td>"
+                    + "</tr>"
+                    + "</tbody></table>"
                 )
-            table = (
-            "<h1>分歧观点分析</h1>"
-            + f"<p>发现 {len(conflicts)} 个存在实质分歧的议题。</p>"
-            + "<table class=\"counter-table\"><thead><tr><th>正方</th><th>反方</th><th>冲突点</th></tr></thead><tbody>"
-            + "\n".join(rows)
-            + "</tbody></table>"
-            )
-            return table
+            return "\n".join(parts)
 
         def _build_contacts_html() -> str:
             if not high_contacts:
