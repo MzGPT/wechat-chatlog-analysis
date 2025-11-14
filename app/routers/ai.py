@@ -3,7 +3,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy import text as _sql_text
 from typing import List, Any
+from collections import OrderedDict
 from ..db import SessionLocal
 from ..models import Message, Task, Report, ReportArtifact, SyncState
 from ..schemas import AIReplyRequest, TaskOut
@@ -26,10 +28,37 @@ import json
 import re
 
 
-router = APIRouter(prefix="/api/ai", tags=["ai"])
+router = APIRouter(prefix="/api/ai", tags=["ai"]) 
 
-# 简单的进程内增量缓存：按 (snapshot_id, module, prompt_hash, temperature) 缓存模块产出
-SUMMARY_CACHE: dict[tuple[object, str, str, float], str] = {}
+# 进程内 LRU 缓存：按 (snapshot_id, module, prompt_hash, temperature) 缓存模块产出
+SUMMARY_CACHE_MAX = int(os.getenv("SUMMARY_CACHE_MAX", "64"))
+SUMMARY_CACHE: "OrderedDict[tuple[object, str, str, float], str]" = OrderedDict()
+
+def _summary_cache_get(key: tuple) -> str | None:
+    try:
+        val = SUMMARY_CACHE.get(key)
+        if val is not None:
+            try:
+                del SUMMARY_CACHE[key]
+            except Exception:
+                pass
+            SUMMARY_CACHE[key] = val
+        return val
+    except Exception:
+        return None
+
+def _summary_cache_set(key: tuple, value: str) -> None:
+    try:
+        if key in SUMMARY_CACHE:
+            del SUMMARY_CACHE[key]
+        SUMMARY_CACHE[key] = value
+        while len(SUMMARY_CACHE) > max(1, SUMMARY_CACHE_MAX):
+            try:
+                SUMMARY_CACHE.popitem(last=False)
+            except Exception:
+                break
+    except Exception:
+        pass
 
 
 def _strip_llm_thoughts(text: str) -> str:
@@ -664,7 +693,7 @@ def _run_summary_local(payload: dict) -> dict:
             except Exception:
                 pass
 
-        # 使用原始消息作为大模型输入，同时提取摘要字段以便优先使用
+        # 使用消息的“摘要列（derived.summary）”作为大模型输入上下文，避免传入完整正文，节省 token
         enriched_messages = []
         for m in msgs[:2000]:
             # 从derived中提取summary字段
@@ -677,8 +706,9 @@ def _run_summary_local(payload: dict) -> dict:
                 "sender_name": m.get("sender_name"),
                 "talker": m.get("talker_name") or m.get("chat_id"),
                 "message_type": m.get("message_type") or m.get("type"),
-                "content": m.get("content") or m.get("content_text") or m.get("text"),
-                "summary": summary,  # 添加摘要字段，供_compact函数优先使用
+                # 不再传递完整 content，只保留摘要；必要时前端/本地回退渲染
+                "content": None,
+                "summary": summary,  # 供_compact函数与统计使用
                 "tone": derived.get("tone"),
                 "category": derived.get("category"),
                 "meeting_number": derived.get("meeting_number"),
@@ -725,7 +755,7 @@ def _run_summary_local(payload: dict) -> dict:
 
         high_contact_senders = {c.get("sender") for c in locals().get("high_contacts", []) if c.get("sender")}
 
-        # 统一裁剪长度，优先使用摘要字段，正文仅取前200字符作为补充上下文
+        # 仅使用摘要字段作为上下文；无摘要则传空字符串，避免拉长上下文
         def _compact(ms: list[dict], prefer_meetings: bool = False, limit: int = 400) -> list[dict]:
             # 内部函数：去除ai:前缀
             def _strip_prefix(text: str) -> str:
@@ -741,18 +771,16 @@ def _run_summary_local(payload: dict) -> dict:
             for m in pool:
                 if len(selected) >= limit:
                     break
-                # 优先使用摘要字段，去除ai:前缀
+                # 仅使用摘要字段，去除 ai:/fallback: 前缀
                 summary = _strip_prefix((m.get("summary") or "").strip())
-                content_fallback = (_safe_str(m.get("content"))[:200])
-                # 如果摘要存在，使用摘要；否则使用截断的正文
-                content_to_use = summary if summary else content_fallback
+                content_to_use = summary  # 无摘要传空字符串
                 selected.append({
                     "id": m.get("id"),
                     "time": m.get("time"),
                     "sender": m.get("sender") or m.get("sender_name"),
                     "talker": m.get("talker"),
                     "message_type": m.get("message_type"),
-                    # 优先传摘要，无摘要时才传正文前200字符
+                    # 传摘要；无摘要传 None 以便下游可感知
                     "summary": summary if summary else None,
                     "content": content_to_use,
                 })
@@ -1056,7 +1084,7 @@ def _run_summary_local(payload: dict) -> dict:
                 snap_id = payload.get("snapshot_id")
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
-                cached = SUMMARY_CACHE.get(cache_key)
+                cached = _summary_cache_get(cache_key)
                 if not cached:
                     # 持久化缓存：SyncState("summary_cache:<...>")
                     db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
@@ -1067,7 +1095,7 @@ def _run_summary_local(payload: dict) -> dict:
                             row = db.get(SyncState, db_key)
                             if row and row.value:
                                 cached = row.value
-                                SUMMARY_CACHE[cache_key] = cached
+                                _summary_cache_set(cache_key, cached)
                         finally:
                             db.close()
                     except Exception:
@@ -1112,7 +1140,7 @@ def _run_summary_local(payload: dict) -> dict:
                 snap_id = payload.get("snapshot_id")
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
-                SUMMARY_CACHE[cache_key] = result[result_key]
+                _summary_cache_set(cache_key, result[result_key])
                 # 写入持久化缓存
                 db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
                 try:
@@ -1735,6 +1763,52 @@ def test_tool_model():
         return {"status": "ok", "output": out, "config": info}
     except Exception as e:
         return {"status": "error", "error": str(e), "config": info}
+
+
+# ===== 缓存调试与清理 =====
+@router.get("/debug/caches")
+def debug_caches():
+    """返回缓存统计：内存/数据库/新闻源缓存规模。"""
+    mem = len(SUMMARY_CACHE)
+    db_count = 0
+    try:
+        db = SessionLocal()
+        try:
+            row = db.execute(_sql_text("SELECT COUNT(1) FROM sync_state WHERE key LIKE 'summary_cache:%'"))
+            db_count = int(list(row)[0][0]) if row is not None else 0
+        finally:
+            db.close()
+    except Exception:
+        db_count = 0
+    news_count = 0
+    try:
+        from ..services import news_client as _nc
+        news_count = len(getattr(_nc, "_CACHE", {}) or {})
+    except Exception:
+        news_count = 0
+    return {"summary_cache_memory": mem, "summary_cache_db": db_count, "news_cache": news_count}
+
+
+@router.post("/summary/cache/clear")
+def clear_summary_cache():
+    """清空进程内与持久化的总结缓存。"""
+    try:
+        SUMMARY_CACHE.clear()
+    except Exception:
+        pass
+    cleared = 0
+    try:
+        db = SessionLocal()
+        try:
+            r1 = db.execute(_sql_text("SELECT COUNT(1) FROM sync_state WHERE key LIKE 'summary_cache:%'"))
+            cleared = int(list(r1)[0][0]) if r1 is not None else 0
+            db.execute(_sql_text("DELETE FROM sync_state WHERE key LIKE 'summary_cache:%'"))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return {"status": "ok", "cleared_db": cleared, "memory": 0}
 
 
 @router.post("/test-tool-summary")
