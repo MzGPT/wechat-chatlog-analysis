@@ -814,53 +814,47 @@ def _run_summary_local(payload: dict) -> dict:
                 rating *= 10.0
             norm_ratings[cid] = rating
 
+        # 建立 name/alias → cid 的映射，避免把不存在于联系人管理的“显示名”当作独立联系人
+        name_to_cid: dict[str, str] = {}
+        for cid, detail in contacts_raw.items():
+            name_to_cid[str(cid)] = str(cid)
+            if isinstance(detail, dict):
+                for key in ("name", "alias", "display_name"):
+                    v = str(detail.get(key) or "").strip()
+                    if v:
+                        name_to_cid[v] = str(cid)
+
+        # 统计“期间内是否有消息出现”：前端/快照已按时间窗口过滤，此处只需记录出现过即可
         activity: dict[str, int] = {}
         for m in enriched_messages:
-            sender = (m.get("sender") or "").strip()
-            t = _parse_time(m.get("time"))
-            if not sender or not t:
+            sender = (m.get("sender") or m.get("sender_name") or "").strip()
+            cid = name_to_cid.get(sender)
+            if not cid:
                 continue
-            # 统一为 naive UTC 再比较，避免 aware/naive 混用
-            try:
-                tt = t
-                if tt.tzinfo is not None:
-                    tt = tt.astimezone(timezone.utc).replace(tzinfo=None)
-                if tt >= cutoff_dt:
-                    activity[sender] = activity.get(sender, 0) + 1
-                continue
-            except Exception:
-                pass
-            if t >= cutoff_dt:
-                activity[sender] = activity.get(sender, 0) + 1
+            activity[cid] = 1 + activity.get(cid, 0)
 
         high_contacts = []
-        for sender in set(list(activity.keys()) + list(norm_ratings.keys())):
-            rating = norm_ratings.get(sender)
+        for cid, rating in norm_ratings.items():
             if rating is None:
-                rating = 50.0
-            # 只取评分>=60的联系人
+                continue
             if rating < 60.0:
                 continue
-            active = activity.get(sender, 0)
-            if active <= 0:
+            # 只要期间内有消息出现即可，不再计算具体活跃度
+            if cid not in activity:
                 continue
-            record = {
-                "sender": sender,
-                "rating": rating,
-                "activity": active,
-            }
-            detail = contacts_raw.get(sender)
-            if detail:
-                if detail.get("name"):
-                    record["name"] = detail.get("name")
-                if detail.get("alias"):
-                    record["alias"] = detail.get("alias")
-            high_contacts.append(record)
+            detail = contacts_raw.get(cid) or {}
+            display = detail.get("name") or detail.get("alias") or cid
+            high_contacts.append({
+                "cid": cid,
+                "sender": display,
+                "name": detail.get("name"),
+                "alias": detail.get("alias"),
+                "rating": float(rating),
+                "activity": 1,
+            })
         high_contacts.sort(key=lambda x: (x["rating"], x["activity"]), reverse=True)
         # 若严格阈值导致为空，则以活跃度Top且评分>=60补足，避免"高评分联系人"卡片空白
-        if not high_contacts:
-            tmp = sorted(({"sender": s, "rating": norm_ratings.get(s, 50.0), "activity": a, **(contacts_raw.get(s) or {})} for s, a in activity.items() if norm_ratings.get(s, 50.0) >= 60.0), key=lambda x:(x["activity"], x.get("rating",50.0)), reverse=True)
-            high_contacts = [{"sender": t.get("sender"), "rating": float(t.get("rating",50.0)), "activity": t.get("activity",0), "name": t.get("name"), "alias": t.get("alias")} for t in tmp[:10]]
+        # 无回退：若期间内没有符合条件的联系人，则允许为空，避免误报
 
         time_min = min((m.get("time") for m in enriched_messages if m.get("time")), default=None)
         time_max = max((m.get("time") for m in enriched_messages if m.get("time")), default=None)
@@ -1443,15 +1437,17 @@ def _run_summary_local(payload: dict) -> dict:
             if not high_contacts:
                 lines.append("- 近3天暂无评分≥60分且活跃的联系人")
                 return "\n".join(lines)
-            lines.append("以下按评分与活跃度排序（筛选标准：评分≥60分）：")
+            lines.append("以下按评分降序展示（筛选标准：评分≥60分）：")
             for c in high_contacts[:20]:
                 sender = c.get("name") or c.get("alias") or c.get("sender")
                 rating = c.get("rating")
-                act = c.get("activity")
                 # 收集该联系人的所有消息摘要，优先使用summary字段
                 contact_summaries = []
                 for m in enriched_messages:
-                    if (m.get("sender") or m.get("sender_name")) == c.get("sender"):
+                    # 基于 name_to_cid 将消息的 sender 解析为 cid 对齐
+                    _s = (m.get("sender") or m.get("sender_name") or "").strip()
+                    _cid = name_to_cid.get(_s)
+                    if _cid and _cid == c.get("cid"):
                         summary = (m.get("summary") or "").strip()
                         if summary:
                             summary = _strip_ai_prefix(summary)
@@ -1463,7 +1459,7 @@ def _run_summary_local(payload: dict) -> dict:
                 latest_summaries = contact_summaries[-3:] if len(contact_summaries) > 3 else contact_summaries
                 core_view = _short(latest_summaries[-1] if latest_summaries else "", 100)
                 dynamic_items = [_short(s, 80) for s in latest_summaries[-2:]] if len(latest_summaries) >= 2 else []
-                lines.append(f"### {sender}（评分 {rating:.1f} / 活跃 {act}）")
+                lines.append(f"### {sender}（评分 {rating:.1f}）")
                 lines.append(f"- 核心观点：{core_view or '—'}")
                 if dynamic_items:
                     lines.append(f"- 最新动态：{'；'.join(dynamic_items)}")
@@ -1540,7 +1536,6 @@ def _run_summary_local(payload: dict) -> dict:
             for c in high_contacts[:20]:
                 sender = c.get("name") or c.get("alias") or c.get("sender")
                 rating = c.get("rating")
-                act = c.get("activity")
                 # 收集该联系人的所有消息摘要，优先使用summary字段
                 contact_summaries = []
                 contact_msg_ids = []
@@ -1556,7 +1551,7 @@ def _run_summary_local(payload: dict) -> dict:
                     continue  # 没有摘要则跳过
                 latest_summary = _short(contact_summaries[-1], 120)
                 latest_msg_id = contact_msg_ids[-1] if contact_msg_ids else ""
-                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f} / 活跃 {act}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(latest_msg_id)}\">源</span> {html.escape(latest_summary)}</li>")
+                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(latest_msg_id)}\">源</span> {html.escape(latest_summary)}</li>")
             return "<h1>高评分联系人摘要</h1><ol>" + "".join(items) + "</ol>"
 
         if "market" in module_filter and not result.get("market_markdown"):
