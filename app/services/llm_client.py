@@ -177,6 +177,25 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
             "数据：{{messages_json}}"
         ),
     }
+    ,
+    "minutes_summary": {
+        "system": (
+            "你是会议纪要压缩助手，负责把会议纪要或录音文本压缩成<=300字的主题摘要。\n"
+            "要求：\n"
+            "- 不要复述文件标题；从正文提炼'主题、核心结论、主要依据/要点'；\n"
+            "- 如出现明确的会议/路演安排信息（平台/会议号/时间），可简短保留；\n"
+            "- 输出须以'ai: '开头；禁止编造信息；"
+        ),
+        "user": (
+            "请逐条总结以下会议纪要文本（JSON数组：id/time/sender/content），返回JSON数组，每个元素：\n"
+            "{\n"
+            "  \"id\": string,\n"
+            "  \"summary\": string,     // 必填，<=300字，自然语句；必须以'ai: '开头\n"
+            "  \"tone\": string         // 可选：positive/negative/neutral\n"
+            "}\n\n"
+            "数据：{{messages_json}}"
+        ),
+    }
 }
 
 
