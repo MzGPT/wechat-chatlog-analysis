@@ -294,6 +294,14 @@ def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
     """Direct aggregation from multiple sources (JSON-first). Extendable.
     Implemented: wallstreetcn-quick, HackerNews (Algolia), SpaceflightNews, Reddit (r/stocks, r/investing).
     """
+    # L1 cache: 3h TTL (与前端“每3小时刷新”一致)
+    try:
+        key = f"direct:{int(limit)}:{q or ''}"
+        cached = _cache_get(key)
+        if cached:
+            return cached
+    except Exception:
+        cached = None
     agg: List[dict] = []
     # 1) 华尔街见闻快讯
     try:
@@ -355,6 +363,21 @@ def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
         agg.extend(_direct_npr_business(limit=min(10, limit)))
     except Exception:
         pass
+    # 12) Reuters Business (RSS)
+    try:
+        agg.extend(_direct_rss('https://feeds.reuters.com/reuters/businessNews', 'reuters-business', 'Reuters Business', limit=min(30, limit)))
+    except Exception:
+        pass
+    # 13) BBC Business (RSS)
+    try:
+        agg.extend(_direct_rss('http://feeds.bbci.co.uk/news/business/rss.xml', 'bbc-business', 'BBC Business', limit=min(20, limit)))
+    except Exception:
+        pass
+    # 14) CNBC Top News (RSS)
+    try:
+        agg.extend(_direct_rss('https://www.cnbc.com/id/100003114/device/rss/rss.html', 'cnbc-top', 'CNBC', limit=min(20, limit)))
+    except Exception:
+        pass
     # keyword filter (best-effort)
     if q:
         ql = str(q).lower()
@@ -369,7 +392,13 @@ def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
             continue
         seen.add(key)
         uniq.append(it)
-    return {'total': len(uniq), 'items': uniq, 'upstream_ok': True}
+    result = {'total': len(uniq), 'items': uniq, 'upstream_ok': True}
+    try:
+        # Cache 3 hours
+        _cache_set(key, result, ttl=3 * 3600)
+    except Exception:
+        pass
+    return result
 
 
 # ------------------- external JSON sources (no key) -------------------
@@ -481,6 +510,74 @@ def _direct_reddit(subreddit: str, limit: int = 10) -> List[dict]:
                 'summary_origin': 'fallback',
             }
         })
+    return items
+
+
+def _direct_rss(url: str, source_id: str, source_name: str, limit: int = 30) -> List[dict]:
+    """Generic RSS fetcher for simple RSS feeds with <item><title><link><pubDate>."""
+    import xml.etree.ElementTree as ET
+    txt = requests.get(url, timeout=8).text
+    items: List[dict] = []
+    try:
+        root = ET.fromstring(txt)
+    except Exception:
+        return items
+    # Support both rss/channel/item and feed/entry
+    def _iter_items(node):
+        for it in node.findall('.//item'):
+            yield {
+                'title': (it.findtext('title') or '').strip(),
+                'link': (it.findtext('link') or '').strip(),
+                'pub': (it.findtext('pubDate') or '').strip(),
+            }
+        for it in node.findall('.//{http://www.w3.org/2005/Atom}entry'):
+            yield {
+                'title': (it.findtext('{http://www.w3.org/2005/Atom}title') or '').strip(),
+                'link': (it.find('{http://www.w3.org/2005/Atom}link').attrib.get('href') if it.find('{http://www.w3.org/2005/Atom}link') is not None else '').strip(),
+                'pub': (it.findtext('{http://www.w3.org/2005/Atom}updated') or it.findtext('{http://www.w3.org/2005/Atom}published') or '').strip(),
+            }
+    count = 0
+    for it in _iter_items(root):
+        if not it.get('title'):
+            continue
+        title = it['title']
+        urlp = it.get('link') or ''
+        pub = it.get('pub') or ''
+        ts_int = 0
+        # best-effort pubDate parsing
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(pub)
+            ts_int = int(dt.timestamp() * 1000)
+        except Exception:
+            try:
+                from datetime import datetime
+                ts_int = int(datetime.fromisoformat(pub.replace('Z', '+00:00')).timestamp() * 1000)
+            except Exception:
+                ts_int = 0
+        cat = _infer_news_category(title, source_name)
+        tone = _infer_news_tone(title)
+        items.append({
+            'id': urlp or title,
+            'source_id': source_id,
+            'source_name': source_name,
+            'title': title,
+            'url': urlp,
+            'pub_ts': ts_int,
+            'tags': [],
+            'category': cat,
+            'summary': '',
+            'raw': {'title': title, 'link': urlp, 'pubDate': pub},
+            'derived': {
+                'key_info': title,
+                'category': cat,
+                'tone': tone,
+                'summary_origin': 'fallback',
+            }
+        })
+        count += 1
+        if count >= max(1, min(100, int(limit))):
+            break
     return items
 
 
