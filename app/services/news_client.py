@@ -124,7 +124,19 @@ def _load_source_whitelist() -> list[str]:
                 return [str(x).strip() for x in arr if isinstance(x, (str, int)) and str(x).strip()]
     except Exception:
         pass
-    return []
+    # 默认白名单（当未配置文件时启用）：覆盖常见财经媒体
+    return [
+        'wallstreetcn-quick', 'reuters-business', 'bbc-business', 'cnbc-top',
+        'techcrunch', 'coindesk', 'engadget', 'cointelegraph', 'bitcoincom', 'npr-business',
+        # 国内财经（RSS新增）
+        'stcn',            # 证券时报
+        '21jingji',        # 21世纪经济报道
+        'jiemian',         # 界面新闻
+        'caixin',          # 财新
+        'ssnews',          # 上证报
+        'thepaper',        # 澎湃财经
+        'yicai',           # 第一财经
+    ]
 
 
 def _is_whitelisted(source_id: str, source_name: str, wl: list[str]) -> bool:
@@ -714,3 +726,32 @@ def write_news_snapshot(limit: int = 150) -> dict:
     with open(fpath, 'w', encoding='utf-8') as f:
         _json.dump({'items': rows, 'total': len(rows)}, f, ensure_ascii=False, indent=2)
     return {'status': 'ok', 'file': fpath, 'total': len(rows)}
+    # 15) 国内财经 RSS 源
+    try:
+        agg.extend(_direct_rss('https://www.stcn.com/rss/gundong.xml', 'stcn', '证券时报', limit=min(30, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://www.21jingji.com/rss', '21jingji', '21世纪经济报道', limit=min(20, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://www.jiemian.com/rss.html', 'jiemian', '界面新闻', limit=min(20, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://file.caixin.com/m/caixin_rss.xml', 'caixin', '财新', limit=min(20, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://www.sse.com.cn/aboutus/mediacenter/hotandd/activities/rss_r.xml', 'ssnews', '上证报', limit=min(20, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://www.thepaper.cn/listpage/18480,1199089,1199088,1199086,1199085,1199087,1013477,1299546,1299547,27094,26908,26911,26907,26910,26912,1199092,26909,1299545,1999080,1013490,32285,1013488,1013489,71824,1013487,1013486,1013485,1013484,1013483,1013475,1013491,26906,27093,1013479,1013482,1013478,1013481,1013480,1013476,1013474,1013473,1013472,1013471,1013470,1013468,1013467,1013466,1013465,39536,39535,39534,39533,39532,26913,1652514,1199091,1199090,1199083,1199082,1199081,1199093,1199094,1199095,1199096,1199097,1199098,1299550,1299548,1299552,1299551,1299549,1299553,27092,27091,27090,27089,27088,27087,27086,27085,27084,27083,27082,27081,1999079,1999078,1999077,1999076,1013477,1013479,1013478,1013480,1013476,1013474,1013473,1013472,1013471,1013470,1013468,1013467,1013466,1013465,39536,39535,39534,39533,39532,26913,1652514,1199091,1199090,1199083,1199082,1199081,1199093,1199094,1199095,1199096,1199097,1199098,1299550,1299548,1299552,1299551,1299549,1299553,27092,27091,27090,27089,27088,27087,27086,27085,27084,27083,27082,27081,1999079,1999078,1999077,1999076,1013475,1013491,26906,27093,1013479,1013482,1013478,1013481,1013480,1013476,1013474,1013473,1013472,1013471,1013470,1013468,1013467,1013466,1013465,39536,39535,39534,39533,39532,26913,1652514,1199091,1199090,1199083,1199082,1199081,1199093,1199094,1199095,1199096,1199097,1199098,1299550,1299548,1299552,1299551,1299549,1299553,27092,27091,27090,27089,27088,27087,27086,27085,27084,27083,27082,27081,1999079,1999078,1999077,1999076,1013479,1013482,1013478,1013481,1013480,1013476,1013474,1013473,1013472,1013471,1013470,1013468,1013467,1013466,1013465,39536,39535,39534,39533,39532,26913,1652514,1199091,1199090,1199083,1199082,1199081,1199093,1199094,1199095,1199096,1199097,1199098,1299550,1299548,1299552,1299551,1299549,1299553,27092,27091,27090,27089,27088,27087,27086,27085,27084,27083,27082,27081', 'thepaper', '澎湃财经', limit=min(20, limit)))
+    except Exception:
+        pass
+    try:
+        agg.extend(_direct_rss('https://www.yicai.com/rss/pc/', 'yicai', '第一财经', limit=min(20, limit)))
+    except Exception:
+        pass
