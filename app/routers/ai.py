@@ -1273,13 +1273,13 @@ def _run_summary_local(payload: dict) -> dict:
             return "".join(sections)
 
         PLATFORM_ABBREV = {
-            "腾讯会议": "腾",
-            "进门财经": "进",
-            "飞书": "飞",
-            "Zoom": "ZM",
-            "Teams": "TM",
-            "钉钉": "钉",
-            "电话会议": "电",
+            "腾讯会议": "腾讯",
+            "进门财经": "进门",
+            "飞书": "飞书",
+            "Zoom": "Zoom",
+            "Teams": "Teams",
+            "钉钉": "钉钉",
+            "电话会议": "电话",
         }
 
         def _detect_platform(text: str) -> str | None:
@@ -1514,8 +1514,10 @@ def _run_summary_local(payload: dict) -> dict:
                 msg_id = html.escape(str(it.get('id') or ''))
                 platform = html.escape(it['platform'])
                 code = html.escape(it['number']) if it['number'] != "待确认" else ""
+                full_time = html.escape(it['time'])
+                full_code = (platform + " " + code).strip()
                 rows.append(
-                    f"<tr data-msg-id=\"{msg_id}\"><td>{html.escape(it['time'])}</td><td>{platform} {code}</td>"
+                    f"<tr data-msg-id=\"{msg_id}\"><td title=\"{full_time}\">{full_time}</td><td title=\"{full_code}\">{full_code}</td>"
                     f"<td><span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
                 )
             table = """
