@@ -1309,7 +1309,12 @@ def _run_summary_local(payload: dict) -> dict:
             return dt.strftime("%m-%d %H:%M")
 
         def _extract_time_from_text(text: str) -> str | None:
-            # Try to parse patterns like 9-24 19:30 / 09-24 19:30 / 9月24日 19:30 / 9/24 19:30
+            """从正文中提取“会议时间”，而不是消息发送时间。
+
+            支持模式：
+            - 9-24 19:30 / 09-24 19:30 / 9月24日 19:30 / 9/24 19:30
+            - “今晚/今天/明天 xx:xx” 等，仅时间时默认使用当天日期。
+            """
             import re as _re
             t = (text or "").strip()
             if not t:
