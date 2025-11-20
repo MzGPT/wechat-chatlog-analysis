@@ -965,8 +965,10 @@ def _run_summary_local(payload: dict) -> dict:
                     source = sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=400)  # 增加limit确保覆盖更多消息
             elif module_key == "counter":
+                # 分歧观点分析：视窗内的所有有效摘要都应纳入分析，避免只看最近少量消息
+                # _compact 仅做 ai: 前缀清理与结构统一，limit 设为 source 长度，由后续分片逻辑控制 token 大小
                 source = [m for m in sorted_messages if _is_counter(m)] or sorted_messages
-                module_payload["messages"] = _compact(source, prefer_meetings=False, limit=280)
+                module_payload["messages"] = _compact(source, prefer_meetings=False, limit=len(source))
             elif module_key == "contacts":
                 if high_contact_senders:
                     source = [m for m in sorted_messages if (m.get("sender") or m.get("sender_name")) in high_contact_senders]
