@@ -224,9 +224,8 @@ def normalize_items(raw: dict, *, finance_only: bool = True, whitelist: list[str
         nid = it.get('id') or url or title
         ts = it.get('pubDate') or it.get('timestamp') or it.get('updatedTime') or 0
         wl = whitelist or []
+        # 仅根据来源白名单筛选；不再使用关键词判断财经属性
         if wl and not _is_whitelisted(str(src_id), str(src_name), wl):
-            continue
-        if finance_only and not wl and not _is_finance(str(title), str(url)):
             continue
         cat = _infer_news_category(str(title), str(src_name))
         tone = _infer_news_tone(str(title))
