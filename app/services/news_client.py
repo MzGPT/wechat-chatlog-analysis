@@ -86,11 +86,21 @@ def newsnow_refresh() -> dict:
 # --------------- finance filtering & normalization ---------------
 
 _DEFAULT_FINANCE_KEYWORDS: list[str] = [
-    "宏观", "央行", "利率", "通胀", "汇率", "财政", "货币政策", "降准", "降息",
+    # 宏观与政策
+    "宏观", "央行", "利率", "通胀", "通缩", "汇率", "财政", "货币政策", "降准", "降息",
+    "加息", "缩表", "非农", "就业", "失业率", "经济数据", "美联储", "联储", "议息", "FOMC",
+    "CPI", "PPI", "PCE", "GDP",
+    # 行业与市场
     "地产", "房企", "土拍", "销售", "按揭",
     "半导体", "芯片", "算力", "AI", "人工智能", "光伏", "新能源", "储能", "风电", "锂电",
     "券商", "A股", "港股", "美股", "科创板", "创业板", "北交所",
+    # 公司与财报
     "业绩", "利润", "营收", "公告", "IPO", "回购", "减持", "增持", "限售解禁", "评级", "目标价",
+    "财报", "指引", "展望",
+    # 英文常见词（确保海外财经标题不过滤）
+    "fed", "fomc", "nonfarm", "non-farm", "payroll", "payrolls", "jobs report",
+    "earnings", "guidance", "outlook", "results", "revenue", "profit",
+    "nvidia", "nvda", "google", "alphabet",
 ]
 
 
@@ -167,7 +177,7 @@ def _is_finance(title: str, url: str | None = None) -> bool:
 def _infer_news_category(title: str, source_name: str = "") -> str:
     t = (title or "")
     s = (source_name or "")
-    macro_keys = ("央行","利率","通胀","财政","货币政策","降准","降息","贸易","关税","PMI","GDP")
+    macro_keys = ("央行","利率","通胀","通缩","财政","货币政策","降准","降息","加息","贸易","关税","PMI","GDP","非农","就业","失业率","美联储","联储","CPI","PPI","PCE","FOMC")
     if any(k in t for k in macro_keys):
         return "宏观"
     industry_keys = ("半导体","芯片","算力","AI","人工智能","光伏","新能源","储能","风电","锂电","汽车","医药","军工","煤炭","有色","地产")

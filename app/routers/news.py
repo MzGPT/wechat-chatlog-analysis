@@ -116,8 +116,18 @@ def summarize_news(payload: dict = Body(default={})):  # accepts JSON body { ids
         limit = 50
     # 取数据：直接采集
     direct = direct_from_sources_json(limit=limit, q=q)
-    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=True)
-    items = norm.get('items') or []
+    # 使用来源白名单优先；若白名单非空，则不再按关键词 finance_only 过滤
+    from ..services.news_client import _load_source_whitelist
+    wl = _load_source_whitelist()
+    fo = False if wl else True
+    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=fo, whitelist=wl)
+    raw_items = norm.get('items') or []
+    # 仅保留近72小时新闻，避免模型被陈旧信息稀释
+    from time import time as _time
+    now_ms = int(_time() * 1000)
+    cutoff = now_ms - 72 * 3600 * 1000
+    items_72h = [it for it in raw_items if int(it.get('pub_ts') or 0) >= cutoff]
+    items = items_72h or raw_items
     # 若传了 ids，仅过滤保留
     if ids and isinstance(ids, list):
         idset = {str(x) for x in ids if x is not None}

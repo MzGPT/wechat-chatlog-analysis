@@ -978,12 +978,22 @@ def _run_summary_local(payload: dict) -> dict:
             elif module_key == "newswatch":
                 # 舆情分析读取直接新闻源，而非聊天消息
                 try:
-                    from ..services.news_client import direct_from_sources_json, normalize_items
-                    # 拉取较新的直接新闻（无需白名单，保持财经关键词过滤）
-                    direct = direct_from_sources_json(limit=80)
-                    norm = normalize_items({"success": True, "data": direct.get("items", [])}, finance_only=True)
+                    from ..services.news_client import direct_from_sources_json, normalize_items, _load_source_whitelist
+                    direct = direct_from_sources_json(limit=120)
+                    # 使用来源白名单优先过滤；若白名单非空，则不再二次按关键词过滤 finance_only
+                    wl = _load_source_whitelist()
+                    fo = False if wl else True
+                    norm = normalize_items({"success": True, "data": direct.get("items", [])}, finance_only=fo, whitelist=wl)
+                    raw_items = norm.get("items") or []
+                    # 仅保留近72小时内的新闻，优先覆盖最新的重要事件
+                    from time import time as _time
+                    now_ms = int(_time() * 1000)
+                    cutoff = now_ms - 72 * 3600 * 1000
+                    items_72h = [it for it in raw_items if int(it.get("pub_ts") or 0) >= cutoff]
+                    # 若过滤过严导致为空，则回退到全部列表
+                    use_items = items_72h or raw_items
                     news_items = []
-                    for it in (norm.get("items") or [])[:80]:
+                    for it in use_items[:80]:
                         news_items.append({
                             "id": str(it.get("id")),
                             "source": it.get("source_name") or it.get("source_id") or "",
