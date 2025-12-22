@@ -1,6 +1,6 @@
 # 项目对话与改动总览（Past Chat Digest）
 
-更新时间：2025-12-21
+更新时间：2025-12-22
 
 > 目的：把本轮（0913-2）围绕“AI 总结/会议路演/新闻舆情/联系人与黑白名单/缓存与 Token”多轮沟通的需求、关键决策、落地结果与验证点，整理成可持续迭代的摘要。  
 > 说明：这里是“对话要点 + 结果落点”，不是逐字聊天记录。
@@ -114,3 +114,20 @@
 - 邮件黑名单匹配：建议对 `Name <a@b.com>` 做邮箱提取归一化，以提高命中率。
 - 缓存治理：可加“清空摘要缓存”按钮/接口，定期清理 `summary_cache:` 前缀键，避免长期增长。
 - 自动拉黑阈值：可在设置中参数化（默认 40），支持关闭/调整阈值。
+
+---
+
+## 6) 备份与发布记录（v0.8.0）
+
+### GitHub 仓库（新建）
+- Repo：`https://github.com/leecyno1/wechat-chatlog-analysis-v0.8`（Private）
+- Release Tag：`v0.8.0`
+- Release Commit：`653724debf4a738730368106d939dcaf072ce8b0`
+
+### 本地备份（目录：`/Users/lichengyin/Desktop/Projects/0913_backups`）
+- 预推送快照（含未提交改动）：`0913-prepush-20251222-105537.tar.gz`
+  - sha256：`faac06325d66cdabb72488df04e4b861c8039e6dbe75aeaa556ffed970b42eef`
+- 发布后备份（可恢复整个 git 历史）：`0913-v0.8.0-20251222-110010.bundle`
+  - sha256：`1b452d0d9aaa2eb1c38656a5e3af6a36f5dd964deefab3356ecff1ed9f42c5b1`
+- 发布源代码归档（基于 tag）：`0913-v0.8.0-20251222-110010.src.tar.gz`
+  - sha256：`d673fac002a0e77d84a928ea76fc68daa41299435c5fefb27e759f78edc5d72e`
