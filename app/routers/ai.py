@@ -7,7 +7,7 @@ from sqlalchemy import text as _sql_text
 from typing import List, Any
 from collections import OrderedDict
 from ..db import SessionLocal
-from ..models import Message, Task, Report, ReportArtifact, SyncState
+from ..models import Message, Task, Report, ReportArtifact, SyncState, Contact
 from ..schemas import AIReplyRequest, TaskOut
 from ..services.n8n_client import N8NClient
 from ..services.llm_client import (
@@ -230,13 +230,24 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         )
         db.flush()
 
-        contacts_full = snapshot.contact_ratings or {}
+        # 高评分联系人完全以联系人管理表为准，忽略任何模型/缓存生成的评分
+        contacts_full: dict[str, dict[str, Any]] = {}
+        try:
+            rows = db.scalars(select(Contact)).all()
+        except Exception:
+            rows = []
+        for contact in rows:
+            cid = str(contact.id)
+            contacts_full[cid] = {
+                "cid": cid,
+                "rating": float(contact.rating) if contact.rating is not None else None,
+                "name": contact.name,
+                "alias": contact.alias,
+                "labels": contact.labels or {},
+            }
         contact_ratings_simple: dict[str, Any] = {}
         for key, data in contacts_full.items():
-            if isinstance(data, dict):
-                rating_val = data.get("rating")
-            else:
-                rating_val = data
+            rating_val = data.get("rating")
             if rating_val is None:
                 continue
             try:
@@ -591,20 +602,33 @@ def _run_summary_local(payload: dict) -> dict:
 
     contacts_raw: dict[str, dict[str, Any]] = {}
     for key, value in (payload.get("contact_ratings") or {}).items():
+        entry: dict[str, Any]
         if isinstance(value, dict):
-            contacts_raw[str(key)] = value.copy()
+            entry = value.copy()
         else:
             try:
-                contacts_raw[str(key)] = {"rating": float(value)}
+                entry = {"rating": float(value)}
             except Exception:
-                contacts_raw[str(key)] = {}
+                entry = {}
+        entry["cid"] = str(key)
+        contacts_raw[str(key)] = entry
     for key, value in (payload.get("contact_details") or {}).items():
         entry = contacts_raw.get(str(key), {}).copy()
         if isinstance(value, dict):
             entry.update(value)
         else:
             entry.setdefault("extra", value)
+        entry["cid"] = str(key)
         contacts_raw[str(key)] = entry
+
+    name_to_cid: dict[str, str] = {}
+    for cid, detail in contacts_raw.items():
+        name_to_cid[str(cid)] = str(cid)
+        if isinstance(detail, dict):
+            for key in ("name", "alias", "display_name"):
+                v = str(detail.get(key) or "").strip()
+                if v:
+                    name_to_cid[v] = str(cid)
 
     def _extract_text(message: dict) -> str:
         if not isinstance(message, dict):
@@ -661,13 +685,18 @@ def _run_summary_local(payload: dict) -> dict:
                     )
                 if '评分来自系统' not in user_p:
                     cp['user'] = (
-                        '只返回 JSON 对象 {"html": string}，不得使用代码块或反引号。\n'
-                        'HTML 结构：\n'
-                        '<h1>高评分联系人摘要</h1>\n'
-                        '<p>规则：评分≥60（评分来自系统），按评分降序展示。</p>\n'
-                        '<h3><姓名或别名>（评分 <x.x> / 活跃 <y>）</h3>\n'
-                        '<ul>\n  <li>核心观点：<一句话概括> #123</li>\n  <li>核心观点：<一句话概括> #456</li>\n</ul>\n'
-                        '<p>如需：可增加“关注联系人”段落，格式同上。</p>\n'
+                        '请输出 JSON 对象 {"markdown": string}：\n'
+                        '# 高评分联系人摘要\n'
+                        '（评分≥60，按评分降序排列）\n\n'
+                        '## <姓名或别名> (评分 <x.x>)\n'
+                        '- 核心观点：<一句话概括> #<id>\n'
+                        '- 核心观点：<一句话概括> #<id>\n\n'
+                        '## <姓名或别名> (评分 <x.x>)\n'
+                        '...\n\n'
+                        '注意：\n'
+                        '1. 严禁使用 wxid_xxx 作为姓名，必须使用 sender_name 或 alias。\n'
+                        '2. 仅分析列表中评分>=60的联系人。\n'
+                        '3. 必须基于 summary 字段生成，禁止编造。\n'
                         '数据：{{messages_data}}'
                     )
                 module_prompts['contacts'] = cp
@@ -699,7 +728,11 @@ def _run_summary_local(payload: dict) -> dict:
             # 从derived中提取summary字段
             derived = m.get("derived") or {}
             summary = derived.get("summary") or ""
-            enriched_messages.append({
+            cid = str(m.get("sender_id") or "").strip()
+            if not cid:
+                sender_label = (m.get("sender_name") or "").strip()
+                cid = name_to_cid.get(sender_label, "")
+            entry = {
                 "id": m.get("id"),
                 "time": m.get("time") or m.get("timestamp"),
                 "sender": m.get("sender_name") or m.get("sender_id"),
@@ -713,7 +746,16 @@ def _run_summary_local(payload: dict) -> dict:
                 "category": derived.get("category"),
                 "meeting_number": derived.get("meeting_number"),
                 "keywords": derived.get("keywords") or [],
-            })
+                "contact_id": cid if cid else None,
+            }
+            enriched_messages.append(entry)
+
+        from collections import defaultdict
+        messages_by_cid: dict[str, list[dict]] = defaultdict(list)
+        for em in enriched_messages:
+            cid = em.get("contact_id")
+            if cid:
+                messages_by_cid[cid].append(em)
 
         # 紧凑化传入大模型的数据，避免上下文过大导致超限/失败
         def _safe_str(v: Any) -> str:
@@ -742,18 +784,21 @@ def _run_summary_local(payload: dict) -> dict:
         market_terms = ("认为", "观点", "策略", "看多", "看空", "判断", "建议", "风险", "目标价", "估值", "行业", "公司", "基本面", "宏观", "政策")
 
         def _is_meeting(m: dict) -> bool:
-            text = (m.get("content") or "").strip()
+            text = (m.get("summary") or m.get("content") or "").strip()
+            if m.get("meeting_number"):
+                return True
+            if not text:
+                keywords = " ".join(k for k in (m.get("keywords") or []) if isinstance(k, str))
+                text = keywords.strip()
             return any(t in text for t in meeting_terms)
 
         def _is_market(m: dict) -> bool:
-            text = (m.get("content") or "").strip()
+            text = (m.get("summary") or m.get("content") or "").strip()
             return any(t in text for t in market_terms)
 
         def _is_counter(m: dict) -> bool:
-            text = (m.get("content") or "").strip()
+            text = (m.get("summary") or m.get("content") or "").strip()
             return any(t in text for t in market_terms)
-
-        high_contact_senders = {c.get("sender") for c in locals().get("high_contacts", []) if c.get("sender")}
 
         # 仅使用摘要字段作为上下文；无摘要则传空字符串，避免拉长上下文
         def _compact(ms: list[dict], prefer_meetings: bool = False, limit: int = 400) -> list[dict]:
@@ -766,6 +811,16 @@ def _run_summary_local(payload: dict) -> dict:
                     t = t[9:].strip()
                 return t
             
+            # 内部函数：时间去去年份 (YYYY-MM-DD HH:MM:SS -> MM-DD HH:MM)
+            def _short_time(ts: Any) -> str:
+                s = str(ts) if ts else ""
+                # 简单处理：若包含 T 或空格，且长度足够，则截取
+                # 2025-11-24 10:00:00 -> 11-24 10:00
+                # 2025-11-24T10:00:00 -> 11-24 10:00
+                if len(s) >= 16 and (s[4] == '-' or s[4] == '/'):
+                    return s[5:16].replace('T', ' ')
+                return s
+
             selected: list[dict] = []
             pool = ms
             for m in pool:
@@ -774,10 +829,22 @@ def _run_summary_local(payload: dict) -> dict:
                 # 仅使用摘要字段，去除 ai:/fallback: 前缀
                 summary = _strip_prefix((m.get("summary") or "").strip())
                 content_to_use = summary  # 无摘要传空字符串
+                
+                # 尝试解析发送人名称与评分
+                cid = m.get("contact_id")
+                sender_display = m.get("sender") or m.get("sender_name")
+                rating = None
+                if cid and cid in contacts_raw:
+                    c_info = contacts_raw[cid]
+                    # 优先使用备注 > 昵称 > 原始ID
+                    sender_display = c_info.get("remark") or c_info.get("name") or c_info.get("alias") or sender_display
+                    rating = c_info.get("rating")
+
                 selected.append({
                     "id": m.get("id"),
-                    "time": m.get("time"),
-                    "sender": m.get("sender") or m.get("sender_name"),
+                    "time": _short_time(m.get("time")), # 去除年份
+                    "sender": sender_display,
+                    "rating": rating,  # 显式传递评分给 LLM
                     "talker": m.get("talker"),
                     "message_type": m.get("message_type"),
                     # 传摘要；无摘要传 None 以便下游可感知
@@ -842,45 +909,34 @@ def _run_summary_local(payload: dict) -> dict:
                 rating *= 10.0
             norm_ratings[cid] = rating
 
-        # 建立 name/alias → cid 的映射，避免把不存在于联系人管理的“显示名”当作独立联系人
-        name_to_cid: dict[str, str] = {}
-        for cid, detail in contacts_raw.items():
-            name_to_cid[str(cid)] = str(cid)
-            if isinstance(detail, dict):
-                for key in ("name", "alias", "display_name"):
-                    v = str(detail.get(key) or "").strip()
-                    if v:
-                        name_to_cid[v] = str(cid)
-
-        # 统计“期间内是否有消息出现”：前端/快照已按时间窗口过滤，此处只需记录出现过即可
-        activity: dict[str, int] = {}
-        for m in enriched_messages:
-            sender = (m.get("sender") or m.get("sender_name") or "").strip()
-            cid = name_to_cid.get(sender)
-            if not cid:
-                continue
-            activity[cid] = 1 + activity.get(cid, 0)
+        def _latest_contact_time(msgs_for_contact: list[dict]) -> str:
+            if not msgs_for_contact:
+                return ""
+            return _iso(max((m.get("time") for m in msgs_for_contact if m.get("time")), default=""))
 
         high_contacts = []
         for cid, rating in norm_ratings.items():
-            if rating is None:
+            if rating is None or rating < 60.0:
                 continue
-            if rating < 60.0:
-                continue
-            # 只要期间内有消息出现即可，不再计算具体活跃度
-            if cid not in activity:
+            contact_msgs = messages_by_cid.get(cid)
+            if not contact_msgs:
                 continue
             detail = contacts_raw.get(cid) or {}
             display = detail.get("name") or detail.get("alias") or cid
+            # 跳过仅有 wxid_ 而无真实姓名/别名的联系人，避免在“高评分联系人”模块展示微信ID
+            if (not (detail.get("name") or detail.get("alias"))) and str(display).startswith("wxid_"):
+                continue
+            ordered_msgs = sorted(contact_msgs, key=lambda x: _iso(x.get("time")), reverse=True)
             high_contacts.append({
                 "cid": cid,
                 "sender": display,
-                "name": detail.get("name"),
+                "name": detail.get("name") or display,
                 "alias": detail.get("alias"),
                 "rating": float(rating),
-                "activity": 1,
+                "messages": ordered_msgs,
             })
-        high_contacts.sort(key=lambda x: (x["rating"], x["activity"]), reverse=True)
+        high_contacts.sort(key=lambda x: (x["rating"], _latest_contact_time(x.get("messages") or [])), reverse=True)
+        high_contact_ids = {c.get("cid") for c in high_contacts if c.get("cid")}
         # 若严格阈值导致为空，则以活跃度Top且评分>=60补足，避免"高评分联系人"卡片空白
         # 无回退：若期间内没有符合条件的联系人，则允许为空，避免误报
 
@@ -970,10 +1026,10 @@ def _run_summary_local(payload: dict) -> dict:
                 source = [m for m in sorted_messages if _is_counter(m)] or sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=len(source))
             elif module_key == "contacts":
-                if high_contact_senders:
-                    source = [m for m in sorted_messages if (m.get("sender") or m.get("sender_name")) in high_contact_senders]
+                if high_contact_ids:
+                    source = [m for m in sorted_messages if (m.get("contact_id") or "") in high_contact_ids]
                 else:
-                    source = sorted_messages
+                    source = []
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=220)
             elif module_key == "newswatch":
                 # 舆情分析读取直接新闻源，而非聊天消息
@@ -1143,8 +1199,11 @@ def _run_summary_local(payload: dict) -> dict:
                 if "markdown" in parsed:
                     result[result_key] = _strip_llm_thoughts(parsed.get("markdown", ""))
                 elif "html" in parsed:
+                    # 如果模型仍返回 HTML，尝试转换为 Markdown 或保留
+                    # 这里优先保留，但前端 renderMarkdown 会处理
                     result[result_key] = _strip_llm_thoughts(parsed.get("html", ""))
             else:
+                # 兜底：如果返回纯文本，视为 Markdown
                 result[result_key] = _strip_llm_thoughts(output_text)
 
             # 写入缓存
@@ -1275,13 +1334,17 @@ def _run_summary_local(payload: dict) -> dict:
             total = len(enriched_messages)
             pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
             neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
-            sections = ["<h1>市场观点总览</h1>", f"<p>样本：{total} 条；正向 {pos} / 负向 {neg}</p>", "<p>今日关键风险：关注政策节奏与资金流、业绩兑现度以及外部宏观变量带来的波动。</p>"]
+            sections = [f"<p>样本：{total} 条；正向 {pos} / 负向 {neg}</p>"]
+            topic_idx = 1
             for name, _ in CAT_RULES:
                 bucket = [m for m in enriched_messages if name in _match_cats(m)]
-                sections.append(f"<h2>{name}</h2>")
+                if not bucket:
+                    continue
+                sections.append(f"<div class=\"section-label\">【主题{topic_idx}：{html.escape(name)}】</div>")
                 lines = _summarize_bucket(bucket)
                 sections.append("<ul>" + "".join(f"<li>{html.escape(line)}</li>" for line in lines) + "</ul>")
-            sections.append("<h2>今日重点提示</h2><ul><li>按主题监控验证窗口，补齐证据再做仓位调整，保留对冲准备。</li></ul>")
+                topic_idx += 1
+            sections.append("<div class=\"section-label\">【行动建议】</div><ul><li>按主题监控验证窗口，补齐证据再做仓位调整，保留对冲准备。</li></ul>")
             return "".join(sections)
 
         PLATFORM_ABBREV = {
@@ -1377,6 +1440,7 @@ def _run_summary_local(payload: dict) -> dict:
                         continue  # 没有摘要则跳过该消息，不使用content作为fallback
                     base_summary = _strip_ai_prefix(base_summary)
                     shown_time = _extract_time_from_text(text) or _fmt_meeting_time(m.get("time"))
+                    label_idx = len(items) + 1
                     items.append({
                         "id": m.get("id") or m.get("message_id"),
                         "time": shown_time,
@@ -1384,6 +1448,7 @@ def _run_summary_local(payload: dict) -> dict:
                         "number": meeting_no or "待确认",
                         "speaker": m.get("sender") or m.get("sender_name") or "-",
                         "topic": _short_cn(base_summary, 10) or "-",
+                        "label": f"会议{label_idx}",
                     })
             # sort by time desc
             items.sort(key=lambda x: x.get("time") or "", reverse=True)
@@ -1392,17 +1457,15 @@ def _run_summary_local(payload: dict) -> dict:
         def _build_meetings_md() -> str:
             items = _extract_meetings()
             if not items:
-                return "# 会议路演信息\n- 信息有限"
+                return "- 近期未检测到可用的会议路演信息"
             platform_counter = Counter(it.get("platform") or "待定" for it in items)
             top_platforms = ", ".join(f"{k}{v}场" for k, v in platform_counter.most_common(3))
-            md = ["# 会议路演信息", f"- 今日共 {len(items)} 场，主流平台：{top_platforms or '—'}"]
-            md.append("\n| 时间 | 平台/会议号 | 主讲人 | 主题要点 |\n|---|---|---|---|")
-            for it in items:
+            lines = [f"今日共 {len(items)} 场；主流平台：{top_platforms or '—'}"]
+            for idx, it in enumerate(items, 1):
                 code = it['number'] if it['number'] != "待确认" else ''
-                platform_tag = it['platform']
-                md.append(f"| {it['time']} | {platform_tag} {code} | {it['speaker']} | {it['topic']} |")
-            md.append("\n## 跟进提醒\n- 核对会议号与参会方式，提前准备提问要点和资料。")
-            return "\n".join(md)
+                news_id = str(it.get("id") or "")
+                lines.append(f"【会议{idx}】{it['time']} | {it['platform']} {code} | {it['topic']} #{news_id}")
+            return "\n".join(lines)
 
         def _normalize_conflict_theme(m: dict) -> str:
             # 统一使用 summary 作为议题主题来源
@@ -1455,11 +1518,11 @@ def _run_summary_local(payload: dict) -> dict:
         def _build_counter_md() -> str:
             conflicts = _extract_conflicts()
             if not conflicts:
-                return "# 分歧观点分析\n- 暂未识别具备证据支撑的分歧观点，可继续收集信息。"
-            md = ["# 分歧观点分析", f"- 共发现 {len(conflicts)} 个存在明显分歧的议题，需重点核查。"]
-            for item in conflicts:
+                return "- 暂未识别具备证据支撑的分歧观点，可继续收集信息。"
+            md = [f"共发现 {len(conflicts)} 个存在明显分歧的议题，需重点核查。"]
+            for idx, item in enumerate(conflicts, 1):
                 theme = _short(item["theme"], 40)
-                md.append(f"\n## 议题：{theme}")
+                md.append(f"\n【分歧观点{idx}】{theme}")
                 pos_line = item["positive"][0]
                 if item["pos_ids"]:
                     ids = " ".join(f"#{i}" for i in item["pos_ids"][:2] if i)
@@ -1474,87 +1537,78 @@ def _run_summary_local(payload: dict) -> dict:
                 md.append(f"- 对立观点：{neg_line}")
                 merged = item["positive"] + item["negative"]
                 md.append(f"- 待核查：{_short(_pick_risk([_strip_ai_prefix(x) for x in merged]), 100)}")
-            md.append("\n## 行动建议\n- 对上述议题安排快速访谈或数据核查，先补证据再定调；及时反馈投委会。")
+            md.append("\n【行动建议】对上述议题安排快速访谈或数据核查，先补证据再定调；及时反馈投委会。")
             return "\n".join(md)
 
         def _build_contacts_md() -> str:
-            lines = ["# 高评分联系人摘要"]
+            lines = []
             if not high_contacts:
                 lines.append("- 近3天暂无评分≥60分且活跃的联系人")
                 return "\n".join(lines)
-            lines.append("以下按评分降序展示（筛选标准：评分≥60分）：")
-            for c in high_contacts[:20]:
-                sender = c.get("name") or c.get("alias") or c.get("sender")
-                rating = c.get("rating")
-                # 收集该联系人的所有消息摘要，优先使用summary字段
-                contact_summaries = []
-                for m in enriched_messages:
-                    # 基于 name_to_cid 将消息的 sender 解析为 cid 对齐
-                    _s = (m.get("sender") or m.get("sender_name") or "").strip()
-                    _cid = name_to_cid.get(_s)
-                    if _cid and _cid == c.get("cid"):
-                        summary = (m.get("summary") or "").strip()
-                        if summary:
-                            summary = _strip_ai_prefix(summary)
-                            if summary:
-                                contact_summaries.append(summary)
-                if not contact_summaries:
-                    continue  # 没有摘要则跳过
-                # 使用最新的几条摘要
-                latest_summaries = contact_summaries[-3:] if len(contact_summaries) > 3 else contact_summaries
-                core_view = _short(latest_summaries[-1] if latest_summaries else "", 100)
-                dynamic_items = [_short(s, 80) for s in latest_summaries[-2:]] if len(latest_summaries) >= 2 else []
-                lines.append(f"### {sender}（评分 {rating:.1f}）")
-                lines.append(f"- 核心观点：{core_view or '—'}")
-                if dynamic_items:
-                    lines.append(f"- 最新动态：{'；'.join(dynamic_items)}")
+            for idx, c in enumerate(high_contacts[:20], 1):
+                sender = c.get("name") or c.get("alias") or c.get("sender") or c.get("cid")
+                rating = c.get("rating") or 0
+                msg_entries = []
+                for msg in c.get("messages", [])[:3]:
+                    summary = _strip_ai_prefix(msg.get("summary") or "")
+                    if not summary:
+                        continue
+                    msg_entries.append({
+                        "text": _short(summary, 120),
+                        "id": msg.get("id"),
+                    })
+                if not msg_entries:
+                    continue
+                lines.append(f"【联系人{idx}】{sender}（评分 {rating:.1f}）")
+                primary = msg_entries[0]
+                badge = f" (#{primary['id']})" if primary.get("id") else ""
+                lines.append(f"- 核心观点：{primary['text']}{badge}")
+                if len(msg_entries) > 1:
+                    extras = []
+                    for extra in msg_entries[1:]:
+                        tag = f" (#{extra['id']})" if extra.get('id') else ''
+                        extras.append(f"{extra['text']}{tag}")
+                    lines.append(f"- 补充观点：{'；'.join(extras)}")
                 else:
-                    lines.append("- 最新动态：近期信息已记录于聊天摘要中")
-                lines.append("- 跟进建议：针对其关注点准备问答并确认最新数据。")
-            lines.append("\n## 关注联系人\n- 近3天评分处于次高分段的潜力对象建议提升触达频次。")
+                    lines.append("- 补充观点：近期信息已记录于聊天摘要中")
+                lines.append("- 跟进建议：关注其重点议题，准备应答要点。")
             return "\n".join(lines)
 
         # === HTML 版本（用于更好的交互与排版） ===
         def _build_meetings_html() -> str:
             items = _extract_meetings()
             if not items:
-                return "<h1>会议路演信息</h1><p>信息有限</p>"
+                return "<p>近期未检测到可用的会议路演信息。</p>"
             platform_counter = Counter(it.get("platform") or "待定" for it in items)
             top_platforms = ", ".join(f"{html.escape(k)}{v}场" for k, v in platform_counter.most_common(3)) or "—"
             rows = []
-            for it in items:
+            for idx, it in enumerate(items, 1):
                 msg_id = html.escape(str(it.get('id') or ''))
                 platform = html.escape(it['platform'])
                 code = html.escape(it['number']) if it['number'] != "待确认" else ""
                 full_time = html.escape(it['time'])
                 full_code = (platform + " " + code).strip()
+                label = html.escape(f"【会议{idx}】")
                 rows.append(
                     f"<tr data-msg-id=\"{msg_id}\"><td title=\"{full_time}\">{full_time}</td><td title=\"{full_code}\">{full_code}</td>"
-                    f"<td><span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
+                    f"<td>{label} <span class=\"msg-badge\" data-msg-id=\"{msg_id}\">源</span> {html.escape(it['topic'])}</td></tr>"
                 )
-            table = """
-            <h1>会议路演信息</h1>
-            <p>今日共 {n} 场；主流平台：{platforms}</p>
+            table = f"""
+            <p>今日共 {len(items)} 场；主流平台：{top_platforms}</p>
             <table class=\"meeting-table\"><thead><tr><th>时间</th><th>平台/会议号</th><th>主题要点</th></tr></thead>
-            <tbody>{rows}</tbody></table>
-            <h2>跟进提醒</h2>
-            <ul><li>核对会议号与参会方式，提前准备提问要点和资料。</li></ul>
-            """.replace("{n}", str(len(items))).replace("{rows}", "\n".join(rows)).replace("{platforms}", top_platforms)
+            <tbody>{''.join(rows)}</tbody></table>
+            """
             return table
 
         def _build_counter_html() -> str:
-            """Build per-topic 3-column tables with headings and an overview.
-            修复：首次主题缺失标题/概览的问题，确保每个议题包含 H2 标题 + 表格。
-            """
             conflicts = _extract_conflicts()
             if not conflicts:
-                return "<h1>分歧观点分析</h1><p>暂无明确分歧。建议继续跟踪关键数据与风险点。</p>"
+                return "<p>暂无明确分歧。建议继续跟踪关键数据与风险点。</p>"
 
             parts: list[str] = []
-            parts.append("<h1>分歧观点分析</h1>")
-            parts.append(f"<p>整体概览：共发现 {len(conflicts)} 个存在实质分歧的议题，建议优先核查证据、补齐数据缺口。</p>")
+            parts.append(f"<p>共发现 {len(conflicts)} 个存在实质分歧的议题，建议优先核查证据、补齐数据缺口。</p>")
 
-            for it in conflicts:
+            for idx, it in enumerate(conflicts, 1):
                 theme = _short(str(it.get("theme") or "未命名议题"), 40)
                 pos_txt = _short(_strip_ai_prefix(it["positive"][0]), 200)
                 neg_txt = _short(_strip_ai_prefix(it["negative"][0]), 200)
@@ -1564,7 +1618,7 @@ def _run_summary_local(payload: dict) -> dict:
                 neg_badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(str(neg_id))}\">源</span> " if neg_id else ""
                 conflict = _short(_pick_risk([_strip_ai_prefix(x) for x in (it["positive"] + it["negative"]) ]), 200)
 
-                parts.append(f"<h2>议题：{html.escape(theme)}</h2>")
+                parts.append(f"<div class=\"section-label\">【分歧观点{idx}】{html.escape(theme)}</div>")
                 parts.append(
                     "<table class=\"counter-table\"><thead><tr><th>正方</th><th>反方</th><th>冲突点</th></tr></thead><tbody>"
                     + "<tr>"
@@ -1578,51 +1632,49 @@ def _run_summary_local(payload: dict) -> dict:
 
         def _build_contacts_html() -> str:
             if not high_contacts:
-                return "<h1>高评分联系人摘要</h1><p>近3天暂无评分≥60分且活跃的联系人</p>"
-            items = []
-            for c in high_contacts[:20]:
-                sender = c.get("name") or c.get("alias") or c.get("sender")
-                rating = c.get("rating")
-                # 收集该联系人的所有消息摘要，优先使用summary字段
-                contact_summaries = []
-                contact_msg_ids = []
-                for m in enriched_messages:
-                    if (m.get("sender") or m.get("sender_name")) == c.get("sender"):
-                        summary = (m.get("summary") or "").strip()
-                        if summary:
-                            summary = _strip_ai_prefix(summary)
-                            if summary:
-                                contact_summaries.append(summary)
-                                contact_msg_ids.append(str(m.get("id") or m.get("message_id") or ""))
-                if not contact_summaries:
-                    continue  # 没有摘要则跳过
-                latest_summary = _short(contact_summaries[-1], 120)
-                latest_msg_id = contact_msg_ids[-1] if contact_msg_ids else ""
-                items.append(f"<li><strong>{html.escape(sender)}</strong>（评分 {rating:.1f}）<br><em>核心观点：</em><span class=\"msg-badge\" data-msg-id=\"{html.escape(latest_msg_id)}\">源</span> {html.escape(latest_summary)}</li>")
-            return "<h1>高评分联系人摘要</h1><ol>" + "".join(items) + "</ol>"
+                return "<p>近3天暂无评分≥60分且活跃的联系人。</p>"
+            cards: list[str] = []
+            for idx, c in enumerate(high_contacts[:20], 1):
+                sender = c.get("name") or c.get("alias") or c.get("sender") or c.get("cid")
+                rating = c.get("rating") or 0
+                msg_rows: list[str] = []
+                for msg in c.get("messages", [])[:3]:
+                    summary = _strip_ai_prefix(msg.get("summary") or "")
+                    if not summary:
+                        continue
+                    msg_id = str(msg.get("id") or "")
+                    badge = f"<span class=\"msg-badge\" data-msg-id=\"{html.escape(msg_id)}\">源</span> " if msg_id else ""
+                    msg_rows.append(f"<li>{badge}{html.escape(_short(summary, 120))}</li>")
+                if not msg_rows:
+                    continue
+                cards.append(
+                    f"<section class=\"contact-card\"><div class=\"section-label\">【联系人{idx}】{html.escape(sender)}（评分 {rating:.1f}）</div><ul>{''.join(msg_rows)}</ul></section>"
+                )
+            return "".join(cards)
 
         if "market" in module_filter and not result.get("market_markdown"):
             # 更紧凑：每类最多3条，降低噪声
             orig_fn = _build_market_md
-            def _build_market_md_compact():
-                total = len(enriched_messages)
-                pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
-                neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
-                md = ["# 市场观点总结", f"- 样本数：{total}；正向：{pos}；负向：{neg}"]
-                for name, _ in CAT_RULES:
-                    bucket = [m for m in enriched_messages if name in _match_cats(m)]
-                    if not bucket:
-                        md.append(f"\n## {name}\n- 信息有限")
-                        continue
-                    md.append(f"\n## {name}")
-                    for m in bucket[:3]:
-                        sent = m.get("sender") or m.get("sender_name") or "未知"
-                        ts = m.get("time") or ""
-                        text = _short(m.get("summary") or m.get("content") or "", 120)
-                        tone = m.get("tone") or "neutral"
-                        md.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
-                md.append("\n## 行动建议\n- 聚焦确定性主线，跟踪关键数据点，控制仓位风险。")
-                return "\n".join(md)
+        def _build_market_md_compact():
+            total = len(enriched_messages)
+            pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
+            neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
+            md_lines: list[str] = [f"样本数：{total}；正向：{pos}；负向：{neg}"]
+            topic_idx = 1
+            for name, _ in CAT_RULES:
+                bucket = [m for m in enriched_messages if name in _match_cats(m)]
+                if not bucket:
+                    continue
+                md_lines.append(f"\n【主题{topic_idx}：{name}】")
+                for m in bucket[:3]:
+                    sent = m.get("sender") or m.get("sender_name") or "未知"
+                    ts = m.get("time") or ""
+                    text = _short(m.get("summary") or m.get("content") or "", 120)
+                    tone = m.get("tone") or "neutral"
+                    md_lines.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
+                topic_idx += 1
+            md_lines.append("\n【行动建议】聚焦确定性主线，跟踪关键数据点，控制仓位风险。")
+            return "\n".join(md_lines)
             result["market_markdown"] = _build_market_md_compact()
             result["market_html"] = _build_market_html()
         if "meetings" in module_filter and not result.get("meetings_markdown"):
@@ -1663,26 +1715,21 @@ def _run_summary_local(payload: dict) -> dict:
                         t = _strip_ai_prefix(title)
                         return _short(t, 120)
 
-                    lines: list[str] = ["# 新闻舆情监测"]
-                    lines.append(
-                        f"- 数据概览：共 {len(items)} 条，来源 {len(src_counter)} 家；类别分布：宏观 {cat_counter.get('宏观', 0)}、行业 {cat_counter.get('行业', 0)}、个股 {cat_counter.get('个股', 0)} 条。"
-                    )
+                    lines: list[str] = [
+                        f"数据概览：共 {len(items)} 条，来源 {len(src_counter)} 家；类别分布：宏观 {cat_counter.get('宏观', 0)}、行业 {cat_counter.get('行业', 0)}、个股 {cat_counter.get('个股', 0)} 条。"
+                    ]
                     pos = tone_counter.get("positive", 0)
                     neg = tone_counter.get("negative", 0)
                     neu = tone_counter.get("neutral", 0)
-                    lines.append(f"- 舆情温度：正面 {pos} / 中性 {neu} / 负面 {neg}，仍以{('负面' if neg>pos else '中性' if neu>=pos and neu>=neg else '正面')}为主调。")
+                    lines.append(f"舆情温度：正面 {pos} / 中性 {neu} / 负面 {neg}，仍以{('负面' if neg>pos else '中性' if neu>=pos and neu>=neg else '正面')}为主调。")
 
-                    lines.append("\n## 主题脉络")
                     for idx, (theme, arr) in enumerate(sorted(theme_map.items(), key=lambda kv: len(kv[1]), reverse=True)[:5], start=1):
                         sample = arr[0]
                         srcs = {it.get("source_name") or it.get("source_id") or "未知" for it in arr[:3]}
                         lines.append(
-                            f"{idx}. {theme}（{len(arr)}条，主要来自 {', '.join(srcs)}）：{_clean_title(sample.get('title') or '')}"
+                            f"【新闻主题{idx}】{theme}（{len(arr)}条，主要来自 {', '.join(srcs)}）：{_clean_title(sample.get('title') or '')}"
                         )
-
-                    lines.append("\n## 关注动作")
-                    lines.append("- 结合舆情热点，梳理对交易/仓位的影响，并追踪政策或数据验证节点。")
-                    lines.append("- 对负面舆情较集中的议题，安排快速核实或舆论监测，防范扩散风险。")
+                    lines.append("【关注动作】结合舆情热点，梳理对交易/仓位的影响，并追踪政策或数据验证节点；对负面舆情较集中的议题，安排快速核实或舆论监测，防范扩散风险。")
                     result["newswatch_markdown"] = "\n".join(lines)
             except Exception:
                 pass

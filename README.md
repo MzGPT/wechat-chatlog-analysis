@@ -1,5 +1,7 @@
 % 微信聊天记录分析系统（FastAPI + SQLite + n8n）
 
+版本：**v0.8.0**（见 `VERSION` / `docs/RELEASE_NOTES_v0.8.0.md`）
+
 ![python](https://img.shields.io/badge/python-3.11%2B-blue.svg?logo=python)
 ![fastapi](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)
 ![sqlite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite)
@@ -9,6 +11,13 @@
 - 支持从 chatlog HTTP 服务增量拉取、离线导入目录（可选）
 - 本地 SiliconFlow 接口完成总结与候选回复生成；发送可选对接 n8n/WeChatPadPro
 - 自带极简 UI（`/static/index.html`）便于验收与演示
+
+v0.8.0 重点能力（面向验收）
+- AI 总结：增量摘要缓存（刷新可恢复）+ payload 瘦身降 Token
+- 会议信息：3 列紧凑表格（时间｜平台/会议号｜主题要点），主题仅取摘要 summary 并自动换行
+- 新闻舆情：来源徽标/气泡可点击查看引用来源（消息/新闻），支持按 id 回查
+- 联系人：评分可编辑保存；消息行“顶/踩”可加减分；评分 < 40 自动拉黑（持久化）
+- 黑白名单：支持联系人 + 群聊（talkers）管理；黑名单对象强制不进入微信/邮件列表
 
 预览界面
 
@@ -62,10 +71,11 @@
 - 同步能力：支持 chatlog HTTP 增量/全量拉取
 - 发送通道：集成 WeChatPadPro（HTTP+WS），可扩展 n8n
 - 极简 UI：检索、过滤、总结与群发一体化验收页
- - 邮件引擎：多账户 IMAP 收取 + SMTP 发送，UI 与微信消息对齐
- - 新闻聚合：对接 @newsnow，内嵌其原生页面
- - 自媒体聚合：对接 @folo，以同样的列表风格融合展示
- - 扩展消息：按 langbot 适配器配置生成动态标签页（Telegram/QQ/企微/飞书等）
+- 邮件引擎：多账户 IMAP 收取 + SMTP 发送，UI 与微信消息对齐
+- 新闻聚合：对接 @newsnow，内嵌其原生页面
+- 自媒体聚合：对接 @folo，以同样的列表风格融合展示
+- 扩展消息：按 langbot 适配器配置生成动态标签页（Telegram/QQ/企微/飞书等）
+- （可选）macOS 提醒事项：会议路演“📅 预约”可写入 Reminders（仅 macOS）
 
 目录结构
 app/            FastAPI 应用/路由/服务/模型/配置/模式
@@ -90,10 +100,13 @@ docs/ n8n/      参考文档与示例工作流
 - POST /api/ai/suggest-replies  POST /api/ai/summary
 - POST /api/send
 - POST /api/sync/chatlog
- - 邮件：GET/POST /api/email/accounts，POST /api/email/accounts/{id}/sync，GET /api/email/messages，POST /api/email/send
- - 新闻：GET /api/news/config（前端 iframe 使用）；配置：GET/POST /api/config/newsnow
- - 自媒体：GET /api/folo/posts；配置：GET/POST /api/config/folo
- - 扩展消息：GET/POST /api/extensions/adapters，POST /api/extensions/adapters/{key}/ingest，GET /api/extensions/messages?adapter_key=xxx；配置：GET/POST /api/config/extensions
+- 邮件：GET/POST /api/email/accounts，POST /api/email/accounts/{id}/sync，GET /api/email/messages，POST /api/email/send
+- 新闻：GET /api/news/config（前端 iframe 使用）；配置：GET/POST /api/config/newsnow
+- 新闻回查：GET /api/newsfeed/by-ids?ids=...
+- 自媒体：GET /api/folo/posts；配置：GET/POST /api/config/folo
+- 黑/白名单：GET/POST /api/filters
+- （可选）提醒事项：POST /api/tools/reminders/add
+- 扩展消息：GET/POST /api/extensions/adapters，POST /api/extensions/adapters/{key}/ingest，GET /api/extensions/messages?adapter_key=xxx；配置：GET/POST /api/config/extensions
 
 开发与调试
 - 热重载：bash scripts/manage.sh dev 或 uvicorn app.main:app --reload

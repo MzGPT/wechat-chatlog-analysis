@@ -86,16 +86,23 @@ def _message_to_dict(msg: Message) -> Dict[str, Any]:
 def _email_to_dict(em: EmailMessage) -> Dict[str, Any]:
     ts = em.sent_at.isoformat() if em.sent_at else None
     # 为总结准备尽量完整的文本（标题/发件人/正文），同时标明频道
+    # 调整策略：将主题放在末尾，避免 LLM 直接摘抄作为摘要首句
     lines: list[str] = []
-    if em.subject:
-        lines.append(f"主题: {em.subject}")
-    if em.from_addr:
-        lines.append(f"发件人: {em.from_addr}")
-    if em.snippet:
-        lines.append(f"摘要片段: {em.snippet}")
+    
+    # 优先放入正文和摘要片段
     body = (em.body_text or "").strip()
     if body:
-        lines.append(f"正文: {body}")
+        lines.append(f"{body}")
+    elif em.snippet:
+        lines.append(f"摘要片段: {em.snippet}")
+        
+    lines.append("")
+    lines.append("--- 辅助信息 ---")
+    if em.from_addr:
+        lines.append(f"发件人: {em.from_addr}")
+    if em.subject:
+        lines.append(f"邮件主题: {em.subject}")
+        
     text = "\n".join(lines).strip()
     return {
         "channel": "email",

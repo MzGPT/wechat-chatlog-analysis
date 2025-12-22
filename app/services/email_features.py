@@ -136,6 +136,88 @@ def _build_summary(text: str) -> str:
     return "；".join(dedup)[:100]
 
 
+def _extract_field(pattern: str, text: str) -> str:
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+    return (m.group(1) if m else "").strip()
+
+
+def _extract_block(text: str, labels: List[str]) -> str:
+    """Extract a block after keywords like 摘要/要点/主题/观点.
+    Stops when hitting the next metadata label to avoid dragging尾字段."""
+    if not text:
+        return ""
+    stop_tokens = [
+        "内部预约人", "预约人", "券商研究员", "分析师", "会议链接", "会议号",
+        "路演方式", "路演类型", "路演平台", "位置", "时间", "联系人",
+    ]
+    pattern = r"(?:" + "|".join(re.escape(lbl) for lbl in labels) + r")[：:]\s*([\s\S]{4,400}?)\s*(?:" + "|".join(re.escape(st) for st in stop_tokens) + r"|$)"
+    m = re.search(pattern, text)
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(1)).strip()
+
+
+def _shorten_time_text(value: str) -> str:
+    if not value:
+        return ""
+    t = value.strip()
+    replacements = {
+        "年": "/",
+        "月": "/",
+        "日": " ",
+        "号": " ",
+        "上": " ",
+        "下": " ",
+    }
+    for src, dst in replacements.items():
+        t = t.replace(src, dst)
+    t = t.replace("--", "-")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def _compose_summary_body(
+    *,
+    appointment_time: str,
+    platform: str,
+    meeting_number: str,
+    core: str,
+    organizer: str,
+    analyst: str,
+) -> str:
+    parts: List[str] = []
+    time_seg = _shorten_time_text(appointment_time)
+    if time_seg:
+        parts.append(time_seg)
+    prefix = " ".join(p for p in [platform, meeting_number] if p).strip()
+    if prefix:
+        parts.append(prefix)
+    if core:
+        parts.append(core.strip())
+    if organizer:
+        parts.append(f"内部:{organizer.strip()}")
+    if analyst:
+        parts.append(f"研究:{analyst.strip()}")
+    cleaned = [seg for seg in parts if seg]
+    return " | ".join(cleaned).strip()
+
+
+def _extract_time_window(text: str) -> str:
+    if not text:
+        return ""
+    patterns = [
+        r"(20\d{2}[年/\-]\d{1,2}[月/\-]\d{1,2}[日号]?\s*\d{1,2}:\d{2}(?:\s*[\-~]\s*\d{1,2}:\d{2})?)",
+        r"(\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2}(?:\s*[\-~]\s*\d{1,2}:\d{2})?)",
+        r"(\d{1,2}/\d{1,2}\s*\d{1,2}:\d{2}(?:\s*[\-~]\s*\d{1,2}:\d{2})?)",
+        r"(\d{1,2}:\d{2}\s*[\-~]\s*\d{1,2}:\d{2})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def build_email_features(items: List[dict]) -> Dict[str, dict]:
     if not items:
         return {}
@@ -254,10 +336,6 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
                 return _only_digits(g)
         return ""
 
-    def _extract(field_pattern: str, text: str) -> str:
-        m = re.search(field_pattern, text, flags=re.IGNORECASE)
-        return (m.group(1) if m else "").strip()
-
     for item in items:
         mid = str(item.get('id')) if item.get('id') is not None else ''
         if not mid:
@@ -266,7 +344,7 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         raw_text = base.get('raw_text', '')
         feat = features.get(mid, {}).copy() if isinstance(features, dict) else {}
 
-        meeting_link = feat.get('meeting_link') or _extract(r"会议链接[:：]?\s*(https?://\S+)", raw_text)
+        meeting_link = feat.get('meeting_link') or _extract_field(r"会议链接[:：]?\s*(https?://\S+)", raw_text)
         if not meeting_link:
             link_match = re.search(r"https?://\S+", raw_text)
             meeting_link = link_match.group(0) if link_match else ''
@@ -277,29 +355,19 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
             if repl:
                 meeting_number = repl
 
-        appointment_time = feat.get('appointment_time') or ''
-        if not appointment_time:
-            for pattern in [
-                r"\b(20\d{2}[/-]\d{1,2}[/-]\d{1,2}\s+\d{1,2}:\d{2})\b",
-                r"\b(\d{1,2}-\d{1,2}\s*\d{1,2}:\d{2})\b",
-                r"(\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2})",
-            ]:
-                m = re.search(pattern, raw_text)
-                if m:
-                    appointment_time = m.group(1)
-                    break
+        appointment_time = feat.get('appointment_time') or _extract_time_window(raw_text)
 
-        analyst = feat.get('analyst') or feat.get('researcher') or _extract(r"(?:券商研究员|分析师)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
-        organizer = feat.get('organizer') or _extract(r"(?:内部预约人|预约人)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
+        analyst = feat.get('analyst') or feat.get('researcher') or _extract_field(r"(?:券商研究员|分析师)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
+        organizer = feat.get('organizer') or _extract_field(r"(?:内部预约人|预约人)[:：]\s*([^\s;|，。\n]{1,20})", raw_text)
 
         # main_point：优先使用工具产出（若将来提供），否则从正文提取“观点/主题”段；最后才回退到标题
-        main_point = feat.get('main_point')
+        main_point = feat.get('main_point') or _extract_block(raw_text, ['观点', '主题'])
         if not main_point:
-            match = re.search(r"(?:观点|主题)[:：]\s*([\s\S]{4,400}?)\s*(?:内部预约人|预约人|券商研究员|分析师|会议链接|会议号|时间|路演|路演类型|路演方式|重点关注|重点|$)", raw_text)
-            if match:
-                main_point = re.sub(r"\s+", " ", match.group(1)).strip()
+            main_point = _extract_block(raw_text, ['摘要', '要点', '核心观点'])
         if not main_point:
-            main_point = base.get('subject', '')
+            cleaned_text = re.sub(r"主题[:：].*?(?:\n|$)", "", raw_text, flags=re.IGNORECASE).strip()
+            if cleaned_text:
+                main_point = cleaned_text[:120]
 
         # 长摘要：严格基于正文构建，避免标题复读
         summary_full = feat.get('summary_full') or _build_summary(raw_text) or main_point or ''
@@ -315,34 +383,35 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         # 两段式：产出 summary（短）与 key_info；其余字段尽量补齐
         # 修复：当工具已给出 summary 时，必须直接使用工具的摘要，避免回退到标题导致“标题 + 摘要重复标题”的问题。
         tool_summary = (feat.get('summary') or '').strip()
+        detected_platform = feat.get('platform') or feat.get('meeting_platform') or _infer_platform(raw_text)
+        summary_value = (summary_short or _build_summary(raw_text) or main_point or raw_text[:50]).strip()
         if tool_summary:
-            # 将平台与会议号前置到摘要中：ai: <platform> <number> <body>
             body = re.sub(r'^\s*ai:\s*', '', tool_summary, flags=re.IGNORECASE).strip()
-            detected_platform = feat.get('platform') or feat.get('meeting_platform') or _infer_platform(raw_text)
-            prefix_parts = []
-            if detected_platform:
-                prefix_parts.append(detected_platform)
-            if meeting_number:
-                prefix_parts.append(meeting_number)
-            prefix = ' '.join(prefix_parts).strip()
-            summary_text = f"ai: {prefix} {body}".strip() if prefix else f"ai: {body}"
+            summary_body = _compose_summary_body(
+                appointment_time=appointment_time,
+                platform=detected_platform,
+                meeting_number=meeting_number,
+                core=body,
+                organizer=organizer,
+                analyst=analyst,
+            ) or body
+            summary_text = f"ai: {summary_body}".strip()
             summary_origin = 'tool'
         else:
-            # 仅在无工具摘要时，才基于正文提炼简短显示
-            summary_value = (summary_short or _build_summary(raw_text) or main_point or raw_text[:50]).strip()
-            detected_platform = feat.get('platform') or feat.get('meeting_platform') or _infer_platform(raw_text)
-            prefix_parts = []
-            if detected_platform:
-                prefix_parts.append(detected_platform)
-            if meeting_number:
-                prefix_parts.append(meeting_number)
-            prefix = ' '.join(prefix_parts).strip()
-            summary_text = f"fallback: {prefix} {summary_value}".strip() if prefix else (f"fallback: {summary_value}" if summary_value else 'fallback:')
+            summary_body = _compose_summary_body(
+                appointment_time=appointment_time,
+                platform=detected_platform,
+                meeting_number=meeting_number,
+                core=main_point or summary_value,
+                organizer=organizer,
+                analyst=analyst,
+            ) or summary_value
+            summary_text = f"fallback: {summary_body}".strip()
             summary_origin = 'fallback'
 
         # key_info：优先基于工具摘要（去掉前缀）或正文提炼要点，避免直接使用标题
         key_info_body = re.sub(r'^\s*(ai:|fallback:)\s*', '', summary_text, flags=re.IGNORECASE).strip()
-        key_info_src = feat.get('key_info') or key_info_body or main_point or raw_text[:50]
+        key_info_src = feat.get('key_info') or key_info_body or main_point or summary_value or raw_text[:50]
         key_info = (key_info_src or '').strip()[:30]
         key_info_origin = 'tool' if feat.get('key_info') or tool_summary else 'fallback'
 
@@ -425,6 +494,12 @@ def build_email_fallback_features(items: List[dict]) -> Dict[str, dict]:
         meeting_digits = re.sub(r"\D", "", meeting_raw)
         meeting_number = meeting_digits if 9 <= len(meeting_digits) <= 13 else ''
         platform = _infer_platform(text)
+        appointment_time = _extract_time_window(text)
+        organizer = _extract_field(r"(?:内部预约人|预约人)[:：]\s*([^\s;|，。\n]{1,20})", text)
+        analyst = _extract_field(r"(?:券商研究员|分析师)[:：]\s*([^\s;|，。\n]{1,20})", text)
+        main_point = _extract_block(text, ['观点', '主题']) or _extract_block(text, ['摘要', '要点'])
+        if not main_point and subject:
+            main_point = subject
         # key_info
         key_info_src = ''
         # prefer explicit 观点/主题 段落
@@ -460,13 +535,24 @@ def build_email_fallback_features(items: List[dict]) -> Dict[str, dict]:
         key_info = _clip_vis(key_info_src, 30)
         # summary (短)
         summ_src = _build_summary(text) or key_info_src
-        summary = f"fallback: {_clip_vis(summ_src, 50)}"
+        summary_body = _compose_summary_body(
+            appointment_time=appointment_time,
+            platform=platform,
+            meeting_number=meeting_number,
+            core=main_point or summ_src,
+            organizer=organizer,
+            analyst=analyst,
+        ) or _clip_vis(summ_src, 50)
+        summary = f"fallback: {_clip_vis(summary_body, 80)}"
         results[mid] = {
             'meeting_number': meeting_number,
             'platform': platform,
             'key_info': key_info,
             'summary': summary,
             'summary_origin': 'fallback',
+            'appointment_time': appointment_time,
+            'organizer': organizer,
+            'analyst': analyst,
         }
     return results
 
