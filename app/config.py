@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     SILICONFLOW_API_URL: str | None = "https://api.siliconflow.cn/v1"
     SILICONFLOW_MODEL: str | None = "Qwen/Qwen3-30B-A3B"
     SILICONFLOW_TOOL_MODEL: str | None = "Qwen/Qwen3-8B"
+    AI_MAX_PARALLEL: int = 3
 
     # WeChatPadPro
     WECHATPAD_HTTP_BASE: str | None = None  # e.g., http://60.205.58.39:1238
@@ -39,8 +40,6 @@ class Settings(BaseSettings):
     # Extensions / Adapters
     LANGBOT_ADAPTER_LOG_DIR: str | None = None  # e.g., ./data/adapters
 
-    # Microsoft OAuth for Outlook/Hotmail
-    MS_CLIENT_ID: str | None = None
     MS_TENANT: str | None = "consumers"  # common/organizations/consumers
 
     # NewsNow aggregation (server on :4445)
@@ -51,6 +50,9 @@ class Settings(BaseSettings):
     NEWSNOW_REFRESH_INTERVAL_SECONDS: int | None = Field(default=3600)  # 0 = disabled (manual only)
     # 每3小时写入一次新闻舆情底层快照（datasets JSON）
     NEWS_SNAPSHOT_INTERVAL_SECONDS: int | None = Field(default=10800)
+
+    # Optional: MediaCrawlerPro server base (meeting recorder controls proxy)
+    MEDIA_SERVER_BASE: str | None = None
 
     class Config:
         env_file = ".env"

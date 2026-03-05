@@ -1,4 +1,4 @@
-% 微信聊天记录分析系统（FastAPI + SQLite + n8n）
+% 信息聚合AI系统（FastAPI + SQLite + AI）
 
 版本：**v0.8.0**（见 `VERSION` / `docs/RELEASE_NOTES_v0.8.0.md`）
 
@@ -6,11 +6,11 @@
 ![fastapi](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)
 ![sqlite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite)
 
-一个面向“聊天记录检索 + AI 总结 + 自动发送”的最小可用后端：
+一个面向“多源信息聚合 + 检索过滤 + AI 总结 + 自动发送”的本地优先系统：
 - FastAPI + SQLite(FTS5) 提供高效存储与全文检索
-- 支持从 chatlog HTTP 服务增量拉取、离线导入目录（可选）
-- 本地 SiliconFlow 接口完成总结与候选回复生成；发送可选对接 n8n/WeChatPadPro
-- 自带极简 UI（`/static/index.html`）便于验收与演示
+- 支持从 chatlog HTTP 服务增量拉取微信消息；支持邮件、多媒体、自媒体、公众号、会议纪要等多源聚合
+- 本地 SiliconFlow 接口完成总结/摘要/候选回复生成；发送通道可对接 LangBot 网关/WeChatPadPro/n8n
+- 自带极简 UI（`/static/index.html`）：数据看板、AI 总结、聚合列表、发送管理、功能设置等一体化
 
 v0.8.0 重点能力（面向验收）
 - AI 总结：增量摘要缓存（刷新可恢复）+ payload 瘦身降 Token
@@ -19,17 +19,16 @@ v0.8.0 重点能力（面向验收）
 - 联系人：评分可编辑保存；消息行“顶/踩”可加减分；评分 < 40 自动拉黑（持久化）
 - 黑白名单：支持联系人 + 群聊（talkers）管理；黑名单对象强制不进入微信/邮件列表
 
-预览界面
+预览界面（示例截图，已脱敏）
 
-![Preview](static/preview.png)
+![Preview](docs/assets/screenshots/01-ai-summary-light.jpg)
 
-更多截图
+更多截图（建议查看 `docs/SCREENSHOTS.md`）
 
-![UI-Search](static/ui-search.png)
-![API-Docs](static/ui-docs.png)
-![Health](static/ui-health.png)
-![Messages](static/ui-messages.png)
-![AI-Summary](static/ui-summary.png)
+![WeChat](docs/assets/screenshots/03-wechat-light.jpg)
+![Email](docs/assets/screenshots/04-email-light.jpg)
+![Media](docs/assets/screenshots/06-media-light.jpg)
+![MP](docs/assets/screenshots/07-mp-light.jpg)
 
 目录导航
 - 快速开始
@@ -39,6 +38,7 @@ v0.8.0 重点能力（面向验收）
 - 常用 API
 - 开发与调试
 - 安全与发布建议
+ - 文档与截图
 
 快速开始
 1) 初始化环境变量
@@ -74,6 +74,9 @@ v0.8.0 重点能力（面向验收）
 - 邮件引擎：多账户 IMAP 收取 + SMTP 发送，UI 与微信消息对齐
 - 新闻聚合：对接 @newsnow，内嵌其原生页面
 - 自媒体聚合：对接 @folo，以同样的列表风格融合展示
+- 自媒体聚合（MediaCrawlerPro）：读取本地 `MediaCrawlerPro-Python` 落盘数据并以紧凑表格展示（支持跳转链接）
+- 公众号聚合（we-mp-rss）：读取本地 `we-mp-rss` SQLite（含 insight summary）并以紧凑表格展示（支持展开详情）
+- 纪要聚合增强：合并展示本项目 minutes + MediaCrawlerPro meeting_records（支持音频下载）
 - 扩展消息：按 langbot 适配器配置生成动态标签页（Telegram/QQ/企微/飞书等）
 - （可选）macOS 提醒事项：会议路演“📅 预约”可写入 Reminders（仅 macOS）
 
@@ -89,6 +92,9 @@ docs/ n8n/      参考文档与示例工作流
 - CHATLOG_DIR：本地聊天目录，用于离线导入（可留空）
 - N8N_REPLY_WEBHOOK / N8N_SUMMARY_WEBHOOK / N8N_CONTACT_WEBHOOK / N8N_SEND_WEBHOOK / N8N_AUTH_TOKEN
 - DATABASE_URL：默认 sqlite:///./data/app.db
+- MEDIA_PROJECT_DIR：MediaCrawlerPro-Python 项目根目录（缺省尝试同级目录 `../MediaCrawlerPro-Python`）
+- MEDIA_SERVER_BASE：MediaCrawlerPro 后端地址（用于会议录音“监听/停止”等控制代理），示例 `http://127.0.0.1:8001`
+- WE_MP_RSS_DIR / WE_MP_RSS_DB：we-mp-rss 项目目录或 SQLite 路径（缺省尝试 `../we-mp-rss/data/db.db`）
 
 常用 API（节选）
 - GET /api/health
@@ -104,6 +110,9 @@ docs/ n8n/      参考文档与示例工作流
 - 新闻：GET /api/news/config（前端 iframe 使用）；配置：GET/POST /api/config/newsnow
 - 新闻回查：GET /api/newsfeed/by-ids?ids=...
 - 自媒体：GET /api/folo/posts；配置：GET/POST /api/config/folo
+- MediaCrawlerPro：GET /api/media/items，GET /api/media/meeting-records，GET /api/media/meeting/audio/{record_id}
+- we-mp-rss：GET /api/mp/articles，GET /api/mp/articles/{article_id}?include_content=true
+- 任务：GET /api/tasks，GET /api/tasks/{id}
 - 黑/白名单：GET/POST /api/filters
 - （可选）提醒事项：POST /api/tools/reminders/add
 - 扩展消息：GET/POST /api/extensions/adapters，POST /api/extensions/adapters/{key}/ingest，GET /api/extensions/messages?adapter_key=xxx；配置：GET/POST /api/config/extensions
@@ -125,3 +134,10 @@ docs/ n8n/      参考文档与示例工作流
 
 致谢
 本项目基于 FastAPI/Starlette/SQLite 等优秀组件构建，感谢开源社区。
+
+文档与截图
+- 功能总览：`docs/OVERVIEW.md`
+- 模块说明：`docs/MODULES.md`
+- 配置与集成：`docs/INTEGRATIONS.md`
+- 架构说明：`docs/ARCHITECTURE.md`
+- 截图集：`docs/SCREENSHOTS.md`

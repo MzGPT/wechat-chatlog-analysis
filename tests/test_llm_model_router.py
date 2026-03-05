@@ -1,0 +1,213 @@
+import os
+import sys
+
+import requests
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import app.services.llm_client as llm_client
+from app.services.llm_client import _MODEL_ROUTER_COUNTERS, resolve_chat_target, resolve_chat_targets
+
+
+def test_router_disabled_falls_back_to_default_model():
+    conf = {
+        "api_url": "https://example.com/v1",
+        "api_key": "k-default",
+        "model": "main-default",
+        "tool_model": "tool-default",
+        "model_router": {"enabled": False},
+    }
+    target = resolve_chat_target(conf, route_kind="main", route_key="market", model_override=None)
+    assert target["model"] == "main-default"
+    assert target["channel_id"] is None
+    assert target["api_url"] == "https://example.com/v1"
+    assert target["api_key"] == "k-default"
+
+
+def test_router_prefers_mapped_channel_when_enabled():
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "main-default",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "main_channels": [
+                {"id": "main-a", "model": "model-a", "weight": 1, "enabled": True},
+                {"id": "main-b", "model": "model-b", "weight": 1, "enabled": True, "api_url": "https://b.example/v1", "api_key": "b-key"},
+            ],
+            "main_module_channels": {"market": ["main-b"], "default": ["main-a"]},
+        },
+    }
+    target = resolve_chat_target(conf, route_kind="main", route_key="market", model_override="manual-model")
+    assert target["channel_id"] == "main-b"
+    assert target["model"] == "model-b"
+    assert target["api_url"] == "https://b.example/v1"
+    assert target["api_key"] == "b-key"
+
+
+def test_router_honors_manual_override_when_prefer_router_disabled():
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "main-default",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": False,
+            "main_channels": [{"id": "main-a", "model": "model-a", "weight": 1, "enabled": True}],
+            "main_module_channels": {"default": ["main-a"]},
+        },
+    }
+    target = resolve_chat_target(conf, route_kind="main", route_key="market", model_override="manual-model")
+    assert target["channel_id"] is None
+    assert target["model"] == "manual-model"
+    assert target["api_url"] == "https://base.example/v1"
+
+
+def test_router_weighted_round_robin_sequence():
+    _MODEL_ROUTER_COUNTERS.clear()
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "tool_model": "tool-default",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "tool_channels": [
+                {"id": "tool-a", "model": "tool-model-a", "weight": 1, "enabled": True},
+                {"id": "tool-b", "model": "tool-model-b", "weight": 2, "enabled": True},
+            ],
+            "tool_route_channels": {"messages": ["tool-a", "tool-b"], "default": ["tool-a"]},
+        },
+    }
+
+    seq = []
+    for _ in range(6):
+        target = resolve_chat_target(conf, route_kind="tool", route_key="messages", model_override=None)
+        seq.append(target["channel_id"])
+    assert seq == ["tool-a", "tool-b", "tool-b", "tool-a", "tool-b", "tool-b"]
+
+
+def test_router_returns_ordered_fallback_targets():
+    _MODEL_ROUTER_COUNTERS.clear()
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "main-default",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "main_channels": [
+                {"id": "main-a", "model": "model-a", "weight": 2, "enabled": True, "api_url": "https://a.example/v1", "api_key": "ka"},
+                {"id": "main-b", "model": "model-b", "weight": 1, "enabled": True, "api_url": "https://b.example/v1", "api_key": "kb"},
+            ],
+            "main_module_channels": {"market": ["main-a", "main-b"], "default": ["main-a"]},
+        },
+    }
+    targets = resolve_chat_targets(conf, route_kind="main", route_key="market", model_override=None)
+    assert len(targets) >= 2
+    assert targets[0]["channel_id"] in {"main-a", "main-b"}
+    # all mapped channels should be included for fallback
+    got_ids = [t.get("channel_id") for t in targets if t.get("channel_id")]
+    assert set(got_ids) == {"main-a", "main-b"}
+    # base default should be included as final fallback
+    assert targets[-1]["channel_id"] is None
+    assert targets[-1]["model"] == "main-default"
+
+
+class _FakeResponse:
+    def __init__(self, content: str, status_code: int = 200):
+        self._content = content
+        self.status_code = status_code
+        self.headers = {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status={self.status_code}")
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def test_siliconflow_chat_falls_back_to_next_channel(monkeypatch):
+    _MODEL_ROUTER_COUNTERS.clear()
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "base-model",
+        "max_tokens": 1024,
+        "model_temperature": 0.3,
+        "http_timeout": 5,
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "main_channels": [
+                {"id": "m1", "model": "model-1", "weight": 1, "enabled": True, "api_url": "https://m1.example/v1", "api_key": "k1"},
+                {"id": "m2", "model": "model-2", "weight": 1, "enabled": True, "api_url": "https://m2.example/v1", "api_key": "k2"},
+            ],
+            "main_module_channels": {"market": ["m1", "m2"], "default": ["m1"]},
+        },
+    }
+    monkeypatch.setattr(llm_client, "load_ai_config", lambda: conf)
+    calls: list[str] = []
+
+    def _fake_post(url, headers, payload, timeout=180):  # noqa: ARG001
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.RequestException("first route failed")
+        return _FakeResponse("ok-from-fallback")
+
+    monkeypatch.setattr(llm_client, "_post_with_backoff", _fake_post)
+    out = llm_client.siliconflow_chat(
+        [{"role": "user", "content": "ping"}],
+        route_kind="main",
+        route_key="market",
+    )
+    assert out == "ok-from-fallback"
+    assert len(calls) >= 2
+    assert calls[0].startswith("https://m1.example/v1")
+    assert calls[1].startswith("https://m2.example/v1")
+
+
+def test_siliconflow_chat_sets_openrouter_headers(monkeypatch):
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "base-model",
+        "max_tokens": 1024,
+        "model_temperature": 0.3,
+        "http_timeout": 5,
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "main_channels": [
+                {
+                    "id": "openrouter-1",
+                    "model": "stepfun/step-3.5-flash:free",
+                    "weight": 1,
+                    "enabled": True,
+                    "api_url": "https://openrouter.ai/api/v1",
+                    "api_key": "k-openrouter",
+                }
+            ],
+            "main_module_channels": {"market": ["openrouter-1"], "default": ["openrouter-1"]},
+        },
+    }
+    monkeypatch.setattr(llm_client, "load_ai_config", lambda: conf)
+    captured_headers = {}
+
+    def _fake_post(url, headers, payload, timeout=180):  # noqa: ARG001
+        captured_headers.update(headers)
+        return _FakeResponse("ok-openrouter")
+
+    monkeypatch.setattr(llm_client, "_post_with_backoff", _fake_post)
+    out = llm_client.siliconflow_chat(
+        [{"role": "user", "content": "ping"}],
+        route_kind="main",
+        route_key="market",
+    )
+    assert out == "ok-openrouter"
+    assert captured_headers.get("HTTP-Referer") == "https://localhost"
+    assert captured_headers.get("X-Title") == "Dr.Lemon Information Aggregation AI"

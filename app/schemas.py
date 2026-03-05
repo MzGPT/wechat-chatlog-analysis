@@ -43,6 +43,10 @@ class ContactOut(BaseModel):
         from_attributes = True
 
 
+class ContactsLookupRequest(BaseModel):
+    ids: List[str]
+
+
 class ChatOut(BaseModel):
     id: str
     title: Optional[str]

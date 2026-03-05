@@ -166,15 +166,27 @@ def summarize_news(payload: dict = Body(default={})):  # accepts JSON body { ids
         out = siliconflow_chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
-        ], temperature=temp)
-        # 希望返回 {markdown: string}
+        ], temperature=temp, route_kind="main", route_key="newswatch")
+        # 希望返回 {markdown: string, quant?: object}
         md = out
+        q_md = ""
         try:
             j = _json.loads(out)
-            if isinstance(j, dict) and 'markdown' in j:
-                md = j.get('markdown') or md
+            if isinstance(j, dict):
+                if 'markdown' in j:
+                    md = j.get('markdown') or md
+                if 'quant' in j:
+                    try:
+                        from ..services.quant_analysis import normalize_quant, render_quant_section_markdown
+
+                        q_norm = normalize_quant(j.get("quant") if isinstance(j.get("quant"), dict) else None)
+                        q_md = render_quant_section_markdown(q_norm, module="newswatch")
+                    except Exception:
+                        q_md = ""
         except Exception:
             pass
+        if q_md and isinstance(md, str) and md.strip():
+            md = md.rstrip() + "\n\n" + q_md
         # 保存数据集到 datasets 目录
         try:
             import os, time

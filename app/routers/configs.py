@@ -7,6 +7,7 @@ from ..models import SyncState
 import json
 from ..config import settings
 import requests
+import os
 
 
 router = APIRouter(prefix="/api", tags=["config"])
@@ -197,17 +198,74 @@ def set_folo_config(payload: dict, db: Session = Depends(_get_db)):
     return {"status": "ok"}
 
 
+@router.get("/config/media")
+def get_media_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "media_config")
+
+
+@router.post("/config/media")
+def set_media_config(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "media_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/config/mp")
+def get_mp_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "mp_config")
+
+
+@router.post("/config/mp")
+def set_mp_config(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "mp_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.get("/config/minutes")
+def get_minutes_config(db: Session = Depends(_get_db)):
+    return _get_json_obj(db, "minutes_config")
+
+
+@router.post("/config/minutes")
+def set_minutes_config(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    _set_json_obj(db, "minutes_config", payload)
+    db.commit()
+    return {"status": "ok"}
+
+
 @router.get("/config/extensions")
 def get_extensions_config(db: Session = Depends(_get_db)):
-    return _get_json_obj(db, "extensions_config")
+    cfg = _get_json_obj(db, "extensions_config")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    # Convenience: surface a sensible default when user hasn't configured a log dir yet.
+    if not (str(cfg.get("langbot_log_dir") or "").strip()):
+        for candidate in ("../LangBot/docker/data/logs", "../LangBot/data/logs"):
+            if os.path.isdir(candidate):
+                cfg = {**cfg, "langbot_log_dir": candidate}
+                break
+    return cfg
 
 
 @router.post("/config/extensions")
 def set_extensions_config(payload: dict, db: Session = Depends(_get_db)):
-    # expected: { langbot_log_dir?: str, enabled_adapters?: [str] }
+    # expected (merged into existing): { langbot_log_dir?: str, ... }
     if not isinstance(payload, dict):
         raise HTTPException(400, "invalid payload")
-    _set_json_obj(db, "extensions_config", payload)
+    existing = _get_json_obj(db, "extensions_config")
+    existing = existing if isinstance(existing, dict) else {}
+    for k, v in payload.items():
+        if v is None:
+            existing.pop(k, None)
+        else:
+            existing[k] = v
+    _set_json_obj(db, "extensions_config", existing)
     db.commit()
     return {"status": "ok"}
 

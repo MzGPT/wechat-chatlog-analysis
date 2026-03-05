@@ -7,10 +7,10 @@ from .config import settings
 from .db import SessionLocal
 from .services.sync_service import sync_from_chatlog
 from .services.email_engine import imap_fetch, FetchOptions
-from .services.ms_graph import fetch_messages_graph, refresh_token
 from .models import EmailAccount, ExtAdapter
 from .services.ext_adapter_service import ingest_adapter_logs
 from .services import news_client
+from .services.wechat8061_sync import wechat8061_sync_loop
 
 
 async def _sync_loop():
@@ -70,26 +70,7 @@ async def _email_loop():
                 accounts = db.query(EmailAccount).filter(EmailAccount.enabled == True).all()  # noqa
                 for acc in accounts:
                     try:
-                        prov = (acc.provider or "").lower()
-                        oauth = (acc.auth or {}).get("oauth") if acc.auth else None
-                        if prov in ("outlook", "office365", "hotmail") and oauth and oauth.get("access_token"):
-                            try:
-                                fetch_messages_graph(db, acc, oauth.get("access_token"), top=50)
-                            except Exception:
-                                # best-effort refresh then retry once
-                                try:
-                                    if oauth.get("refresh_token"):
-                                        new_tok = refresh_token(oauth.get("refresh_token"))
-                                        auth = acc.auth or {}
-                                        auth["oauth"] = new_tok
-                                        acc.auth = auth
-                                        db.add(acc)
-                                        db.flush()
-                                        fetch_messages_graph(db, acc, new_tok.get("access_token"), top=50)
-                                except Exception:
-                                    pass
-                        else:
-                            imap_fetch(db, acc, FetchOptions(limit=50, unseen_only=True))
+                        imap_fetch(db, acc, FetchOptions(limit=50, unseen_only=True))
                     except Exception:
                         pass
                 db.commit()
@@ -110,13 +91,13 @@ async def _ext_adapter_loop():
         try:
             db = SessionLocal()
             try:
-                adapters = db.query(ExtAdapter).filter(ExtAdapter.enabled == True).all()  # noqa
-                for a in adapters:
-                    try:
-                        ingest_adapter_logs(db, a, a.config.get("log_dir") or base_dir)
-                    except Exception:
-                        pass
-                db.commit()
+	                adapters = db.query(ExtAdapter).filter(ExtAdapter.enabled == True).all()  # noqa
+	                for a in adapters:
+	                    try:
+	                        ingest_adapter_logs(db, a, a.config.get("log_dir") or base_dir, since=None)
+	                    except Exception:
+	                        pass
+	                db.commit()
             finally:
                 db.close()
         except Exception:
@@ -132,16 +113,16 @@ async def _news_loop():
         try:
             # Trigger upstream refresh and warm local caches
             try:
-                news_client.newsnow_refresh()
+                await asyncio.to_thread(news_client.newsnow_refresh)
             except Exception:
                 pass
             try:
-                news_client.newsnow_sources(force=True)
+                await asyncio.to_thread(news_client.newsnow_sources, force=True)
             except Exception:
                 pass
             try:
                 # warm a small slice
-                news_client.newsnow_news(limit=20, simple=True)
+                await asyncio.to_thread(news_client.newsnow_news, limit=20, simple=True)
             except Exception:
                 pass
         except Exception:
@@ -164,12 +145,12 @@ async def _news_snapshot_loop():
         try:
             # Best-effort: collect and persist a fresh snapshot
             try:
-                news_client.write_news_snapshot(limit=200)
+                await asyncio.to_thread(news_client.write_news_snapshot, limit=200)
             except Exception:
                 pass
             # Optionally warm aggregation cache for UI consumption
             try:
-                news_client.direct_from_sources_json(limit=50)
+                await asyncio.to_thread(news_client.direct_from_sources_json, limit=50)
             except Exception:
                 pass
         except Exception:
@@ -183,6 +164,8 @@ def install_background(app: FastAPI):
         interval = int(settings.__dict__.get("SYNC_INTERVAL_SECONDS", 0) or 0)
         if interval and interval > 0:
             asyncio.create_task(_sync_loop())
+        # Optional: wechat8061 message sync (controlled by ai_config.json wechatpad_sync_enabled)
+        asyncio.create_task(wechat8061_sync_loop())
         # 邮件同步改为“仅手动触发”，不再定时自动拉取
         # 如需恢复定时，请显式改回并确保 EMAIL_SYNC_INTERVAL_SECONDS > 0
         # email_interval = int(settings.__dict__.get("EMAIL_SYNC_INTERVAL_SECONDS", 0) or 0)

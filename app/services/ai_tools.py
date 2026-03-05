@@ -91,6 +91,7 @@ def extract_message_features(
     *,
     prompt_key: str = "message_summary",
     model_override: str | None = None,
+    route_key: str | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """逐条调用小模型提取特征（不再批处理）"""
 
@@ -124,7 +125,12 @@ def extract_message_features(
         try:
             # 构造单条消息的 prompt（包装成数组以兼容现有格式）
             prompt = _tool_prompt_payload([single_msg], tool_prompt_conf)
-            content = siliconflow_tool_chat(prompt, temperature=temperature, model_override=model_override)
+            content = siliconflow_tool_chat(
+                prompt,
+                temperature=temperature,
+                model_override=model_override,
+                route_key=route_key,
+            )
             
             if not content or not isinstance(content, str):
                 raise ValueError(f"API返回为空或非字符串: {type(content)}")
@@ -258,6 +264,19 @@ def extract_message_features(
                     summary = "ai: 信息有限"
             if not summary.lower().startswith("ai:"):
                 summary = f"ai: {summary}"
+
+            # Optional: refined minutes / structured transcript
+            refined = ""
+            try:
+                refined = str(
+                    item.get("refined")
+                    or item.get("content_refined")
+                    or item.get("refined_content")
+                    or item.get("minutes_refined")
+                    or ""
+                ).strip()
+            except Exception:
+                refined = ""
             
             # 禁止截断tool派生的文字，不设文字上限
             
@@ -268,7 +287,7 @@ def extract_message_features(
             
             # tone 标准化（支持新增的 meeting 类型）
             tone = str(item.get("tone") or "neutral").lower()
-            allowed_tones = {"bullish", "bearish", "neutral", "meeting"}
+            allowed_tones = {"bullish", "bearish", "neutral", "meeting", "positive", "negative"}
             if tone not in allowed_tones:
                 tone = "neutral"
             
@@ -282,6 +301,7 @@ def extract_message_features(
                 "meeting_number": meeting_number,
                 "tone": tone,
                 "confidence": confidence,
+                "refined": refined,
                 # 保留兼容字段（用于后续可能的扩展）
                 "keywords": [],
                 "platform": "",
@@ -463,6 +483,7 @@ def ensure_message_features(
         temperature=temperature,
         prompt_key="message_summary",
         model_override=model_ovr,
+        route_key="messages",
     )
     tool_errors = features.pop("__errors__", None)
     tool_debug = features.pop("__debug__", None)

@@ -1,4 +1,4 @@
-# Release Notes v0.8.0
+# 信息聚合AI系统 Release Notes v0.8.0
 
 发布时间：2025-12-21
 

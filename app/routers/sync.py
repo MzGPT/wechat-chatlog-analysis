@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 from ..db import SessionLocal
-from ..services.sync_service import sync_from_chatlog, sync_full, compare_with_chatlog
+from ..services.sync_service import sync_from_chatlog, sync_full, compare_with_chatlog, sync_from_langbot_adapters
 from ..services.snapshot_service import refresh_default_snapshots
 from ..models import SyncState
 
@@ -18,6 +19,17 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _langbot_backup_enabled(db: Session) -> bool:
+    row = db.get(SyncState, "extensions_config")
+    if not row or not row.value:
+        return False
+    try:
+        cfg = json.loads(row.value) or {}
+        return bool((cfg or {}).get("langbot_backup_enabled", False))
+    except Exception:
+        return False
 
 
 @router.post("/chatlog")
@@ -35,12 +47,20 @@ def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
             parsed_since = None
     try:
         res = sync_from_chatlog(db, parsed_since)
+        # Also ingest LangBot adapter logs as a backup source and merge into main messages table (deduped).
+        if _langbot_backup_enabled(db):
+            try:
+                langbot_since = parsed_since or (datetime.now() - timedelta(days=3))
+                res["langbot"] = sync_from_langbot_adapters(db, since=langbot_since, ingest=True)
+            except Exception:
+                res["langbot"] = {"status": "error"}
+        else:
+            res["langbot"] = {"status": "disabled"}
         # After sync, immediately write fallback summaries so UI shows grey entries
         from sqlalchemy import select
         from ..models import Message
         from ..services.ai_tools import populate_fallback_derived, ensure_message_features
         # build a conservative window since parsed_since (or 3 days if None)
-        from datetime import datetime, timedelta
         cutoff = parsed_since or (datetime.utcnow() - timedelta(days=3))
         recent = db.execute(select(Message).where(Message.timestamp >= cutoff).order_by(Message.id.desc()).limit(5000)).scalars().all()
         try:
@@ -95,7 +115,28 @@ def sync_state(db: Session = Depends(get_db)):
 def sync_chatlog_full(days: int = 30, db: Session = Depends(get_db)):
     try:
         res = sync_full(db, days=days)
+        if _langbot_backup_enabled(db):
+            try:
+                langbot_since = datetime.now() - timedelta(days=max(1, int(days or 30)))
+                res["langbot"] = sync_from_langbot_adapters(db, since=langbot_since, ingest=True)
+            except Exception:
+                res["langbot"] = {"status": "error"}
+        else:
+            res["langbot"] = {"status": "disabled"}
         refresh_default_snapshots(db)
+        db.commit()
+        return res
+    except Exception:
+        db.rollback()
+        raise
+
+
+@router.post("/langbot")
+def sync_langbot(days: int = 7, force: bool = False, db: Session = Depends(get_db)):
+    """Manual: merge LangBot adapter logs into main messages table (deduped)."""
+    try:
+        since_dt = datetime.now() - timedelta(days=max(1, int(days or 7)))
+        res = sync_from_langbot_adapters(db, since=since_dt, ingest=True, force=bool(force))
         db.commit()
         return res
     except Exception:

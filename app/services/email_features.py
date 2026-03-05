@@ -310,6 +310,7 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         temperature=0.1,
         prompt_key='email_message_summary',
         model_override=model_ovr,
+        route_key='emails',
     ) if prepared else {}
     features.pop("__errors__", None)
 

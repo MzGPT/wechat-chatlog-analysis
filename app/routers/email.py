@@ -12,7 +12,6 @@ from ..models import EmailAccount, EmailMessage
 from ..schemas import EmailAccountIn, EmailAccountOut, EmailMessageOut, PaginatedEmailMessages, EmailSendRequest
 from ..services.email_engine import imap_fetch, FetchOptions, smtp_send, pop3_fetch
 from ..services.email_features import build_email_features, persist_email_features
-from ..services.ms_graph import send_mail_graph
 
 
 router = APIRouter(prefix="/api/email", tags=["email"])
@@ -302,11 +301,8 @@ def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):
     if not acc:
         raise HTTPException(404, "account not found")
     try:
-        # Prefer Microsoft Graph when provider is outlook and OAuth is present
-        if (acc.provider or "").lower() in ("outlook", "office365", "hotmail") and ((acc.auth or {}).get("oauth")):
-            resp = send_mail_graph(db, acc, body.to, body.subject, body.body_text, cc=body.cc, bcc=body.bcc)
-        else:
-            resp = smtp_send(db, acc, body.to, body.subject, body.body_text, cc=body.cc, bcc=body.bcc)
+        # Microsoft OAuth/Graph 已移除：统一走 SMTP 发送（或由用户自行配置 IMAP/SMTP / 应用专用密码）。
+        resp = smtp_send(db, acc, body.to, body.subject, body.body_text, cc=body.cc, bcc=body.bcc)
         db.commit()
         return resp
     except Exception as e:

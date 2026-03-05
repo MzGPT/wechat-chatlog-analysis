@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc
 from typing import Optional
+from datetime import datetime
 
 from ..db import SessionLocal
 from ..models import ExtAdapter, AdapterMessage
@@ -35,8 +36,10 @@ def upsert_adapter(body: ExtAdapterIn, db: Session = Depends(get_db)):
     if row:
         for k, v in body.model_dump().items():
             setattr(row, k, v)
+        row.updated_at = datetime.utcnow()
     else:
         row = ExtAdapter(**body.model_dump())
+        row.updated_at = datetime.utcnow()
         db.add(row)
     db.commit()
     db.refresh(row)
@@ -60,7 +63,7 @@ def ingest_adapter(adapter_key: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "adapter not found")
     base_dir = row.config.get("log_dir") or settings.__dict__.get("LANGBOT_ADAPTER_LOG_DIR") or "./data/adapters"
     try:
-        n = ingest_adapter_logs(db, row, base_dir)
+        n = ingest_adapter_logs(db, row, base_dir, since=None)
         db.commit()
         return {"status": "ok", "new": n}
     except Exception as e:
@@ -80,4 +83,3 @@ def list_adapter_messages(
     rows = db.execute(query.order_by(desc(AdapterMessage.timestamp.nullslast()), desc(AdapterMessage.id)).limit(limit).offset(offset)).scalars().all()
     items = [AdapterMessageOut.model_validate(r) for r in rows]
     return {"total": len(total), "items": items}
-

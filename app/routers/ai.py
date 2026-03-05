@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 from sqlalchemy import select
 from sqlalchemy import text as _sql_text
 from typing import List, Any
@@ -15,17 +16,61 @@ from ..services.llm_client import (
     save_ai_config,
     siliconflow_chat,
     siliconflow_tool_chat,
+    get_router_runtime_stats,
     DEFAULT_MODULE_PROMPTS,
     DEFAULT_TOOL_PROMPTS,
 )
 from ..services.ai_tools import extract_message_features, build_ai_input_messages
 from ..services.report_artifacts import build_artifact_payloads
 from ..services.snapshot_service import upsert_snapshot
+from ..services.langbot_gateway_client import LangBotGatewayClient
 import os
+import time
+from urllib.parse import urlparse
+
+
+def _commit_with_retry(
+    db: Session,
+    *,
+    retries: int = 18,
+    base_delay: float = 0.2,
+    objects: list[Any] | None = None,
+) -> None:
+    """SQLite may transiently raise 'database is locked' under concurrent access; retry commits briefly."""
+    last: Exception | None = None
+    tracked = [obj for obj in (objects or []) if obj is not None]
+    for attempt in range(max(1, retries)):
+        try:
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            for obj in tracked:
+                try:
+                    db.add(obj)
+                except Exception:
+                    pass
+            last = exc
+            msg_parts = [str(exc)]
+            try:
+                if getattr(exc, "orig", None):
+                    msg_parts.append(str(exc.orig))
+            except Exception:
+                pass
+            msg = " | ".join(msg_parts).lower()
+            if "database is locked" in msg or "locked" in msg:
+                # Use bounded exponential backoff to survive short write storms.
+                sleep_s = min(0.9, base_delay * (1.45 ** attempt))
+                time.sleep(max(0.05, sleep_s))
+                continue
+            raise
+    if last:
+        raise last
 from hashlib import sha1
 import html
 import json
 import re
+from ..services.quant_analysis import normalize_quant, render_quant_section_markdown
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai"]) 
@@ -89,12 +134,78 @@ def _strip_llm_thoughts(text: str) -> str:
     return cleaned
 
 
+def _unwrap_markdown_payload(text: str) -> tuple[str | None, str | None, dict | None]:
+    """Try to parse LLM output shaped as JSON payload and extract markdown/html/quant.
+
+    Models sometimes return:
+    - raw JSON string: {"markdown":"...","quant":{...}}
+    - fenced JSON block
+    - JSON embedded in extra prose
+    This helper extracts structured fields when possible, otherwise returns (None, None, None).
+    """
+    if not isinstance(text, str):
+        return None, None, None
+    raw = text.strip()
+    if not raw:
+        return None, None, None
+
+    # strip fenced code blocks like ```json ... ```
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2:
+            first = lines[0].strip().lower()
+            if first.startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+    parsed: dict | None = None
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            parsed = obj
+    except Exception:
+        parsed = None
+
+    # loose parse from first "{" to last "}" when model adds leading/trailing prose
+    if parsed is None:
+        try:
+            s = raw.find("{")
+            e = raw.rfind("}")
+            if s >= 0 and e > s:
+                obj = json.loads(raw[s : e + 1])
+                if isinstance(obj, dict):
+                    parsed = obj
+        except Exception:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        return None, None, None
+
+    md = parsed.get("markdown")
+    html_v = parsed.get("html")
+    quant_v = parsed.get("quant")
+    md_out = str(md) if isinstance(md, str) else None
+    html_out = str(html_v) if isinstance(html_v, str) else None
+    quant_out = quant_v if isinstance(quant_v, dict) else None
+    if md_out is None and html_out is None:
+        return None, None, None
+    return md_out, html_out, quant_out
+
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+def _render_template(tpl: str, ctx: dict[str, Any]) -> str:
+    out = tpl or ""
+    for k, v in (ctx or {}).items():
+        out = out.replace("{{" + k + "}}", str(v if v is not None else ""))
+    return out
 
 
 @router.post("/suggest-replies", response_model=TaskOut)
@@ -143,6 +254,137 @@ def suggest_replies(body: AIReplyRequest, db: Session = Depends(get_db)):
     return TaskOut(id=task.id, type=task.type, status=task.status, result=task.result)
 
 
+@router.post("/reply-local")
+def reply_local(payload: dict, db: Session = Depends(get_db)) -> dict:
+    """Generate a single reply locally using SiliconFlow + tool prompt keys (reply_*)."""
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    message_id = payload.get("message_id")
+    message_text = str(payload.get("message_text") or "").strip()
+    operation_type = str(payload.get("operation_type") or "答").strip() or "答"
+    prompt_key = str(payload.get("prompt_key") or "").strip()
+    sender_name = str(payload.get("sender_name") or "").strip()
+    talker_name = str(payload.get("talker_name") or "").strip()
+
+    if not message_text and message_id is not None:
+        try:
+            mid = int(message_id)
+            m = db.get(Message, mid)
+            if m:
+                message_text = str(m.content_text or "").strip()
+                sender_name = sender_name or str(m.sender_name or m.sender_id or "").strip()
+                talker_name = talker_name or str(m.talker_name or m.chat_id or "").strip()
+        except Exception:
+            pass
+
+    if not message_text:
+        raise HTTPException(400, "message_text required")
+
+    conf = load_ai_config()
+    if not conf.get("api_key"):
+        raise HTTPException(400, "SILICONFLOW_API_KEY not configured")
+
+    # Allow choosing different reply prompts (extensible shortcuts in settings)
+    tool_prompts = conf.get("tool_prompts") or {}
+    if not prompt_key:
+        # Default mapping: split built-in "约/问/答" into three independent prompts.
+        if operation_type == "约":
+            prompt_key = "reply_yue"
+        elif operation_type == "问":
+            prompt_key = "reply_wen"
+        else:
+            prompt_key = "reply_da"
+
+    prompt_conf = tool_prompts.get(prompt_key) or DEFAULT_TOOL_PROMPTS.get(prompt_key)
+    if not isinstance(prompt_conf, dict):
+        raise HTTPException(400, f"unknown prompt_key: {prompt_key}")
+    system_prompt = str(prompt_conf.get("system") or "").strip()
+    user_template = str(prompt_conf.get("user") or "").strip()
+    if not system_prompt or not user_template:
+        # fallback to legacy default
+        legacy = tool_prompts.get("reply_generation") or DEFAULT_TOOL_PROMPTS.get("reply_generation") or {}
+        system_prompt = system_prompt or str(legacy.get("system") or "").strip()
+        user_template = user_template or str(legacy.get("user") or "").strip()
+    if not system_prompt or not user_template:
+        raise HTTPException(400, f"prompt_key not configured: {prompt_key}")
+
+    ctx = {
+        "operation_type": operation_type,
+        "sender_name": sender_name,
+        "talker_name": talker_name,
+        "message_text": message_text,
+    }
+    user_prompt = _render_template(user_template, ctx)
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    model = conf.get("tool_model_messages") or conf.get("tool_model") or conf.get("model") or "Qwen/Qwen3-8B"
+    try:
+        text = siliconflow_chat(
+            messages,
+            temperature=0.2,
+            model_override=model,
+            force_json=False,
+            route_kind="tool",
+            route_key="reply",
+        )
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    reply = (text or "").strip()
+    if reply.startswith("```"):
+        reply = reply.strip("`").strip()
+    return {"status": "ok", "reply": reply}
+
+
+@router.post("/mass-generate")
+def mass_generate(payload: dict):
+    """Generate a short mass-send template text.
+
+    Returns {text: string}. The template should include `{name}` placeholder.
+    """
+    instruction = str((payload or {}).get("instruction") or "").strip()
+    if not instruction:
+        raise HTTPException(400, "instruction required")
+    conf = load_ai_config()
+    tool_model = conf.get("tool_model") or "Qwen/Qwen3-8B"
+    messages = [
+        {
+            "role": "system",
+            "content": "\n".join(
+                [
+                    "你是微信群发文案助手。",
+                    "你将生成一段可直接发送的群发消息模板，必须包含 {name} 占位符用于个性化称呼。",
+                    "输出要求：纯文本；不要 Markdown；不要代码块；不要多余解释。",
+                    "内容要求：专业礼貌、简短清晰、避免营销腔、避免夸张。",
+                ]
+            ),
+        },
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    f"需求：{instruction}",
+                    "请只输出一段模板文本，必须包含 {name}。",
+                ]
+            ),
+        },
+    ]
+    try:
+        text = siliconflow_chat(
+            messages,
+            temperature=0.2,
+            model_override=tool_model,
+            force_json=False,
+            route_kind="tool",
+            route_key="reply",
+        )
+    except Exception as e:
+        return {"error": str(e)}
+    text = (text or "").strip()
+    # defensive: strip fenced blocks if any
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+    return {"text": text}
+
+
 @router.post("/summary", response_model=TaskOut)
 def summary(payload: dict, db: Session = Depends(get_db)):
     message_ids_raw = payload.get("message_ids") or []
@@ -183,7 +425,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         # 持久化失败不阻断主流程
         pass
     module_candidates = payload.get("modules")
-    ALLOWED_MODULES = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}
+    ALLOWED_MODULES = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch", "mediawatch", "mpwatch", "minuteswatch"}
     if isinstance(module_candidates, list) and module_candidates:
         modules = [m for m in module_candidates if m in ALLOWED_MODULES]
     else:
@@ -193,7 +435,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         else:
             modules = []
     if not modules:
-        modules = ["market", "meetings", "counter", "contacts", "newswatch", "socialwatch"]
+        modules = ["market", "meetings", "counter", "contacts", "newswatch", "mediawatch", "mpwatch", "minuteswatch", "socialwatch"]
     temperature = options.get("temperature") if isinstance(options, dict) else None
     try:
         temperature = float(temperature) if temperature is not None else None
@@ -218,141 +460,149 @@ def summary(payload: dict, db: Session = Depends(get_db)):
 
     task = Task(type="summary", payload=ctx, status="pending")
     db.add(task)
-    db.commit()
+    _commit_with_retry(db, objects=[task])
     db.refresh(task)
 
     try:
-        snapshot = upsert_snapshot(
-            db,
-            message_ids=message_ids,
-            filters=filters,
-            options=options,
-        )
-        db.flush()
+        external_modules = {"mediawatch", "mpwatch", "minuteswatch"}
+        external_only = bool(modules) and set(modules).issubset(external_modules)
 
-        # 高评分联系人完全以联系人管理表为准，忽略任何模型/缓存生成的评分
+        snapshot = None
+        if not external_only:
+            snapshot = upsert_snapshot(
+                db,
+                message_ids=message_ids,
+                filters=filters,
+                options=options,
+            )
+            db.flush()
+
         contacts_full: dict[str, dict[str, Any]] = {}
-        try:
-            rows = db.scalars(select(Contact)).all()
-        except Exception:
-            rows = []
-        for contact in rows:
-            cid = str(contact.id)
-            contacts_full[cid] = {
-                "cid": cid,
-                "rating": float(contact.rating) if contact.rating is not None else None,
-                "name": contact.name,
-                "alias": contact.alias,
-                "labels": contact.labels or {},
-            }
         contact_ratings_simple: dict[str, Any] = {}
-        for key, data in contacts_full.items():
-            rating_val = data.get("rating")
-            if rating_val is None:
-                continue
+        if not external_only:
+            # 高评分联系人完全以联系人管理表为准，忽略任何模型/缓存生成的评分
             try:
-                contact_ratings_simple[str(key)] = float(rating_val)
+                rows = db.scalars(select(Contact)).all()
             except Exception:
-                continue
+                rows = []
+            for contact in rows:
+                cid = str(contact.id)
+                contacts_full[cid] = {
+                    "cid": cid,
+                    "rating": float(contact.rating) if contact.rating is not None else None,
+                    "name": contact.name,
+                    "alias": contact.alias,
+                    "labels": contact.labels or {},
+                }
+            for key, data in contacts_full.items():
+                rating_val = data.get("rating")
+                if rating_val is None:
+                    continue
+                try:
+                    contact_ratings_simple[str(key)] = float(rating_val)
+                except Exception:
+                    continue
 
         # 保存原始数据集文件，供大模型完整读取与审计（按渠道分组）
-        try:
-            ds_dir = os.path.abspath(os.path.join(os.getcwd(), 'data', 'datasets'))
-            os.makedirs(ds_dir, exist_ok=True)
-            ds_name = f"messages_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
-            ds_path = os.path.join(ds_dir, ds_name)
-            # 精简版数据集：仅保留对总结有用的最小字段，避免无关信息（邮件地址、链接、附件等）造成体积膨胀
-            def _slim(m: dict) -> dict:
-                return {
-                    "id": m.get("id"),
-                    "time": m.get("time") or m.get("timestamp"),
-                    "sender": m.get("sender_name") or m.get("sender_id"),
-                    "talker": m.get("talker_name") or m.get("chat_id"),
-                    "type": m.get("message_type") or m.get("type"),
-                    "content": m.get("content") or m.get("content_text") or m.get("text"),
+        ds_path = None
+        ds_dir = None
+        if not external_only and snapshot is not None:
+            try:
+                ds_dir = os.path.abspath(os.path.join(os.getcwd(), "data", "datasets"))
+                os.makedirs(ds_dir, exist_ok=True)
+                ds_name = f"messages_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
+                ds_path = os.path.join(ds_dir, ds_name)
+                # 精简版数据集：仅保留对总结有用的最小字段，避免无关信息（邮件地址、链接、附件等）造成体积膨胀
+                def _slim(m: dict) -> dict:
+                    return {
+                        "id": m.get("id"),
+                        "time": m.get("time") or m.get("timestamp"),
+                        "sender": m.get("sender_name") or m.get("sender_id"),
+                        "talker": m.get("talker_name") or m.get("chat_id"),
+                        "type": m.get("message_type") or m.get("type"),
+                        "content": m.get("content") or m.get("content_text") or m.get("text"),
+                    }
+                by_channel: dict[str, list] = {}
+                for m in (snapshot.messages or []):
+                    ch = str((m or {}).get("channel") or "wechat")
+                    by_channel.setdefault(ch, []).append(_slim(m))
+                dataset = {
+                    "period": (filters or {}).get("period") if filters else None,
+                    "counts": {k: len(v) for k, v in by_channel.items()},
+                    "channels": by_channel,
                 }
-            by_channel: dict[str, list] = {}
-            for m in (snapshot.messages or []):
-                ch = str((m or {}).get('channel') or 'wechat')
-                by_channel.setdefault(ch, []).append(_slim(m))
-            dataset = {
-                "period": (filters or {}).get("period") if filters else None,
-                "counts": {k: len(v) for k, v in by_channel.items()},
-                "channels": by_channel,
-            }
-            with open(ds_path, 'w', encoding='utf-8') as f:
-                json.dump(dataset, f, ensure_ascii=False, indent=2)
-        except Exception:
-            ds_path = None
+                with open(ds_path, "w", encoding="utf-8") as f:
+                    json.dump(dataset, f, ensure_ascii=False, indent=2)
+            except Exception:
+                ds_path = None
 
         # 创建摘要数据库（包含微信和邮件的摘要内容）
         summary_db_path = None
-        try:
-            summary_db_name = f"summaries_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
-            summary_db_path = os.path.join(ds_dir, summary_db_name)
-            
-            # 提取微信消息摘要
-            wechat_summaries = []
-            email_summaries = []
-            
-            for m in (snapshot.messages or []):
-                channel = str((m or {}).get('channel') or 'wechat')
-                # 提取摘要字段（从derived中获取summary）
-                derived = m.get('derived') or {}
-                summary = derived.get('summary') or ""
-                
-                # 去除ai:前缀
-                if summary:
-                    if summary.lower().startswith("ai:"):
-                        summary = summary[3:].strip()
-                    elif summary.lower().startswith("fallback:"):
-                        summary = summary[9:].strip()
-                
-                if not summary:
-                    continue
-                
-                summary_item = {
-                    "id": m.get("id"),
-                    "time": m.get("time") or m.get("timestamp"),
-                    "sender": m.get("sender_name") or m.get("sender_id"),
-                    "talker": m.get("talker_name") or m.get("chat_id"),
-                    "summary": summary,
-                    "tone": derived.get("tone"),
-                    "category": derived.get("category"),
+        if not external_only and snapshot is not None and ds_dir:
+            try:
+                summary_db_name = f"summaries_{(filters or {}).get('period') or 'custom'}_{snapshot.id}.json"
+                summary_db_path = os.path.join(ds_dir, summary_db_name)
+
+                wechat_summaries = []
+                email_summaries = []
+
+                for m in (snapshot.messages or []):
+                    channel = str((m or {}).get("channel") or "wechat")
+                    derived = m.get("derived") or {}
+                    summary = derived.get("summary") or ""
+
+                    if summary:
+                        if summary.lower().startswith("ai:"):
+                            summary = summary[3:].strip()
+                        elif summary.lower().startswith("fallback:"):
+                            summary = summary[9:].strip()
+
+                    if not summary:
+                        continue
+
+                    summary_item = {
+                        "id": m.get("id"),
+                        "time": m.get("time") or m.get("timestamp"),
+                        "sender": m.get("sender_name") or m.get("sender_id"),
+                        "talker": m.get("talker_name") or m.get("chat_id"),
+                        "summary": summary,
+                        "tone": derived.get("tone"),
+                        "category": derived.get("category"),
+                    }
+
+                    if channel == "email":
+                        email_summaries.append(summary_item)
+                    else:
+                        wechat_summaries.append(summary_item)
+
+                summary_dataset = {
+                    "period": (filters or {}).get("period") if filters else None,
+                    "snapshot_id": snapshot.id,
+                    "counts": {
+                        "wechat": len(wechat_summaries),
+                        "email": len(email_summaries),
+                    },
+                    "wechat_summaries": wechat_summaries,
+                    "email_summaries": email_summaries,
                 }
-                
-                if channel == 'email':
-                    email_summaries.append(summary_item)
-                else:
-                    wechat_summaries.append(summary_item)
-            
-            summary_dataset = {
-                "period": (filters or {}).get("period") if filters else None,
-                "snapshot_id": snapshot.id,
-                "counts": {
-                    "wechat": len(wechat_summaries),
-                    "email": len(email_summaries),
-                },
-                "wechat_summaries": wechat_summaries,
-                "email_summaries": email_summaries,
-            }
-            
-            with open(summary_db_path, 'w', encoding='utf-8') as f:
-                json.dump(summary_dataset, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            summary_db_path = None
+
+                with open(summary_db_path, "w", encoding="utf-8") as f:
+                    json.dump(summary_dataset, f, ensure_ascii=False, indent=2)
+            except Exception:
+                summary_db_path = None
 
         summary_payload = {
-            "messages": snapshot.messages or [],
+            "messages": [] if external_only else (snapshot.messages or []),
             "prompts": prompts,
             "contact_ratings": contact_ratings_simple,
             "contact_details": contacts_full,
-            "meta": snapshot.meta or {},
+            "meta": {} if external_only else (snapshot.meta or {}),
             "modules": modules,
             "temperature": temperature,
             "dataset_path": ds_path,
             "summary_db_path": summary_db_path,  # 新增：摘要数据库路径，可用于验证从摘要表提取总结的方法
-            "snapshot_id": snapshot.id,
+            "snapshot_id": f"external:{(filters or {}).get('period') or 'custom'}" if external_only else snapshot.id,
+            "_cache_db": db,
         }
 
         local_summary = _run_summary_local(summary_payload)
@@ -363,7 +613,7 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         artifact_payloads = build_artifact_payloads(summary_result) if status == "ok" else []
 
         time_range = None
-        if snapshot.time_from and snapshot.time_to:
+        if snapshot is not None and snapshot.time_from and snapshot.time_to:
             time_range = f"{snapshot.time_from.isoformat()} ~ {snapshot.time_to.isoformat()}"
 
         if status == "ok":
@@ -382,9 +632,9 @@ def summary(payload: dict, db: Session = Depends(get_db)):
         task.status = "done" if status == "ok" else "failed"
         task.result = {
             "status": status,
-            "snapshot_id": snapshot.id,
+            "snapshot_id": summary_payload.get("snapshot_id"),
             "report": summary_result,
-            "meta": {**(snapshot.meta or {}), **({"time_range": time_range} if time_range else {})},
+            "meta": {**((snapshot.meta or {}) if snapshot is not None else {}), **({"time_range": time_range} if time_range else {})},
             "modules": returned_modules,
             "options": {
                 "modules": returned_modules,
@@ -397,14 +647,14 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             task.result["artifacts"] = artifact_payloads
 
         db.add(task)
-        db.commit()
+        _commit_with_retry(db, objects=[task])
         db.refresh(task)
     except Exception as e:
         db.rollback()
         task.status = "failed"
         task.result = {"error": str(e)}
         db.add(task)
-        db.commit()
+        _commit_with_retry(db, objects=[task])
         db.refresh(task)
 
     return TaskOut(id=task.id, type=task.type, status=task.status, result=task.result)
@@ -416,6 +666,11 @@ def get_ai_config():
     # Also return UI/analysis defaults so the frontend can persist settings across restarts
     analysis_defaults = conf.get("analysis_defaults") or {}
     ui_prefs = conf.get("ui_prefs") or {}
+    send_provider = str(conf.get("send_provider") or "").strip()
+    if send_provider not in {"langbot_gateway", "wechatpad_direct"}:
+        send_provider = "langbot_gateway" if str(conf.get("langbot_gateway_bot_uuid") or "").strip() else "wechatpad_direct"
+    allow_code_digits = conf.get("mass_name_allow_code_digits")
+    allow_code_digits = True if allow_code_digits is None else bool(allow_code_digits)
     return {
         "api_url": conf.get("api_url"),
         "model": conf.get("model"),
@@ -429,14 +684,33 @@ def get_ai_config():
         "wechatpad_http_base": conf.get("wechatpad_http_base"),
         "wechatpad_text_path": conf.get("wechatpad_text_path"),
         "wechatpad_ws_url": conf.get("wechatpad_ws_url"),
+        "wechatpad_wxid": conf.get("wechatpad_wxid"),
+        "wechatpad_sync_enabled": bool(conf.get("wechatpad_sync_enabled") or False),
+        "wechatpad_sync_poll_seconds": int(conf.get("wechatpad_sync_poll_seconds") or 30),
+        "wechatpad_sync_ws_heartbeat_seconds": int(conf.get("wechatpad_sync_ws_heartbeat_seconds") or 30),
+        # Send (LangBot send-gateway) config
+        "send_provider": send_provider,
+        "langbot_gateway_base": conf.get("langbot_gateway_base") or "",
+        "langbot_gateway_bot_uuid": conf.get("langbot_gateway_bot_uuid") or "",
+        "langbot_gateway_has_token": bool(conf.get("langbot_gateway_auth_token") or ""),
+        # Mass send config (persisted)
+        "mass_send_targets": conf.get("mass_send_targets") or [],
+        "mass_send_template": conf.get("mass_send_template") or "",
+        "mass_send_throttle_ms": int(conf.get("mass_send_throttle_ms") or 1500),
+        "mass_greeting_default_suffix": conf.get("mass_greeting_default_suffix") or "",
+        "mass_greeting_rules": conf.get("mass_greeting_rules") or "",
+        "mass_greeting_rank_map": conf.get("mass_greeting_rank_map") or "",
+        "mass_name_allow_code_digits": allow_code_digits,
+        "mass_honorific_default_enabled": bool(conf.get("mass_honorific_default_enabled") or False),
         "message_filters": conf.get("message_filters", {}),
         "module_prompts": conf.get("module_prompts", {}),
         "default_module_prompts": DEFAULT_MODULE_PROMPTS,
         "tool_prompts": conf.get("tool_prompts", {}),
         "default_tool_prompts": DEFAULT_TOOL_PROMPTS,
+        "model_router": conf.get("model_router") or {},
         "analysis_defaults": {
             # 默认包含新闻舆情模块（默认必出）
-            "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts", "newswatch"],
+            "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts", "newswatch", "mediawatch", "mpwatch", "minuteswatch"],
             "concurrency": int(analysis_defaults.get("concurrency") or 32),
             "temperature": float(analysis_defaults.get("temperature") or 0.3),
             "force_snapshot": bool(analysis_defaults.get("force_snapshot") if analysis_defaults.get("force_snapshot") is not None else True),
@@ -458,10 +732,94 @@ def set_ai_config(conf: dict):
     if "wechatpad_http_base" in conf and conf["wechatpad_http_base"] is not None:
         merged["wechatpad_http_base"] = conf["wechatpad_http_base"].strip()
     if "wechatpad_text_path" in conf and conf["wechatpad_text_path"] is not None:
-        p = conf["wechatpad_text_path"].strip() or "/api/v1/message/sendText"
+        raw = str(conf["wechatpad_text_path"]).strip() or "/api/v1/message/sendText"
+        # Accept user-pasted full URL (or accidental "/http://..."), store only URL path.
+        candidate = raw[1:] if raw.startswith("/http://") or raw.startswith("/https://") else raw
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            try:
+                parsed = urlparse(candidate)
+                raw = parsed.path or "/"
+            except Exception:
+                raw = "/"
+        p = raw.strip() or "/api/v1/message/sendText"
         merged["wechatpad_text_path"] = p if p.startswith("/") else "/" + p
     if "wechatpad_ws_url" in conf and conf["wechatpad_ws_url"] is not None:
         merged["wechatpad_ws_url"] = conf["wechatpad_ws_url"].strip()
+    if "wechatpad_wxid" in conf and conf["wechatpad_wxid"] is not None:
+        merged["wechatpad_wxid"] = str(conf["wechatpad_wxid"]).strip()
+    if "wechatpad_sync_enabled" in conf and conf["wechatpad_sync_enabled"] is not None:
+        merged["wechatpad_sync_enabled"] = bool(conf["wechatpad_sync_enabled"])
+    if "wechatpad_sync_poll_seconds" in conf and conf["wechatpad_sync_poll_seconds"] is not None:
+        try:
+            merged["wechatpad_sync_poll_seconds"] = max(5, min(3600, int(conf["wechatpad_sync_poll_seconds"])))
+        except Exception:
+            pass
+    if "wechatpad_sync_ws_heartbeat_seconds" in conf and conf["wechatpad_sync_ws_heartbeat_seconds"] is not None:
+        try:
+            merged["wechatpad_sync_ws_heartbeat_seconds"] = max(10, min(600, int(conf["wechatpad_sync_ws_heartbeat_seconds"])))
+        except Exception:
+            pass
+
+    # Send provider (LangBot gateway vs direct)
+    if "send_provider" in conf and conf["send_provider"] is not None:
+        v = str(conf.get("send_provider") or "").strip()
+        if v in {"langbot_gateway", "wechatpad_direct"}:
+            merged["send_provider"] = v
+    if "langbot_gateway_base" in conf and conf["langbot_gateway_base"] is not None:
+        merged["langbot_gateway_base"] = str(conf.get("langbot_gateway_base") or "").strip().rstrip("/")
+    if "langbot_gateway_bot_uuid" in conf and conf["langbot_gateway_bot_uuid"] is not None:
+        raw = str(conf.get("langbot_gateway_bot_uuid") or "").strip()
+        if raw:
+            try:
+                base = str(merged.get("langbot_gateway_base") or "").strip().rstrip("/") or None
+                token = str(merged.get("langbot_gateway_auth_token") or "").strip() or None
+                client = LangBotGatewayClient(base=base, bot_uuid=raw, auth_token=token)
+                raw = client.canonicalize_bot_uuid(raw)
+            except Exception:
+                pass
+        merged["langbot_gateway_bot_uuid"] = raw
+    if "langbot_gateway_auth_token" in conf and conf["langbot_gateway_auth_token"] is not None:
+        raw = str(conf.get("langbot_gateway_auth_token") or "")
+        # Allow clearing with empty string. If the UI sends a masked placeholder, keep existing.
+        if not raw.strip():
+            merged["langbot_gateway_auth_token"] = ""
+        elif raw.strip().startswith("***"):
+            pass
+        else:
+            merged["langbot_gateway_auth_token"] = raw.strip()
+
+    # Mass send config
+    if "mass_send_targets" in conf and conf["mass_send_targets"] is not None:
+        if isinstance(conf["mass_send_targets"], list):
+            # store [{id,name}] only
+            cleaned: list[dict] = []
+            for it in conf["mass_send_targets"][:500]:
+                if not isinstance(it, dict):
+                    continue
+                tid = str(it.get("id") or "").strip()
+                if not tid:
+                    continue
+                name = str(it.get("name") or "").strip()
+                cleaned.append({"id": tid, "name": name})
+            merged["mass_send_targets"] = cleaned
+    if "mass_send_template" in conf and conf["mass_send_template"] is not None:
+        merged["mass_send_template"] = str(conf["mass_send_template"])
+    if "mass_send_throttle_ms" in conf and conf["mass_send_throttle_ms"] is not None:
+        try:
+            merged["mass_send_throttle_ms"] = max(0, min(60_000, int(conf["mass_send_throttle_ms"])))
+        except Exception:
+            pass
+    if "mass_greeting_default_suffix" in conf and conf["mass_greeting_default_suffix"] is not None:
+        merged["mass_greeting_default_suffix"] = str(conf["mass_greeting_default_suffix"]).strip()
+    if "mass_greeting_rules" in conf and conf["mass_greeting_rules"] is not None:
+        # store as multiline text ("keyword=suffix")
+        merged["mass_greeting_rules"] = str(conf["mass_greeting_rules"])
+    if "mass_greeting_rank_map" in conf and conf["mass_greeting_rank_map"] is not None:
+        merged["mass_greeting_rank_map"] = str(conf["mass_greeting_rank_map"])
+    if "mass_name_allow_code_digits" in conf and conf["mass_name_allow_code_digits"] is not None:
+        merged["mass_name_allow_code_digits"] = bool(conf["mass_name_allow_code_digits"])
+    if "mass_honorific_default_enabled" in conf and conf["mass_honorific_default_enabled"] is not None:
+        merged["mass_honorific_default_enabled"] = bool(conf["mass_honorific_default_enabled"])
 
     # optional runtime LLM params
     if "max_tokens" in conf and conf["max_tokens"] is not None:
@@ -503,8 +861,8 @@ def set_ai_config(conf: dict):
         incoming = conf["analysis_defaults"]
         if "modules" in incoming and isinstance(incoming["modules"], list):
             # keep valid modules only
-            valid = {"market", "meetings", "counter", "contacts"}
-            ad["modules"] = [m for m in incoming["modules"] if m in valid] or ["market", "meetings", "counter", "contacts"]
+            valid = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch", "mediawatch", "mpwatch", "minuteswatch"}
+            ad["modules"] = [m for m in incoming["modules"] if m in valid] or ["market", "meetings", "counter", "contacts", "newswatch", "mediawatch", "mpwatch", "minuteswatch"]
         if "concurrency" in incoming:
             try:
                 ad["concurrency"] = max(1, min(128, int(incoming["concurrency"])) )
@@ -550,7 +908,9 @@ def set_ai_config(conf: dict):
         stored_tool = merged.get("tool_prompts", {})
         incoming_tool = conf["tool_prompts"]
         for key, prompts in incoming_tool.items():
-            if key not in DEFAULT_TOOL_PROMPTS:
+            # Allow custom tool prompts (e.g., reply_* shortcuts)
+            key = str(key or "").strip()
+            if not key:
                 continue
             current = stored_tool.get(key, {})
             if not isinstance(current, dict):
@@ -561,8 +921,46 @@ def set_ai_config(conf: dict):
                     updated["system"] = prompts["system"]
                 if "user" in prompts and isinstance(prompts["user"], str):
                     updated["user"] = prompts["user"]
+                if "label" in prompts and isinstance(prompts["label"], str):
+                    updated["label"] = prompts["label"].strip()
                 stored_tool[key] = updated
         merged["tool_prompts"] = stored_tool
+    # Allow deleting custom tool prompts (e.g., reply_* shortcuts) from UI
+    if "tool_prompts_delete" in conf and isinstance(conf["tool_prompts_delete"], list):
+        stored_tool = merged.get("tool_prompts", {})
+        reserved = set(DEFAULT_TOOL_PROMPTS.keys())
+        for k in conf["tool_prompts_delete"]:
+            key = str(k or "").strip()
+            if not key:
+                continue
+            if key in reserved:
+                continue
+            # Safety: only allow deleting reply_* custom shortcuts from UI
+            if not key.startswith("reply_"):
+                continue
+            stored_tool.pop(key, None)
+        merged["tool_prompts"] = stored_tool
+    if "model_router" in conf and isinstance(conf["model_router"], dict):
+        current_router = merged.get("model_router") if isinstance(merged.get("model_router"), dict) else {}
+        updated_router = dict(current_router)
+        for field in (
+            "enabled",
+            "strategy",
+            "prefer_router",
+            "dynamic_weighting",
+            "breaker_failures",
+            "cooldown_seconds",
+            "latency_ref_ms",
+            "main_channels",
+            "mid_channels",
+            "tool_channels",
+            "main_module_channels",
+            "mid_route_channels",
+            "tool_route_channels",
+        ):
+            if field in conf["model_router"]:
+                updated_router[field] = conf["model_router"][field]
+        merged["model_router"] = updated_router
     save_ai_config(merged)
     return {"status": "ok"}
 
@@ -643,6 +1041,21 @@ def _run_summary_local(payload: dict) -> dict:
                 value = raw.get(field)
                 if isinstance(value, str) and value.strip():
                     return value
+        # Some channels (links/files/derived-only rows) may not carry `content_text`,
+        # but still have meaningful derived summaries. Use them to avoid filtering out
+        # high-signal messages and causing empty market summaries.
+        derived = message.get("derived")
+        if isinstance(derived, dict):
+            for field in ("summary", "summary_full", "key_info"):
+                value = derived.get(field)
+                if isinstance(value, str) and value.strip():
+                    t = value.strip()
+                    low = t.lower()
+                    if low.startswith("ai:"):
+                        t = t[3:].strip()
+                    elif low.startswith("fallback:"):
+                        t = t[9:].strip()
+                    return t
         return ""
 
     def _is_short_message(message: dict) -> bool:
@@ -673,6 +1086,13 @@ def _run_summary_local(payload: dict) -> dict:
     try:
         conf = load_ai_config()
         module_prompts = conf.get("module_prompts", {})
+        # By default, external aggregation modules are summarized locally to avoid heavy LLM usage / long hangs.
+        # Can be overridden per-request with options.use_llm_external_modules=true (best-effort).
+        try:
+            req_opts = payload.get("options") or {}
+            use_llm_external_modules = bool((req_opts or {}).get("use_llm_external_modules", False))
+        except Exception:
+            use_llm_external_modules = False
         # 强化“高评分联系人”提示词：禁止模型自行打分，评分来自系统
         try:
             cp = module_prompts.get('contacts') or {}
@@ -727,7 +1147,8 @@ def _run_summary_local(payload: dict) -> dict:
         for m in msgs[:2000]:
             # 从derived中提取summary字段
             derived = m.get("derived") or {}
-            summary = derived.get("summary") or ""
+            # Prefer tool summary; fallback to richer heuristic fields when needed.
+            summary = derived.get("summary") or derived.get("summary_full") or derived.get("key_info") or ""
             cid = str(m.get("sender_id") or "").strip()
             if not cid:
                 sender_label = (m.get("sender_name") or "").strip()
@@ -960,9 +1381,9 @@ def _run_summary_local(payload: dict) -> dict:
 
         requested_modules = payload.get("modules")
         if isinstance(requested_modules, list) and requested_modules:
-            module_filter = {m for m in requested_modules if m in {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}}
+            module_filter = {m for m in requested_modules if m in {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch", "mediawatch", "mpwatch", "minuteswatch"}}
         else:
-            module_filter = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch"}
+            module_filter = {"market", "meetings", "counter", "contacts", "newswatch", "socialwatch", "mediawatch", "mpwatch", "minuteswatch"}
 
         temperature = payload.get("temperature")
         try:
@@ -977,6 +1398,9 @@ def _run_summary_local(payload: dict) -> dict:
             "contacts": "top_contacts_markdown",
             "newswatch": "newswatch_markdown",
             "socialwatch": "socialwatch_markdown",
+            "mediawatch": "mediawatch_markdown",
+            "mpwatch": "mpwatch_markdown",
+            "minuteswatch": "minuteswatch_markdown",
         }
 
         module_titles = {
@@ -986,6 +1410,16 @@ def _run_summary_local(payload: dict) -> dict:
             "contacts": "高评分联系人摘要",
             "newswatch": "新闻舆情监测",
             "socialwatch": "自媒体舆情监测",
+            "mediawatch": "自媒体聚合摘要",
+            "mpwatch": "公众号聚合摘要",
+            "minuteswatch": "会议聚合摘要",
+        }
+
+        html_result_map = {
+            "market": "market_html",
+            "meetings": "meetings_html",
+            "counter": "counter_html",
+            "contacts": "top_contacts_html",
         }
 
         result: dict[str, str] = {
@@ -999,7 +1433,242 @@ def _run_summary_local(payload: dict) -> dict:
             "top_contacts_html": "",
             "newswatch_markdown": "",
             "socialwatch_markdown": "",
+            "mediawatch_markdown": "",
+            "mpwatch_markdown": "",
+            "minuteswatch_markdown": "",
         }
+
+        def _ensure_heading(module_key: str, result_key: str, html_key: str | None) -> None:
+            """确保每个模块有首段标题，避免前端看不到第一个小标题。"""
+            title = module_titles.get(module_key)
+            if not title:
+                return
+            # 若 html 为空但 markdown 本身是 HTML，则同步写入 html 字段
+            if html_key and not result.get(html_key):
+                md_val = str(result.get(result_key) or "").strip()
+                if md_val.lstrip().startswith("<"):
+                    result[html_key] = md_val
+            if html_key:
+                html_val = str(result.get(html_key) or "").strip()
+                if html_val and not re.search(r"<h[1-3][^>]*>", html_val, flags=re.IGNORECASE):
+                    result[html_key] = f"<h2>{html.escape(title)}</h2>\n{html_val}"
+                    return
+            md_val = str(result.get(result_key) or "").strip()
+            if md_val and not md_val.lstrip().startswith("#"):
+                result[result_key] = f"# {title}\n\n{md_val}"
+
+        def _short_time(v: Any) -> str:
+            s = str(v or "").strip()
+            if not s:
+                return ""
+            if len(s) >= 16 and (s[4] == "-" or s[4] == "/"):
+                return s[5:16].replace("T", " ")
+            return s[:16].replace("T", " ")
+
+        def _short_text(v: Any, limit: int = 36) -> str:
+            t = str(v or "").strip().replace("\n", " ")
+            if len(t) > limit:
+                return t[:limit] + "…"
+            return t
+
+        def _md_link(label: str, url: str) -> str:
+            u = (url or "").strip()
+            if not u:
+                return label
+            safe = u.replace(")", "%29").replace("(", "%28")
+            return f"[{label}]({safe})"
+
+        def _md_cell(full: Any, limit: int = 36) -> str:
+            # Render an HTML span with full content embedded for frontend popover.
+            # IMPORTANT: avoid '|' in markdown-table cells; we normalize to full-width '｜'.
+            import html as _html
+
+            raw = str(full or "").strip()
+            if not raw:
+                return ""
+            raw = raw.replace("|", "｜")
+            short = _short_text(raw.replace("\r", " ").replace("\n", " "), limit)
+            attr = raw.replace("\\", "\\\\").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+            return f'<span data-full-content="{_html.escape(attr, quote=True)}">{_html.escape(short)}</span>'
+
+        def _md_link_cell(label_full: Any, url: str, limit: int = 24) -> str:
+            # HTML <a> with embedded full label, opens in new tab.
+            import html as _html
+
+            u = (url or "").strip()
+            label_raw = str(label_full or "").strip().replace("|", "｜")
+            if not u:
+                return _md_cell(label_raw, limit=limit)
+            safe = u.replace("|", "%7C").replace(")", "%29").replace("(", "%28")
+            short = _short_text(label_raw.replace("\r", " ").replace("\n", " "), limit)
+            attr = label_raw.replace("\\", "\\\\").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+            return (
+                f'<a href="{_html.escape(safe, quote=True)}" target="_blank" rel="noreferrer" '
+                f'data-full-content="{_html.escape(attr, quote=True)}">{_html.escape(short)}</a>'
+            )
+
+        def _render_external_module_md(module_key: str, rows: list[dict]) -> str:
+            if module_key == "mediawatch":
+                lines: list[str] = ["# 自媒体聚合摘要"]
+                if not rows:
+                    lines.append("暂无数据。")
+                    return "\n".join(lines)
+                platforms: dict[str, int] = {}
+                for r in rows:
+                    p = str(r.get("talker_name") or r.get("platform") or "").strip() or "unknown"
+                    platforms[p] = platforms.get(p, 0) + 1
+                top_plat = " / ".join([k for k, _ in sorted(platforms.items(), key=lambda kv: kv[1], reverse=True)[:3]])
+                lines.append(f"条目数：{len(rows)}；平台Top：{top_plat}")
+                lines.append("")
+                lines.append("| 时间 | 平台 | 作者 | 标题 | 摘要 | 互动 |")
+                lines.append("| --- | --- | --- | --- | --- | --- |")
+                for r in rows[:30]:
+                    meta = r.get("meta") or {}
+                    stats = meta.get("stats") or {}
+                    like = int(stats.get("like") or 0)
+                    comment = int(stats.get("comment") or 0)
+                    share = int(stats.get("share") or 0)
+                    collect = int(stats.get("collect") or 0)
+                    engagement = f"赞{like}/评{comment}/转{share}/藏{collect}"
+                    url = str(meta.get("url") or r.get("url") or "").strip()
+                    title = str(meta.get("title") or r.get("title") or r.get("content") or "").strip()
+                    summary = str(r.get("content") or "").strip()
+                    lines.append(
+                        "| "
+                        + " | ".join(
+                            [
+                                _short_time(r.get("time")),
+                                _md_cell(r.get("talker_name") or r.get("platform") or "", 10),
+                                _md_cell(r.get("sender_name") or r.get("sender") or "", 10),
+                                _md_link_cell(title, url, 18),
+                                _md_cell(summary, 28),
+                                engagement,
+                            ]
+                        )
+                        + " |"
+                    )
+                return "\n".join(lines)
+
+            if module_key == "mpwatch":
+                lines = ["# 公众号聚合摘要"]
+                if not rows:
+                    lines.append("暂无数据。")
+                    return "\n".join(lines)
+                channels: dict[str, int] = {}
+                for r in rows:
+                    c = str(r.get("sender_name") or r.get("sender") or "").strip() or "unknown"
+                    channels[c] = channels.get(c, 0) + 1
+                top_ch = " / ".join([k for k, _ in sorted(channels.items(), key=lambda kv: kv[1], reverse=True)[:3]])
+                lines.append(f"条目数：{len(rows)}；公众号Top：{top_ch}")
+                lines.append("")
+                lines.append("| 时间 | 公众号 | 标题 | 摘要 |")
+                lines.append("| --- | --- | --- | --- |")
+                for r in rows[:30]:
+                    meta = r.get("meta") or {}
+                    url = str(meta.get("url") or "").strip()
+                    title = str(meta.get("title") or r.get("title") or "").strip() or str(r.get("content") or "").strip()
+                    summary = str(r.get("content") or "").strip()
+                    lines.append(
+                        "| "
+                        + " | ".join(
+                            [
+                                _short_time(r.get("time")),
+                                _md_cell(r.get("sender_name") or r.get("sender") or "", 10),
+                                _md_link_cell(title, url, 22),
+                                _md_cell(summary, 42),
+                            ]
+                        )
+                        + " |"
+                    )
+                return "\n".join(lines)
+
+            if module_key == "minuteswatch":
+                lines = ["# 会议聚合摘要"]
+                if not rows:
+                    lines.append("暂无数据。")
+                    return "\n".join(lines)
+                lines.append(f"条目数：{len(rows)}")
+                lines.append("")
+                lines.append("| 时间 | 主题 | 摘要 | 音频 |")
+                lines.append("| --- | --- | --- | --- |")
+                for r in rows[:20]:
+                    title = str(r.get("sender_name") or r.get("sender") or "").strip()
+                    text = str(r.get("content") or "").strip()
+                    meta = r.get("meta") or {}
+                    audio_url = str(meta.get("audio_url") or "").strip().replace("|", "%7C")
+                    if audio_url:
+                        import html as _html
+
+                        audio = f'<a href="{_html.escape(audio_url, quote=True)}" target="_blank" rel="noreferrer">音频</a>'
+                    else:
+                        audio = ""
+                    lines.append(
+                        "| "
+                        + " | ".join(
+                            [
+                                _short_time(r.get("time")),
+                                _md_cell(title, 18),
+                                _md_cell(text, 56),
+                                audio,
+                            ]
+                        )
+                        + " |"
+                    )
+                return "\n".join(lines)
+
+            return ""
+
+        cache_db = payload.get("_cache_db")
+
+        def _persistent_cache_get(db_key: str) -> str | None:
+            try:
+                if isinstance(cache_db, Session):
+                    row = cache_db.get(SyncState, db_key)
+                    if row and row.value:
+                        return row.value
+                    return None
+            except Exception:
+                return None
+            try:
+                from ..db import SessionLocal as _SL
+
+                dbx = _SL()
+                try:
+                    row = dbx.get(SyncState, db_key)
+                    return row.value if row and row.value else None
+                finally:
+                    dbx.close()
+            except Exception:
+                return None
+
+        def _persistent_cache_set(db_key: str, value: str) -> None:
+            try:
+                if isinstance(cache_db, Session):
+                    row = cache_db.get(SyncState, db_key)
+                    if not row:
+                        row = SyncState(key=db_key, value=value)
+                    else:
+                        row.value = value
+                    cache_db.add(row)
+                    return
+            except Exception:
+                pass
+            try:
+                from ..db import SessionLocal as _SL
+
+                dbx = _SL()
+                try:
+                    row = dbx.get(SyncState, db_key)
+                    if not row:
+                        row = SyncState(key=db_key, value=value)
+                    else:
+                        row.value = value
+                    dbx.add(row)
+                    dbx.commit()
+                finally:
+                    dbx.close()
+            except Exception:
+                pass
 
         for module_key, result_key in module_map.items():
             if module_key not in module_filter:
@@ -1015,10 +1684,11 @@ def _run_summary_local(payload: dict) -> dict:
                 module_payload["messages"] = _compact(source, prefer_meetings=True, limit=250)
             elif module_key == "market":
                 # 市场观点总揽：确保覆盖所有消息，不要遗漏；优先包含摘要
-                source = [m for m in sorted_messages if _is_market(m)]
+                # 排除会议通知/报名等噪声（会议模块单独处理）
+                source = [m for m in sorted_messages if _is_market(m) and not _is_meeting(m)]
                 # 如果筛选后消息太少，则使用全部消息
                 if len(source) < len(sorted_messages) * 0.3:
-                    source = sorted_messages
+                    source = [m for m in sorted_messages if not _is_meeting(m)] or sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=False, limit=400)  # 增加limit确保覆盖更多消息
             elif module_key == "counter":
                 # 分歧观点分析：视窗内的所有有效摘要都应纳入分析，避免只看最近少量消息
@@ -1060,8 +1730,134 @@ def _run_summary_local(payload: dict) -> dict:
                     module_payload["messages"] = news_items
                 except Exception:
                     module_payload["messages"] = []
+            elif module_key == "mediawatch":
+                # 自媒体聚合：读取 Media 项目落盘 JSON（data/results/*.json），优先使用 summary/transcript
+                try:
+                    from ..services.media_store import list_media_items
+                    data = list_media_items(limit=200)
+                    items = data.get("items") or []
+                    rev = max((int(it.get("source_mtime") or 0) for it in items), default=0)
+                    msgs = []
+                    for it in items[:120]:
+                        msgs.append(
+                            {
+                                "channel": "media",
+                                "id": str(it.get("id") or ""),
+                                "time": it.get("time"),
+                                "sender": it.get("author") or "",
+                                "sender_name": it.get("author") or "",
+                                "talker_name": it.get("platform") or "",
+                                "type": "media",
+                                "content": it.get("summary") or it.get("title") or "",
+                                "content_text": it.get("summary") or it.get("title") or "",
+                                "meta": {"url": it.get("url") or "", "title": it.get("title") or "", "stats": it.get("stats") or {}},
+                            }
+                        )
+                    module_payload["messages"] = msgs
+                    module_payload["meta"] = {**(module_payload.get("meta") or {}), "source_rev": rev}
+                except Exception:
+                    module_payload["messages"] = []
+            elif module_key == "mpwatch":
+                # 公众号聚合：读取 we-mp-rss 的 sqlite（articles + feeds + insights）
+                try:
+                    from ..services.mp_rss_store import list_mp_articles, _default_we_mp_rss_db
+                    res = list_mp_articles(limit=200, offset=0, q=None)
+                    items = res.get("items") or []
+                    # cache rev = db mtime
+                    rev = 0
+                    try:
+                        dbp = _default_we_mp_rss_db()
+                        rev = int(dbp.stat().st_mtime) if dbp and dbp.exists() else 0
+                    except Exception:
+                        rev = 0
+                    msgs = []
+                    for it in items[:120]:
+                        msgs.append(
+                            {
+                                "channel": "mp",
+                                "id": str(it.get("id") or ""),
+                                "time": it.get("publish_time"),
+                                "sender": it.get("channel_name") or "",
+                                "sender_name": it.get("channel_name") or "",
+                                "talker_name": "we-mp-rss",
+                                "type": "mp",
+                                "content": it.get("summary") or it.get("title") or "",
+                                "content_text": it.get("summary") or it.get("title") or "",
+                                "meta": {"url": it.get("url") or "", "title": it.get("title") or ""},
+                            }
+                        )
+                    module_payload["messages"] = msgs
+                    module_payload["meta"] = {**(module_payload.get("meta") or {}), "source_rev": rev}
+                except Exception:
+                    module_payload["messages"] = []
+            elif module_key == "minuteswatch":
+                # 会议聚合：读取当前项目本地 minutes（data/minutes + data/recordings）
+                try:
+                    from ..routers.minutes import list_minutes as _list_minutes
+
+                    data = _list_minutes(q=None, limit=200, refresh=False, llm=False)
+                    items = data.get("items") or []
+                    rev = 0
+                    msgs = []
+                    for it in items[:60]:
+                        meta = it.get("meta") or {}
+                        path = str(it.get("path") or "").strip()
+                        title = ""
+                        if path:
+                            try:
+                                import os as _os
+
+                                title = _os.path.splitext(_os.path.basename(path))[0]
+                            except Exception:
+                                title = path
+                        title = title or str(it.get("sender_name") or it.get("sender") or "").strip()
+                        summary = str(it.get("summary") or "").strip()
+                        if not summary:
+                            # best-effort fallback for AI summary panel (avoid huge transcript)
+                            summary = str(it.get("content_refined") or "").strip() or str(it.get("content_text") or "").strip()[:800]
+                        msgs.append(
+                            {
+                                "channel": "minutes",
+                                "id": str(it.get("id") or ""),
+                                "time": it.get("time") or "",
+                                "sender": title,
+                                "sender_name": title,
+                                "talker_name": it.get("talker_name") or "minutes",
+                                "type": "minutes",
+                                "content": summary,
+                                "content_text": summary,
+                                "meta": {"audio_url": meta.get("audio_url") or "", "transcript_status": meta.get("transcript_status") or "", "path": path},
+                            }
+                        )
+                    module_payload["messages"] = msgs
+                    module_payload["meta"] = {**(module_payload.get("meta") or {}), "source_rev": rev}
+                except Exception:
+                    module_payload["messages"] = []
             else:
                 module_payload["messages"] = _compact(sorted_messages, prefer_meetings=False, limit=300)
+
+            # External aggregation modules: local summarization first to avoid long remote LLM calls.
+            if module_key in {"mediawatch", "mpwatch", "minuteswatch"} and not use_llm_external_modules:
+                try:
+                    md = _render_external_module_md(module_key, module_payload.get("messages") or [])
+                    if md:
+                        result[result_key] = md
+                        # Cache like normal (prompt hash still participates so prompt changes invalidate)
+                        try:
+                            snap_id = payload.get("snapshot_id")
+                            rev = (module_payload.get("meta") or {}).get("source_rev")
+                            if rev:
+                                snap_id = f"{snap_id}:{module_key}:{int(rev)}"
+                            ph = sha1(((system_prompt or "") + "\n" + (user_template or "")).encode("utf-8", "ignore")).hexdigest()[:12]
+                            cache_key = (snap_id, module_key, ph, float(temperature))
+                            _summary_cache_set(cache_key, result[result_key])
+                            db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
+                            _persistent_cache_set(db_key, result[result_key])
+                        except Exception:
+                            pass
+                        continue
+                except Exception:
+                    pass
 
             # 粗略 token 预算，防止超过大上下文（~128k tokens）；按字符估算并分块摘要再合并
             try:
@@ -1095,7 +1891,12 @@ def _run_summary_local(payload: dict) -> dict:
                             {"role": "user", "content": user_content},
                         ]
                         try:
-                            part = siliconflow_chat(messages_payload, temperature=temperature)
+                            part = siliconflow_chat(
+                                messages_payload,
+                                temperature=temperature,
+                                route_kind="main",
+                                route_key=module_key,
+                            )
                         except Exception:
                             part = ""
                         if part:
@@ -1113,17 +1914,17 @@ def _run_summary_local(payload: dict) -> dict:
                             {"role": "user", "content": merge_user},
                         ]
                         try:
-                            output_text = siliconflow_chat(merge_payload, temperature=temperature)
-                            parsed = None
-                            try:
-                                parsed = json.loads(output_text)
-                            except Exception:
-                                parsed = None
-                            if isinstance(parsed, dict) and ("markdown" in parsed or "html" in parsed):
-                                if "markdown" in parsed:
-                                    result[result_key] = _strip_llm_thoughts(parsed.get("markdown", ""))
-                                elif "html" in parsed:
-                                    result[result_key] = _strip_llm_thoughts(parsed.get("html", ""))
+                            output_text = siliconflow_chat(
+                                merge_payload,
+                                temperature=temperature,
+                                route_kind="main",
+                                route_key=module_key,
+                            )
+                            md_payload, html_payload, _ = _unwrap_markdown_payload(output_text)
+                            if md_payload is not None:
+                                result[result_key] = _strip_llm_thoughts(md_payload)
+                            elif html_payload is not None:
+                                result[result_key] = _strip_llm_thoughts(html_payload)
                             else:
                                 result[result_key] = _strip_llm_thoughts(output_text)
                             continue  # 已产出结果，跳过常规路径
@@ -1138,38 +1939,43 @@ def _run_summary_local(payload: dict) -> dict:
                 compact = {"messages": module_payload.get("messages", [])}
                 payload_str = json.dumps(compact, ensure_ascii=False)
             else:
-                # 压缩上下文：避免将 raw_messages、大字段、无关 meta 一并传给大模型
+                # 压缩上下文：避免把超大的 contacts/ratings 字典传入大模型（会导致请求过大/超长）
+                meta_raw = module_payload.get("meta") or {}
+                slim_meta: dict[str, Any] = {}
+                for k in ("total_messages", "time_range", "window_days"):
+                    if k in meta_raw:
+                        slim_meta[k] = meta_raw.get(k)
                 slim: dict[str, Any] = {
                     "messages": module_payload.get("messages", []),
-                    # 仅提示必要信息，减少 token
-                    "contact_ratings": module_payload.get("contact_ratings", {}),
-                    "meta": {"total_messages": (module_payload.get("meta") or {}).get("total_messages")},
+                    "meta": slim_meta,
                 }
                 payload_str = json.dumps(slim, ensure_ascii=False)
 
             # ===== 增量缓存命中检查 =====
             try:
                 snap_id = payload.get("snapshot_id")
+                # 对外部聚合模块：把数据源版本纳入缓存 key，避免“数据更新但命中旧缓存”
+                try:
+                    rev = (module_payload.get("meta") or {}).get("source_rev")
+                    if module_key in {"mediawatch", "mpwatch", "minuteswatch"} and rev:
+                        snap_id = f"{snap_id}:{module_key}:{int(rev)}"
+                except Exception:
+                    pass
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 cached = _summary_cache_get(cache_key)
                 if not cached:
                     # 持久化缓存：SyncState("summary_cache:<...>")
                     db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
-                    try:
-                        from ..db import SessionLocal as _SL
-                        db = _SL()
-                        try:
-                            row = db.get(SyncState, db_key)
-                            if row and row.value:
-                                cached = row.value
-                                _summary_cache_set(cache_key, cached)
-                        finally:
-                            db.close()
-                    except Exception:
-                        pass
+                cached = _persistent_cache_get(db_key)
+                if cached:
+                    _summary_cache_set(cache_key, cached)
                 if cached:
                     result[result_key] = cached
+                    hk = html_result_map.get(module_key)
+                    if hk and cached and str(cached).lstrip().startswith("<"):
+                        result[hk] = cached
+                    _ensure_heading(module_key, result_key, hk)
                     continue
             except Exception:
                 pass
@@ -1184,53 +1990,71 @@ def _run_summary_local(payload: dict) -> dict:
             ]
 
             try:
-                output_text = siliconflow_chat(messages_payload, temperature=temperature)
+                output_text = siliconflow_chat(
+                    messages_payload,
+                    temperature=temperature,
+                    route_kind="main",
+                    route_key=module_key,
+                )
             except Exception as exc:  # pragma: no cover
                 result[result_key] = ""
                 # 不中断，让后续使用本地兜底生成
                 continue
 
-            try:
-                parsed = json.loads(output_text)
-            except Exception:
-                parsed = None
-
-            if isinstance(parsed, dict) and ("markdown" in parsed or "html" in parsed):
-                if "markdown" in parsed:
-                    result[result_key] = _strip_llm_thoughts(parsed.get("markdown", ""))
-                elif "html" in parsed:
-                    # 如果模型仍返回 HTML，尝试转换为 Markdown 或保留
-                    # 这里优先保留，但前端 renderMarkdown 会处理
-                    result[result_key] = _strip_llm_thoughts(parsed.get("html", ""))
+            md_payload, html_payload, quant_payload = _unwrap_markdown_payload(output_text)
+            if md_payload is not None or html_payload is not None:
+                if md_payload is not None:
+                    result[result_key] = _strip_llm_thoughts(md_payload)
+                if html_payload is not None:
+                    html_out = _strip_llm_thoughts(html_payload)
+                    # Preserve for markdown-slot rendering (back-compat), but also store in *_html for UI/artifacts.
+                    if not result.get(result_key):
+                        result[result_key] = html_out
+                    hk = html_result_map.get(module_key)
+                    if hk and html_out:
+                        result[hk] = html_out
+                # Append deterministic quant section (server-rendered) for selected modules.
+                try:
+                    if module_key in {"market", "newswatch"}:
+                        q_raw = quant_payload
+                        q_norm = normalize_quant(q_raw if isinstance(q_raw, dict) else None)
+                        q_md = render_quant_section_markdown(q_norm, module=module_key)
+                        cur = str(result.get(result_key) or "")
+                        # Only append to markdown-like content (avoid corrupting raw HTML).
+                        if q_md and cur and not cur.lstrip().startswith("<"):
+                            result[result_key] = cur.rstrip() + "\n\n" + q_md
+                except Exception:
+                    pass
             else:
-                # 兜底：如果返回纯文本，视为 Markdown
-                result[result_key] = _strip_llm_thoughts(output_text)
+                # 兜底：如果返回纯文本，视为 Markdown；若是原生 HTML，则同步写入 *_html 供前端优先使用
+                text_out = _strip_llm_thoughts(output_text)
+                result[result_key] = text_out
+                hk = html_result_map.get(module_key)
+                if hk and text_out and text_out.lstrip().startswith("<"):
+                    result[hk] = text_out
 
+            _ensure_heading(module_key, result_key, html_result_map.get(module_key))
             # 写入缓存
             try:
                 snap_id = payload.get("snapshot_id")
+                try:
+                    rev = (module_payload.get("meta") or {}).get("source_rev")
+                    if module_key in {"mediawatch", "mpwatch", "minuteswatch"} and rev:
+                        snap_id = f"{snap_id}:{module_key}:{int(rev)}"
+                except Exception:
+                    pass
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 _summary_cache_set(cache_key, result[result_key])
                 # 写入持久化缓存
                 db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
-                try:
-                    from ..db import SessionLocal as _SL
-                    db = _SL()
-                    try:
-                        row = db.get(SyncState, db_key)
-                        if not row:
-                            row = SyncState(key=db_key, value=result[result_key])
-                        else:
-                            row.value = result[result_key]
-                        db.add(row)
-                        db.commit()
-                    finally:
-                        db.close()
-                except Exception:
-                    pass
+                _persistent_cache_set(db_key, result[result_key])
             except Exception:
                 pass
+
+        # 补充缺失的首段标题（涵盖缓存/本地生成等路径）
+        for mk, rk in module_map.items():
+            _ensure_heading(mk, rk, html_result_map.get(mk))
 
         # ---------- Local fallbacks to guarantee useful content ----------
         POS = {"看多","看好","上涨","增持","买入","积极","乐观","超配","超预期","改善","提价","扩产","胜诉","达成"}
@@ -1653,28 +2477,36 @@ def _run_summary_local(payload: dict) -> dict:
             return "".join(cards)
 
         if "market" in module_filter and not result.get("market_markdown"):
-            # 更紧凑：每类最多3条，降低噪声
-            orig_fn = _build_market_md
-        def _build_market_md_compact():
-            total = len(enriched_messages)
-            pos = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive"))
-            neg = sum(1 for m in enriched_messages if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative"))
-            md_lines: list[str] = [f"样本数：{total}；正向：{pos}；负向：{neg}"]
-            topic_idx = 1
-            for name, _ in CAT_RULES:
-                bucket = [m for m in enriched_messages if name in _match_cats(m)]
-                if not bucket:
-                    continue
-                md_lines.append(f"\n【主题{topic_idx}：{name}】")
-                for m in bucket[:3]:
-                    sent = m.get("sender") or m.get("sender_name") or "未知"
-                    ts = m.get("time") or ""
-                    text = _short(m.get("summary") or m.get("content") or "", 120)
-                    tone = m.get("tone") or "neutral"
-                    md_lines.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
-                topic_idx += 1
-            md_lines.append("\n【行动建议】聚焦确定性主线，跟踪关键数据点，控制仓位风险。")
-            return "\n".join(md_lines)
+            # 更紧凑：每类最多3条，降低噪声（并保证不为空）
+            def _build_market_md_compact() -> str:
+                total = len(enriched_messages)
+                pos = sum(
+                    1
+                    for m in enriched_messages
+                    if _has_any(str(m.get("content") or ""), POS) or (m.get("tone") == "positive")
+                )
+                neg = sum(
+                    1
+                    for m in enriched_messages
+                    if _has_any(str(m.get("content") or ""), NEG) or (m.get("tone") == "negative")
+                )
+                md_lines: list[str] = [f"样本数：{total}；正向：{pos}；负向：{neg}"]
+                topic_idx = 1
+                for name, _ in CAT_RULES:
+                    bucket = [m for m in enriched_messages if name in _match_cats(m)]
+                    if not bucket:
+                        continue
+                    md_lines.append(f"\n【主题{topic_idx}：{name}】")
+                    for m in bucket[:3]:
+                        sent = m.get("sender") or m.get("sender_name") or "未知"
+                        ts = m.get("time") or ""
+                        text = _short(m.get("summary") or m.get("content") or "", 120)
+                        tone = m.get("tone") or "neutral"
+                        md_lines.append(f"- ({tone}) {text}（来源：{sent} {ts}）")
+                    topic_idx += 1
+                md_lines.append("\n【行动建议】聚焦确定性主线，跟踪关键数据点，控制仓位风险。")
+                return "\n".join(md_lines)
+
             result["market_markdown"] = _build_market_md_compact()
             result["market_html"] = _build_market_html()
         if "meetings" in module_filter and not result.get("meetings_markdown"):
@@ -1831,6 +2663,12 @@ def test_tool_model():
         return {"status": "error", "error": str(e), "config": info}
 
 
+@router.get("/router-stats")
+def router_stats():
+    """Expose in-process routing runtime metrics for diagnostics/weight tuning."""
+    return {"status": "ok", "stats": get_router_runtime_stats()}
+
+
 # ===== 缓存调试与清理 =====
 @router.get("/debug/caches")
 def debug_caches():
@@ -1904,7 +2742,11 @@ def test_tool_summary(payload: dict):
         {"role": "user", "content": user_content},
     ]
     try:
-        raw = siliconflow_tool_chat(messages_payload, temperature=payload.get("temperature") or 0.1)
+        raw = siliconflow_tool_chat(
+            messages_payload,
+            temperature=payload.get("temperature") or 0.1,
+            route_key="messages",
+        )
     except Exception as exc:
         # 直返错误文本，便于前端查看具体问题
         return {

@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, Response
 from .db import init_db
 from .background import install_background
-from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, ms_oauth, minutes, tools
+from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, minutes, tools, media, mp_rss, tasks, recorder, wechat8061, admin, langbot, invitations
 from .routers import news as newsfeed
 from .db import SessionLocal
 from .models import Message
@@ -38,15 +38,23 @@ def create_app() -> FastAPI:
     app.include_router(hooks.router)
     app.include_router(configs.router)
     app.include_router(sync.router)
+    # NOTE: must be mounted before /api/reports/{report_id} to avoid path shadowing.
+    app.include_router(invitations.router)
     app.include_router(reports.router)
     app.include_router(compat.router)
     app.include_router(email.router)
     app.include_router(extensions.router)
     app.include_router(news.router)
     app.include_router(folo.router)
-    app.include_router(ms_oauth.router)
     app.include_router(minutes.router)
     app.include_router(tools.router)
+    app.include_router(media.router)
+    app.include_router(mp_rss.router)
+    app.include_router(tasks.router)
+    app.include_router(recorder.router)
+    app.include_router(wechat8061.router)
+    app.include_router(admin.router)
+    app.include_router(langbot.router)
     # News feed aggregation (API-only, no frontend)
     app.include_router(newsfeed.router)
     app.include_router(market.router)
@@ -64,7 +72,8 @@ def create_app() -> FastAPI:
         """
         index_path = os.path.join(static_dir, "index.html")
         if os.path.exists(index_path):
-            return FileResponse(index_path)
+            # Avoid stale UI after frequent iterations
+            return FileResponse(index_path, headers={"Cache-Control": "no-store"})
         return Response("UI not found", media_type="text/plain", status_code=404)
 
     @app.get("/ui/legacy")

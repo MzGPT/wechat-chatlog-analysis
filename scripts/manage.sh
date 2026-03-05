@@ -24,6 +24,19 @@ ensure_env() {
 }
 
 ensure_venv() {
+  # 项目移动目录后，旧的 venv shebang 可能指向旧路径导致 "bad interpreter"
+  if [[ -d "$VENV_DIR" ]]; then
+    if [[ ! -x "$VENV_DIR/bin/python" && ! -x "$VENV_DIR/bin/python3" ]]; then
+      warn "检测到虚拟环境已损坏（缺少 python 可执行文件），将重建: $VENV_DIR"
+      rm -rf "$VENV_DIR"
+    else
+      # pip 可能存在但 shebang 已失效；用 python -m pip 做一次自检
+      if ! ("$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1 || "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1); then
+        warn "检测到虚拟环境 pip 不可用（可能路径已变更），将重建: $VENV_DIR"
+        rm -rf "$VENV_DIR"
+      fi
+    fi
+  fi
   if [[ ! -d "$VENV_DIR" ]]; then
     info "创建虚拟环境: $VENV_DIR"
     python3 -m venv "$VENV_DIR"
@@ -75,10 +88,21 @@ start_bg() {
   port=${PORT:-8000}
   info "以后台方式启动: http://$host:$port"
   cd "$ROOT_DIR"
-  nohup "$VENV_DIR/bin/uvicorn" "$APP_IMPORT" --host "$host" --port "$port" >"$LOG_FILE" 2>&1 &
+  local pybin
+  pybin="$VENV_DIR/bin/python"
+  if [[ ! -x "$pybin" ]]; then
+    pybin="$VENV_DIR/bin/python3"
+  fi
+  nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" >"$LOG_FILE" 2>&1 < /dev/null &
   echo $! > "$PID_FILE"
   sleep 1
-  ok "已启动 (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
+  if ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then
+    ok "已启动 (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
+  else
+    err "启动失败，请查看日志: $LOG_FILE"
+    tail -n 80 "$LOG_FILE" || true
+    return 1
+  fi
 }
 
 start_fg() {

@@ -25,3 +25,9 @@ uvicorn.log
 # Backups
 *.bak
 static/*.bak
+*.bak-*
+static/*.bak-*
+
+# Local UI screenshots (may contain PII)
+static/ui-*.png
+static/preview.png

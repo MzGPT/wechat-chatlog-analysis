@@ -5,41 +5,70 @@ import json
 import time
 import random
 import threading
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from ..config import settings
 
 
 DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
     "market": {
-        "system": "\n".join([
-            "你是面向投委会的首席策略官。请基于全部消息给出高信噪比的市场解读。",
-            "- 必须通览所有消息，合并相近主题，输出综合判断；",
-            "- 开头一句话给出整体点评并提示关键风险；",
-            "- 各子主题用概括性语言总结主要内容与关键信息，不摘抄原文，不逐条罗列消息；",
-            "- 可在句尾用短标 `#<id>` 标注代表消息来源。",
-        ]),
-        "user": "\n".join([
-            "请输出 {\\\"markdown\\\": string}：",
-            "# 市场观点总览",
-            "- 整体点评：<一句话概括市场基调/主要驱动/核心风险>",
-            "- 关键风险：<一句话指出需关注的触发因素与潜在影响>",
-            "## 宏观政策",
-            "- <主题A>：<综合结论>；<关键证据/逻辑>；<边际变化/不确定性> (#<id> 可选)",
-            "## 行业板块",
-            "- <主题A>：<综合结论>；<关键证据/逻辑>；<边际变化/不确定性>",
-            "## 公司基本面",
-            "- <主题A>：<综合结论>；<关键证据/逻辑>；<风险/待验证>",
-            "## 投资策略",
-            "- <建议>：<依据>；<风险控制>",
-            "## 市场情绪",
-            "- <情绪概括>：<迹象/成交/流向/分布>；<演变可能>",
-            "数据：{{messages_data}}",
-        ]),
+        "system": "\n".join(
+            [
+                "你是面向券商投研/基金经理的一线投研助理，目标是把大量聊天摘要提炼成“可执行、可交易、可跟踪”的市场观点。",
+                "输出必须为 Markdown（不要输出 HTML/代码块）。",
+                "约束：",
+                "- 必须通览全部数据，合并相近主题，避免逐条复述；",
+                "- 结构固定为 7 个部分：总基调、宏观政策、行业赛道、公司基本面、投资策略、市场情绪、风险负面；",
+                "- 各部分要短而密集，信息不足要直说“信息有限/暂无可靠线索”；",
+                "- 结论要落到：影响路径（为什么重要）+ 受益/受损方向（谁受影响）+ 需要跟踪的指标/触发条件；",
+                "- 严禁复制原文；仅基于 summary 等概括性字段归纳；",
+                "- 需要引用证据时，在句尾追加 `#<id>`（可多个）。",
+                "- 行业赛道必须按“细分行业”分点输出；公司基本面必须按“重点公司”分点输出。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请严格返回一个 JSON 对象 {\"markdown\": string, \"quant\": object}（不要代码块）。",
+                "",
+                "其中 markdown 必须严格按以下结构输出：",
+                "# 市场观点总结",
+                "- 总基调：<一句话给出主线/情绪/主驱动> #<id>",
+                "## 宏观政策",
+                "- <结论>；<影响路径/跟踪指标> #<id>",
+                "## 行业/赛道（细分行业）",
+                "- <细分行业A>：<结论>；<受益/受损>；<跟踪> #<id>",
+                "- <细分行业B>：<结论>；<受益/受损>；<跟踪> #<id>",
+                "## 公司基本面（重点公司）",
+                "- <公司A>：<结论>；<关键变量/估值/业绩变化>；<跟踪> #<id>",
+                "- <公司B>：<结论>；<关键变量/估值/业绩变化>；<跟踪> #<id>",
+                "## 投资策略",
+                "- <仓位/风格/配置建议>；<触发条件> #<id可选>",
+                "## 市场情绪",
+                "- <资金与风险偏好观察>；<确认方式/指标> #<id可选>",
+                "## 风险/负面",
+                "- <主要风险>；<触发条件>；<冲击路径> #<id>",
+                "",
+                "quant 用于量化统计，请输出：",
+                "{",
+                "  \"topics\": [",
+                "    {\"topic\":\"<议题名>\", \"bullish_ids\":[\"<id>\",...], \"bearish_ids\":[\"<id>\",...], \"neutral_ids\":[\"<id>\",...] }",
+                "  ]",
+                "}",
+                "要求：",
+                "- topics 建议 3-10 个，优先覆盖 markdown 里提到的关键议题；",
+                "- 仅使用数据里真实出现的 id；id 用字符串；各列表去重；",
+                "- bullish/bearish/neutral 的判断必须可追溯：每个 id 尽量在 markdown 对应要点中出现（#<id>）。",
+                "",
+                "数据：{{messages_data}}",
+            ]
+        ),
     },
     "meetings": {
         "system": "\n".join([
             "你是一名会议情报分析师，要从大量聊天记录中抽取可靠的会议/路演安排 (真实、可核查)。",
+            "输出必须为 Markdown（不要输出 HTML）；优先表格化，字段尽量对齐；避免长段落。",
             "请整合不同来源的信息，识别时间、平台/形式、会议号、讲者/机构与要点，必要时标注待确认的细节。",
             "只保留事实支撑的信息，禁止虚构与臆测。",
         ]),
@@ -59,6 +88,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
     "counter": {
         "system": "\n".join([
             "你是分歧聚合分析师。请通读全部消息，将相近主题归为同一议题，输出正反双方要点。",
+            "输出必须为 Markdown（不要输出 HTML）；结构固定、表格列对齐；每个议题尽量控制在一屏可读范围。",
             "- 每个议题必须包含标题（## 议题：...）；",
             "- 每个议题用 Markdown 表格给出 正方/反方 的 结论/建议、主要依据、代表消息(#id)；",
             "- 另列 冲突点 与 疑问点；不摘抄原文，不罗列标题。",
@@ -85,6 +115,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
     "contacts": {
         "system": "\n".join([
             "你是社交网络分析师。请严格基于数据中提供的 'rating' 字段识别高价值联系人（评分>=60）。",
+            "输出必须为 Markdown（不要输出 HTML）；使用固定小标题与短要点，便于前端统一渲染。",
             "仅基于提供的联系人列表进行分析；列表外的联系人一律忽略。",
             "必须使用消息摘要（summary字段）进行总结，严禁复制原文内容。",
             "禁止复制整条消息，只能使用摘要的概括性内容，必要时引用短句，并标注时间或上下文。",
@@ -106,21 +137,131 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
         ]),
     },
         "newswatch": {
-        "system": "你是舆情风控分析师。将多来源新闻整合为面向投研/交易的简报。要求：1) 仅纳入近72小时内的新闻（优先近24小时）；2) 合并相近主题，去重，不复述标题；3) 用概括性语言总结影响路径/受益与受损/待验证；4) 句尾可用 #(id) 标注来源；5) 输出结构清晰、可执行。",
-        "user": """
-请输出 {\"markdown\": string}：
-# 新闻舆情监测
-- 总体基调：<一句话概括主线/风险/催化>
-- 关键风险：<1-2条>
-## 主题脉络
-- <主题A>：<综合结论>；<影响路径/受益与受损>；<待验证/数据点>；<时间敏感性> (#<id> 可选)
-- <主题B> ...
-## 关注动作
-- <动作1>：<目的/触发条件>；<跟踪指标>
-- <动作2> ...
-（仅整合近72小时新闻。避免罗列标题/链接，使用归纳性语言。）
-数据：{{messages_data}}
-"""
+        "system": "\n".join(
+            [
+                "你是舆情风控分析师，把近72小时新闻整合为投研/交易可用的日报。",
+                "输出必须为 Markdown（不要输出 HTML/代码块）。",
+                "约束：",
+                "- 合并相近主题、去重，不复述标题/链接；",
+                "- 每条要点必须包含：结论 + 影响路径 + 可跟踪指标/触发条件；",
+                "- 子标题固定为 7 类：宏观/政策、行业/赛道、公司/事件、海外/地缘、科技/民生、资金/流向、风险/负面；",
+                "- 全文要点总数<=20（不含标题行），优先输出最重要的；",
+                "- 需要引用证据时，在句尾追加 `#<id>`（news id）。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请严格返回一个 JSON 对象 {\"markdown\": string, \"quant\": object}（不要代码块）。",
+                "",
+                "# 新闻舆情监测",
+                "- 总体基调：<一句话概括主线/催化/风险>",
+                "",
+                "## 宏观/政策",
+                "- <主题>：<结论>；<影响路径>；<跟踪指标/触发> #<id>",
+                "",
+                "## 行业/赛道",
+                "- <主题>：<结论>；<受益/受损>；<跟踪> #<id>",
+                "",
+                "## 公司/事件",
+                "- <公司/事件>：<结论>；<关键变量/数据点>；<跟踪> #<id>",
+                "",
+                "## 海外/地缘",
+                "- <主题>：<结论>；<影响路径>；<跟踪> #<id>",
+                "",
+                "## 科技/民生",
+                "- <主题>：<结论>；<影响路径/用户行为变化>；<跟踪> #<id>",
+                "",
+                "## 资金/流向",
+                "- <方向>：<观察>；<可能原因>；<确认方式/指标> #<id可选>",
+                "",
+                "## 风险/负面",
+                "- <风险>：<触发条件>；<潜在冲击>；<对冲/规避动作> #<id>",
+                "",
+                "## 今日行动（不超过3条）",
+                "- <动作>：<目的>；<触发条件/指标>",
+                "",
+                "quant 用于量化统计，请输出：",
+                "{",
+                "  \"topics\": [",
+                "    {\"topic\":\"<议题名>\", \"bullish_ids\":[\"<id>\",...], \"bearish_ids\":[\"<id>\",...], \"neutral_ids\":[\"<id>\",...] }",
+                "  ]",
+                "}",
+                "要求：",
+                "- topics 建议 5-12 个，覆盖最重要新闻主题；",
+                "- 仅使用数据里真实出现的 id；id 用字符串；各列表去重；",
+                "- bullish/bearish/neutral 的判断要可追溯：每个 id 尽量在 markdown 对应要点中出现（#<id>）。",
+                "",
+                "数据：{{messages_data}}",
+            ]
+        ),
+    },
+
+    "mediawatch": {
+        "system": "\n".join([
+            "你是自媒体舆情分析师，负责把抖音/小红书等平台的最新内容聚合成可执行的简报。",
+            "输出必须为 Markdown（不要输出 HTML）；优先短要点与表格，避免长段原文。",
+            "要求：1) 合并相近主题，避免逐条复述标题；2) 优先使用摘要/转写文本，不复制长原文；3) 输出要点与行动建议；4) 可在句尾用 `#<id>` 标注来源。",
+        ]),
+        "user": "\n".join([
+            "请输出 {\"markdown\": string}：",
+            "# 自媒体聚合摘要",
+            "- 总体基调：<一句话概括近期主线/情绪>",
+            "- 热点主题：<2-4个主题词/关键词>",
+            "## 重点内容",
+            "- <主题A>：<综合结论>；<传播点/关注点>；<可能影响> (#<id> 可选)",
+            "- <主题B>：...",
+            "## 值得转写/深挖",
+            "- <条目>：<原因>；<建议动作> (#<id> 可选)",
+            "## 明细（近20条，按时间倒序）",
+            "| 时间 | 平台 | 作者 | 标题 | 关键要点 |",
+            "| --- | --- | --- | --- | --- |",
+            "| 12-22 10:30 | 抖音 | 张三 | ... | ... |",
+            "数据：{{messages_data}}",
+        ]),
+    },
+
+    "mpwatch": {
+        "system": "\n".join([
+            "你是公众号文章情报分析师，负责把关注公众号的最新文章与摘要整合成投研可读的简报。",
+            "输出必须为 Markdown（不要输出 HTML）；结构固定，便于前端对齐展示。",
+            "要求：1) 不逐条复述标题；2) 合并相近主题；3) 优先使用摘要，不复制全文；4) 给出可执行的关注动作；5) 可用 `#<id>` 标注来源。",
+        ]),
+        "user": "\n".join([
+            "请输出 {\"markdown\": string}：",
+            "# 公众号聚合摘要",
+            "- 总体概览：<一句话概括更新量/重点方向>",
+            "## 主题归纳",
+            "- <主题A>：<综合结论>；<关键点> (#<id> 可选)",
+            "- <主题B>：...",
+            "## 待读清单（近20篇）",
+            "| 时间 | 公众号 | 标题 | 摘要要点 |",
+            "| --- | --- | --- | --- |",
+            "| 12-22 09:10 | XXX | ... | ... |",
+            "数据：{{messages_data}}",
+        ]),
+    },
+
+    "minuteswatch": {
+        "system": "\n".join([
+            "你是会议纪要整理与复盘助手，负责把近期会议记录/纪要提炼为条目化的结论与待办。",
+            "输出必须为 Markdown（不要输出 HTML）；优先短要点与可执行动作，避免逐字稿。",
+            "要求：1) 优先使用现成的会议纪要/要点；2) 不复述长逐字稿；3) 输出行动项与待确认信息；4) 可用 `#<id>` 标注来源。",
+        ]),
+        "user": "\n".join([
+            "请输出 {\"markdown\": string}：",
+            "# 纪要聚合摘要",
+            "- 概览：<会议数量/主题分布/关键结论>",
+            "## 关键结论",
+            "- <结论1>：<依据/原话摘要> (#<id> 可选)",
+            "- <结论2>：...",
+            "## 行动项",
+            "- <动作1>：<负责人/截止时间(如有)>",
+            "- <动作2>：...",
+            "## 明细（近10场）",
+            "| 时间 | 标题/主讲 | 主题 | 要点摘要 |",
+            "| --- | --- | --- | --- |",
+            "数据：{{messages_data}}",
+        ]),
     },
 
     "socialwatch": {
@@ -129,7 +270,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
     },
 }
 
-DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
+DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
     "message_summary": {
         "system": (
             "你是专业的投研信息提取助手。你的任务是：\n"
@@ -193,23 +334,306 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, str]] = {
     ,
     "minutes_summary": {
         "system": (
-            "你是会议纪要压缩助手，负责把会议纪要或录音文本压缩成<=300字的主题摘要。\n"
+            "你是会议纪要摘要助手，负责把会议纪要或录音转写文本压缩成“结构化摘要”（<=500字）。\n"
             "要求：\n"
-            "- 不要复述文件标题；从正文提炼'主题、核心结论、主要依据/要点'；\n"
-            "- 如出现明确的会议/路演安排信息（平台/会议号/时间），可简短保留；\n"
-            "- 输出须以'ai: '开头；禁止编造信息；"
+            "- 必须先给出一个【标题】概括会议主题（放在摘要开头）。\n"
+            "- 摘要主体用“要点大纲 + 分段/小标题”组织，突出逻辑链条与结构；覆盖所有重要点。\n"
+            "- 不要复述文件名/标题；不要逐句抄原文；但要尽量涵盖细节与关键事实。\n"
+            "- 如出现明确的会议/路演安排信息（平台/会议号/时间），可在开头或末尾以一行简短保留。\n"
+            "- 禁止编造信息；信息不足时明确写“信息有限”。\n"
+            "- 输出必须以'ai: '开头。"
         ),
         "user": (
             "请逐条总结以下会议纪要文本（JSON数组：id/time/sender/content），返回JSON数组，每个元素：\n"
             "{\n"
             "  \"id\": string,\n"
-            "  \"summary\": string,     // 必填，<=300字，自然语句；必须以'ai: '开头\n"
+            "  \"summary\": string,     // 必填，<=500字；必须以'ai: '开头；结构示例：ai: 【标题】...\\n要点：\\n- ...\\n- ...\\n结论：...\\n待办：...\n"
             "  \"tone\": string         // 可选：positive/negative/neutral\n"
             "}\n\n"
             "数据：{{messages_json}}"
         ),
     }
+    ,
+    "minutes_refine": {
+        "system": (
+            "你是一名会议记录整理助手。你会收到一段会议录音的转写文本（可能口语化、断句混乱、含口误/赘词）。\n"
+            "你的目标：把转写整理为“通顺、结构清晰、尽量保留细节”的会议详细记录。\n"
+            "要求：\n"
+            "- 不要删减重要内容；尽可能保留原有详细程度（允许删除重复赘词/口水话/明显口误）。\n"
+            "- 修正明显的语序问题、断句、口语化表达与明显的转写错误，使其可读。\n"
+            "- 识别多人讨论：根据称呼/语气/问答/上下文，尽量区分角色；不确定时用“发言人A/B/主持/提问者”等占位。\n"
+            "- 将 Q&A 片段整理为 Q(角色): / A(角色): 形式；讨论片段按角色分段。\n"
+            "- 禁止编造未出现的信息；不要加入你的分析/评价。\n"
+            "- 输出为 JSON 对象（不是数组），字段 refined 为整理后的会议详细记录文本（可用 Markdown）。"
+        ),
+        "user": (
+            "请整理下面的会议转写（messages_json 是单元素数组，包含 id/time/sender/content）。\n"
+            "只返回一个 JSON 对象：\n"
+            "{\n"
+            "  \"id\": string,\n"
+            "  \"summary\": string,     // 简短占位即可，必须以'ai: '开头（例如 ai: ok）\n"
+            "  \"refined\": string      // 必填：整理后的会议详细记录（尽量保留细节，结构清晰，可多段）\n"
+            "}\n\n"
+            "数据：{{messages_json}}"
+        ),
+    }
+    ,
+    "reply_generation": {
+        "label": "旧默认(兼容)",
+        "system": "\n".join(
+            [
+                "你是一名专业的微信沟通助手，负责生成可直接发送的中文回复。",
+                "要求：",
+                "- 输出纯文本（不要 Markdown、不要代码块、不要解释）。",
+                "- 语气礼貌克制、信息密度高、避免夸张与营销腔。",
+                "- 不要编造事实；若信息不足，用一句话提出需要确认的问题。",
+                "- 若操作类型为“约”，优先给出可执行的时间/方式确认；",
+                "- 若为“问”，给出结构化要点并提供下一步建议；",
+                "- 若为“答”，直接回应问题并给出明确结论或行动；",
+                "- 若为“顶/踩”，分别表达赞同或提示风险，保持专业。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请根据以下信息生成一段可直接发送的回复（仅输出回复文本）：",
+                "- 操作类型：{{operation_type}}",
+                "- 对方：{{sender_name}}",
+                "- 会话：{{talker_name}}",
+                "- 原消息：{{message_text}}",
+                "",
+                "回复要求：1-6句，必要时可分点；避免空话套话。",
+            ]
+        ),
+    }
+    ,
+    "reply_yue": {
+        "label": "约",
+        "system": "\n".join(
+            [
+                "你是一名专业的微信沟通助手，擅长把“邀约/约时间/约会议/约电话”回复写得明确、可执行。",
+                "输出要求：",
+                "- 仅输出可直接发送的中文纯文本（不要 Markdown、不要解释）。",
+                "- 语气礼貌克制、信息密度高；避免套话。",
+                "- 给出 2 个可选时间窗口 + 1 个确认方式（线上/电话/地点/会议号）。",
+                "- 若缺少关键要素（时间/地点/主题/时长/参会人），用 1 句追问补齐。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请基于以下原消息，生成一段“约时间/确认会议”的回复（仅输出回复文本）：",
+                "- 对方：{{sender_name}}",
+                "- 会话：{{talker_name}}",
+                "- 原消息：{{message_text}}",
+                "",
+                "回复长度：2-5句。优先提供两个可选时间段，并请对方确认。",
+            ]
+        ),
+    }
+    ,
+    "reply_wen": {
+        "label": "问",
+        "system": "\n".join(
+            [
+                "你是一名专业的微信沟通助手，负责提出“高质量问题/澄清需求/追问关键信息”。",
+                "输出要求：",
+                "- 仅输出可直接发送的中文纯文本（不要 Markdown、不要解释）。",
+                "- 语气礼貌克制；避免质问；每句话都要有信息增量。",
+                "- 问题要少而关键：优先 2-4 个点，覆盖目标、范围、时间、约束、交付物。",
+                "- 若可以给出备选方案/下一步，也用 1 句带出。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请基于以下原消息，生成一段“追问澄清”的回复（仅输出回复文本）：",
+                "- 对方：{{sender_name}}",
+                "- 会话：{{talker_name}}",
+                "- 原消息：{{message_text}}",
+                "",
+                "回复长度：2-6句，可分点提问。",
+            ]
+        ),
+    }
+    ,
+    "reply_da": {
+        "label": "答",
+        "system": "\n".join(
+            [
+                "你是一名专业的微信沟通助手，负责给出“明确答复/可执行结论/下一步动作”。",
+                "输出要求：",
+                "- 仅输出可直接发送的中文纯文本（不要 Markdown、不要解释）。",
+                "- 结论先行：第一句给结论或明确态度；后面补 1-3 条依据/安排。",
+                "- 不要编造事实；信息不足时，先给临时结论 + 1 句需要确认的问题。",
+                "- 尽量给出下一步动作与时间点（如“我今天xx前发你”）。",
+            ]
+        ),
+        "user": "\n".join(
+            [
+                "请基于以下原消息，生成一段“答复确认”的回复（仅输出回复文本）：",
+                "- 对方：{{sender_name}}",
+                "- 会话：{{talker_name}}",
+                "- 原消息：{{message_text}}",
+                "",
+                "回复长度：1-6句，结论优先。",
+            ]
+        ),
+    }
 }
+
+
+def _clamp_int(v: Any, lo: int, hi: int, default: int) -> int:
+    try:
+        iv = int(v)
+        return max(lo, min(hi, iv))
+    except Exception:
+        return default
+
+
+def _to_channel_list(raw: Any, defaults: List[dict]) -> List[dict]:
+    src = raw if isinstance(raw, list) and raw else defaults
+    out: List[dict] = []
+    seen_ids: set[str] = set()
+    for i, item in enumerate(src):
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or f"ch-{i+1}").strip()[:64]
+        if not cid or cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        out.append(
+            {
+                "id": cid,
+                "name": str(item.get("name") or cid).strip()[:120],
+                "model": str(item.get("model") or "").strip(),
+                "weight": _clamp_int(item.get("weight"), 1, 32, 1),
+                "enabled": bool(item.get("enabled") if item.get("enabled") is not None else True),
+                "api_url": str(item.get("api_url") or "").strip(),
+                "api_key": str(item.get("api_key") or "").strip(),
+                "max_inflight": _clamp_int(item.get("max_inflight"), 1, 256, max(2, _LLM_MAX_PARALLEL)),
+            }
+        )
+    return out or defaults
+
+
+def _to_route_map(raw: Any, default_map: Dict[str, List[str]], valid_ids: set[str]) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    src = raw if isinstance(raw, dict) else {}
+    for k, default_ids in default_map.items():
+        vals = src.get(k, default_ids)
+        ids: List[str] = []
+        if isinstance(vals, str):
+            vals = [v.strip() for v in vals.split(",") if v.strip()]
+        if isinstance(vals, list):
+            for v in vals:
+                sid = str(v or "").strip()
+                if sid and sid in valid_ids and sid not in ids:
+                    ids.append(sid)
+        if not ids:
+            ids = [sid for sid in default_ids if sid in valid_ids]
+        out[k] = ids
+    return out
+
+
+def _default_model_router(conf: Dict[str, Any]) -> Dict[str, Any]:
+    main_model = str(conf.get("model") or "Qwen/Qwen3-30B-A3B").strip()
+    mid_model = str(conf.get("tool_model_messages") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
+    tool_msg_model = str(conf.get("tool_model_messages") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
+    tool_email_model = str(conf.get("tool_model_emails") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
+    main_channels = [{"id": "main-1", "name": "主通道-1", "model": main_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""}]
+    mid_channels = [{"id": "mid-1", "name": "中模型-1", "model": mid_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""}]
+    tool_channels = [
+        {"id": "tool-msg", "name": "小模型-微信", "model": tool_msg_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
+        {"id": "tool-email", "name": "小模型-邮件", "model": tool_email_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
+    ]
+    main_route_defaults = {
+        "default": ["main-1"],
+        "market": ["main-1"],
+        "meetings": ["main-1"],
+        "counter": ["main-1"],
+        "contacts": ["main-1"],
+        "newswatch": ["main-1"],
+        "socialwatch": ["main-1"],
+        "mediawatch": ["main-1"],
+        "mpwatch": ["main-1"],
+        "minuteswatch": ["main-1"],
+    }
+    tool_route_defaults = {
+        "default": ["tool-msg"],
+        "messages": ["tool-msg"],
+        "emails": ["tool-email"],
+        "minutes": ["tool-msg"],
+        "reply": ["tool-msg"],
+    }
+    mid_route_defaults = {
+        "default": ["mid-1"],
+        "messages": ["mid-1"],
+        "reply": ["mid-1"],
+    }
+    return {
+        "enabled": False,
+        "strategy": "mixed",
+        "prefer_router": True,
+        "dynamic_weighting": True,
+        "breaker_failures": 3,
+        "cooldown_seconds": 45,
+        "latency_ref_ms": 3000,
+        "main_channels": main_channels,
+        "mid_channels": mid_channels,
+        "tool_channels": tool_channels,
+        "main_module_channels": main_route_defaults,
+        "mid_route_channels": mid_route_defaults,
+        "tool_route_channels": tool_route_defaults,
+    }
+
+
+def _normalize_model_router(raw_router: Any, conf: Dict[str, Any]) -> Dict[str, Any]:
+    defaults = _default_model_router(conf)
+    router = raw_router if isinstance(raw_router, dict) else {}
+
+    main_channels = _to_channel_list(router.get("main_channels"), defaults["main_channels"])
+    mid_channels = _to_channel_list(router.get("mid_channels"), defaults["mid_channels"])
+    tool_channels = _to_channel_list(router.get("tool_channels"), defaults["tool_channels"])
+    main_ids = {c["id"] for c in main_channels}
+    mid_ids = {c["id"] for c in mid_channels}
+    tool_ids = {c["id"] for c in tool_channels}
+    main_route_defaults = defaults["main_module_channels"]
+    mid_route_defaults = defaults["mid_route_channels"]
+    tool_route_defaults = defaults["tool_route_channels"]
+
+    normalized = {
+        "enabled": bool(router.get("enabled") if router.get("enabled") is not None else defaults["enabled"]),
+        "strategy": "mixed",
+        "prefer_router": bool(router.get("prefer_router") if router.get("prefer_router") is not None else defaults["prefer_router"]),
+        "dynamic_weighting": bool(
+            router.get("dynamic_weighting")
+            if router.get("dynamic_weighting") is not None
+            else defaults.get("dynamic_weighting", True)
+        ),
+        "breaker_failures": _clamp_int(
+            router.get("breaker_failures"),
+            2,
+            10,
+            int(defaults.get("breaker_failures", 3)),
+        ),
+        "cooldown_seconds": _clamp_int(
+            router.get("cooldown_seconds"),
+            5,
+            600,
+            int(defaults.get("cooldown_seconds", 45)),
+        ),
+        "latency_ref_ms": _clamp_int(
+            router.get("latency_ref_ms"),
+            300,
+            20000,
+            int(defaults.get("latency_ref_ms", 3000)),
+        ),
+        "main_channels": main_channels,
+        "mid_channels": mid_channels,
+        "tool_channels": tool_channels,
+        "main_module_channels": _to_route_map(router.get("main_module_channels"), main_route_defaults, main_ids),
+        "mid_route_channels": _to_route_map(router.get("mid_route_channels"), mid_route_defaults, mid_ids),
+        "tool_route_channels": _to_route_map(router.get("tool_route_channels"), tool_route_defaults, tool_ids),
+    }
+    return normalized
 
 
 def load_ai_config() -> Dict[str, Any]:
@@ -259,14 +683,41 @@ def load_ai_config() -> Dict[str, Any]:
     conf["module_prompts"] = merged_prompts
 
     stored_tool = conf.get("tool_prompts") or {}
-    merged_tool_prompts: Dict[str, Dict[str, str]] = {}
+    merged_tool_prompts: Dict[str, Dict[str, Any]] = {}
     for key, defaults in DEFAULT_TOOL_PROMPTS.items():
         saved = stored_tool.get(key) or {}
         merged_tool_prompts[key] = {
             "system": saved.get("system") or defaults["system"],
             "user": saved.get("user") or defaults["user"],
         }
+        label: str = ""
+        if isinstance(saved, dict) and isinstance(saved.get("label"), str) and saved.get("label").strip():
+            label = saved.get("label").strip()
+        elif isinstance(defaults, dict) and isinstance(defaults.get("label"), str) and defaults.get("label").strip():
+            label = defaults.get("label").strip()
+        if label:
+            merged_tool_prompts[key]["label"] = label
+
+    # Preserve user-defined custom tool prompts (e.g., reply_* shortcuts).
+    if isinstance(stored_tool, dict):
+        for k, v in stored_tool.items():
+            if k in merged_tool_prompts:
+                continue
+            if not isinstance(k, str) or not k.strip():
+                continue
+            if not isinstance(v, dict):
+                continue
+            system = v.get("system")
+            user = v.get("user")
+            if not isinstance(system, str) or not isinstance(user, str):
+                continue
+            entry: Dict[str, Any] = {"system": system, "user": user}
+            if isinstance(v.get("label"), str) and v.get("label").strip():
+                entry["label"] = v.get("label").strip()
+            merged_tool_prompts[k.strip()] = entry
+
     conf["tool_prompts"] = merged_tool_prompts
+    conf["model_router"] = _normalize_model_router(conf.get("model_router"), conf)
     return conf
 
 
@@ -318,14 +769,40 @@ def save_ai_config(conf: Dict[str, Any]) -> None:
     normalized["module_prompts"] = merged_prompts
 
     stored_tool = normalized.get("tool_prompts") or {}
-    merged_tool_prompts: Dict[str, Dict[str, str]] = {}
+    merged_tool_prompts: Dict[str, Dict[str, Any]] = {}
     for key, defaults in DEFAULT_TOOL_PROMPTS.items():
         saved = stored_tool.get(key) or {}
         merged_tool_prompts[key] = {
             "system": saved.get("system") or defaults["system"],
             "user": saved.get("user") or defaults["user"],
         }
+        label: str = ""
+        if isinstance(saved, dict) and isinstance(saved.get("label"), str) and saved.get("label").strip():
+            label = saved.get("label").strip()
+        elif isinstance(defaults, dict) and isinstance(defaults.get("label"), str) and defaults.get("label").strip():
+            label = defaults.get("label").strip()
+        if label:
+            merged_tool_prompts[key]["label"] = label
+
+    # Preserve custom tool prompts (e.g., reply_* shortcuts) and their label fields.
+    if isinstance(stored_tool, dict):
+        for k, v in stored_tool.items():
+            kk = str(k or "").strip()
+            if not kk or kk in merged_tool_prompts:
+                continue
+            if not isinstance(v, dict):
+                continue
+            system = v.get("system")
+            user = v.get("user")
+            if not isinstance(system, str) or not isinstance(user, str):
+                continue
+            entry: Dict[str, Any] = {"system": system, "user": user}
+            if isinstance(v.get("label"), str) and v.get("label").strip():
+                entry["label"] = v.get("label").strip()
+            merged_tool_prompts[kk] = entry
+
     normalized["tool_prompts"] = merged_tool_prompts
+    normalized["model_router"] = _normalize_model_router(normalized.get("model_router"), normalized)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(normalized, f, ensure_ascii=False, indent=2)
 
@@ -333,6 +810,436 @@ def save_ai_config(conf: Dict[str, Any]) -> None:
 _LLM_MAX_PARALLEL = max(1, int(os.getenv("AI_MAX_PARALLEL", "3") or 3))
 # Global semaphore to throttle concurrent LLM calls across the process
 _LLM_SEMAPHORE = threading.BoundedSemaphore(_LLM_MAX_PARALLEL)
+_MODEL_ROUTER_LOCK = threading.Lock()
+_MODEL_ROUTER_COUNTERS: Dict[str, int] = {}
+_MODEL_ROUTER_STATS: Dict[str, Dict[str, Any]] = {}
+_MODEL_ROUTER_LAST_PERSIST_AT: float = 0.0
+
+
+def _now_ts() -> float:
+    try:
+        return time.time()
+    except Exception:
+        return 0.0
+
+
+def _router_metrics_path() -> str:
+    return os.path.abspath(os.path.join(os.getcwd(), "data", "router_metrics.json"))
+
+
+def _router_trace_path() -> str:
+    return os.path.abspath(os.path.join(os.getcwd(), "data", "router_traces.jsonl"))
+
+
+def _safe_domain(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _get_channel_runtime(channel_id: str) -> Dict[str, Any]:
+    with _MODEL_ROUTER_LOCK:
+        st = _MODEL_ROUTER_STATS.get(channel_id)
+        if st is None:
+            st = {
+                "calls": 0,
+                "success": 0,
+                "failure": 0,
+                "consecutive_failures": 0,
+                "ema_latency_ms": None,
+                "inflight": 0,
+                "last_error": "",
+                "last_status": "",
+                "last_latency_ms": None,
+                "last_at": 0.0,
+                "cooldown_until": 0.0,
+            }
+            _MODEL_ROUTER_STATS[channel_id] = st
+        return st
+
+
+def _persist_router_metrics(force: bool = False) -> None:
+    global _MODEL_ROUTER_LAST_PERSIST_AT
+    now = _now_ts()
+    if not force and now - _MODEL_ROUTER_LAST_PERSIST_AT < 5.0:
+        return
+    _MODEL_ROUTER_LAST_PERSIST_AT = now
+    try:
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        with _MODEL_ROUTER_LOCK:
+            for k, v in _MODEL_ROUTER_STATS.items():
+                snapshot[k] = dict(v)
+        os.makedirs(os.path.abspath(os.path.join(os.getcwd(), "data")), exist_ok=True)
+        with open(_router_metrics_path(), "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+
+def _append_router_trace(
+    *,
+    route_kind: str,
+    route_key: str | None,
+    channel_id: str,
+    model: str,
+    api_url: str,
+    ok: bool,
+    latency_ms: float,
+    reason: str,
+) -> None:
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "route_kind": route_kind,
+        "route_key": str(route_key or "default"),
+        "channel_id": channel_id,
+        "model": model,
+        "provider": _safe_domain(api_url),
+        "ok": bool(ok),
+        "latency_ms": round(float(latency_ms), 1),
+        "reason": reason[:240] if reason else "",
+    }
+    try:
+        os.makedirs(os.path.abspath(os.path.join(os.getcwd(), "data")), exist_ok=True)
+        with open(_router_trace_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        return
+
+
+def _router_mark_inflight(channel_id: str, delta: int) -> None:
+    if not channel_id:
+        return
+    st = _get_channel_runtime(channel_id)
+    with _MODEL_ROUTER_LOCK:
+        inflight = int(st.get("inflight") or 0) + int(delta)
+        st["inflight"] = max(0, inflight)
+        st["last_at"] = _now_ts()
+
+
+def _router_mark_result(
+    channel: dict | None,
+    *,
+    ok: bool,
+    latency_ms: float,
+    err: str = "",
+    conf: dict | None = None,
+) -> None:
+    if not isinstance(channel, dict):
+        return
+    channel_id = str(channel.get("id") or "").strip()
+    if not channel_id:
+        return
+    st = _get_channel_runtime(channel_id)
+    now = _now_ts()
+    base_cooldown = 45
+    breaker_failures = 3
+    if isinstance(conf, dict):
+        router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+        try:
+            base_cooldown = _clamp_int(router.get("cooldown_seconds"), 5, 600, base_cooldown)
+        except Exception:
+            pass
+        try:
+            breaker_failures = _clamp_int(router.get("breaker_failures"), 2, 10, breaker_failures)
+        except Exception:
+            pass
+    with _MODEL_ROUTER_LOCK:
+        st["calls"] = int(st.get("calls") or 0) + 1
+        st["last_at"] = now
+        st["last_latency_ms"] = float(latency_ms)
+        ema = st.get("ema_latency_ms")
+        if ema is None:
+            st["ema_latency_ms"] = float(latency_ms)
+        else:
+            st["ema_latency_ms"] = float(0.25 * float(latency_ms) + 0.75 * float(ema))
+        if ok:
+            st["success"] = int(st.get("success") or 0) + 1
+            st["consecutive_failures"] = 0
+            st["last_error"] = ""
+            st["last_status"] = "ok"
+            st["cooldown_until"] = 0.0
+        else:
+            st["failure"] = int(st.get("failure") or 0) + 1
+            st["consecutive_failures"] = int(st.get("consecutive_failures") or 0) + 1
+            st["last_error"] = str(err or "")[:240]
+            st["last_status"] = "error"
+            cfail = int(st.get("consecutive_failures") or 0)
+            if cfail >= breaker_failures:
+                cool = min(600, base_cooldown * (2 ** max(0, cfail - breaker_failures)))
+                st["cooldown_until"] = now + cool
+    _persist_router_metrics()
+
+
+def _channel_success_rate(channel_id: str) -> float:
+    st = _get_channel_runtime(channel_id)
+    calls = float(st.get("calls") or 0.0)
+    succ = float(st.get("success") or 0.0)
+    return (succ + 1.0) / (calls + 2.0)
+
+
+def _channel_latency_factor(channel_id: str, latency_ref_ms: int) -> float:
+    st = _get_channel_runtime(channel_id)
+    ema = st.get("ema_latency_ms")
+    if ema is None:
+        return 0.9
+    try:
+        lat = max(1.0, float(ema))
+    except Exception:
+        return 0.9
+    ref = max(300.0, float(latency_ref_ms))
+    return 1.0 / (1.0 + (lat / ref))
+
+
+def _channel_concurrency_factor(channel: dict) -> float:
+    cid = str(channel.get("id") or "").strip()
+    if not cid:
+        return 1.0
+    st = _get_channel_runtime(cid)
+    inflight = int(st.get("inflight") or 0)
+    max_inflight = _clamp_int(channel.get("max_inflight"), 1, 256, max(2, _LLM_MAX_PARALLEL))
+    if inflight <= 0:
+        return 1.0
+    if inflight >= max_inflight:
+        return 0.2
+    ratio = float(inflight) / float(max_inflight)
+    return max(0.25, 1.0 - 0.8 * ratio)
+
+
+def _is_channel_in_cooldown(channel_id: str) -> bool:
+    st = _get_channel_runtime(channel_id)
+    try:
+        until = float(st.get("cooldown_until") or 0.0)
+    except Exception:
+        until = 0.0
+    return until > _now_ts()
+
+
+def _dynamic_rank_channels(channels: List[dict], *, route_key: str, conf: Dict[str, Any]) -> List[dict]:
+    enabled = [c for c in channels if isinstance(c, dict) and c.get("enabled") and str(c.get("model") or "").strip()]
+    if not enabled:
+        return []
+    router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+    dynamic_enabled = bool(router.get("dynamic_weighting", True))
+    latency_ref_ms = _clamp_int(router.get("latency_ref_ms"), 300, 20000, 3000)
+    # Preserve old deterministic behavior before any runtime sample exists.
+    has_runtime_sample = False
+    now = _now_ts()
+    for ch in enabled:
+        cid = str(ch.get("id") or "").strip()
+        if not cid:
+            continue
+        st = _get_channel_runtime(cid)
+        if (
+            int(st.get("calls") or 0) > 0
+            or int(st.get("success") or 0) > 0
+            or int(st.get("failure") or 0) > 0
+            or int(st.get("inflight") or 0) > 0
+            or float(st.get("cooldown_until") or 0.0) > now
+        ):
+            has_runtime_sample = True
+            break
+    if not dynamic_enabled or not has_runtime_sample:
+        chosen = _weighted_round_robin(enabled, key=route_key)
+        if not chosen:
+            return enabled
+        chosen_id = str(chosen.get("id") or "").strip()
+        ordered: list[dict] = [chosen]
+        for ch in enabled:
+            if str(ch.get("id") or "").strip() != chosen_id:
+                ordered.append(ch)
+        return ordered
+
+    scored: list[tuple[float, dict]] = []
+    cooled: list[tuple[float, dict]] = []
+    for ch in enabled:
+        cid = str(ch.get("id") or "").strip()
+        if not cid:
+            continue
+        base_weight = float(_clamp_int(ch.get("weight"), 1, 32, 1))
+        succ_factor = _channel_success_rate(cid)
+        lat_factor = _channel_latency_factor(cid, latency_ref_ms)
+        conc_factor = _channel_concurrency_factor(ch)
+        st = _get_channel_runtime(cid)
+        cfail = int(st.get("consecutive_failures") or 0)
+        fail_penalty = max(0.2, 0.82 ** max(0, cfail))
+        jitter = random.uniform(0.0, 0.01)
+        score = base_weight * succ_factor * lat_factor * conc_factor * fail_penalty + jitter
+        if _is_channel_in_cooldown(cid):
+            cooled.append((score, ch))
+        else:
+            scored.append((score, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    cooled.sort(key=lambda x: x[0], reverse=True)
+    ordered = [c for _, c in scored]
+    ordered.extend([c for _, c in cooled])
+    return ordered or enabled
+
+
+def _weighted_round_robin(channels: List[dict], key: str) -> dict | None:
+    enabled = [c for c in channels if isinstance(c, dict) and c.get("enabled") and str(c.get("model") or "").strip()]
+    if not enabled:
+        return None
+    total_weight = sum(_clamp_int(c.get("weight"), 1, 32, 1) for c in enabled)
+    if total_weight <= 0:
+        return enabled[0]
+    with _MODEL_ROUTER_LOCK:
+        idx = _MODEL_ROUTER_COUNTERS.get(key, 0) % total_weight
+        _MODEL_ROUTER_COUNTERS[key] = _MODEL_ROUTER_COUNTERS.get(key, 0) + 1
+    acc = 0
+    for ch in enabled:
+        acc += _clamp_int(ch.get("weight"), 1, 32, 1)
+        if idx < acc:
+            return ch
+    return enabled[0]
+
+
+def _route_pool(
+    conf: Dict[str, Any],
+    *,
+    route_kind: str,
+    route_key: str | None,
+) -> tuple[list[dict], str]:
+    router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+    if route_kind == "tool":
+        channels = router.get("tool_channels") if isinstance(router, dict) else []
+        route_map = router.get("tool_route_channels") if isinstance(router, dict) else {}
+    elif route_kind == "mid":
+        channels = router.get("mid_channels") if isinstance(router, dict) else []
+        route_map = router.get("mid_route_channels") if isinstance(router, dict) else {}
+    else:
+        channels = router.get("main_channels") if isinstance(router, dict) else []
+        route_map = router.get("main_module_channels") if isinstance(router, dict) else {}
+    channels = channels if isinstance(channels, list) else []
+    route_map = route_map if isinstance(route_map, dict) else {}
+    rk = str(route_key or "default").strip() or "default"
+
+    enabled_channels = [
+        c
+        for c in channels
+        if isinstance(c, dict) and c.get("enabled") and str(c.get("model") or "").strip()
+    ]
+    if not enabled_channels:
+        return [], rk
+
+    channel_ids = route_map.get(rk) or route_map.get("default") or []
+    if isinstance(channel_ids, str):
+        channel_ids = [x.strip() for x in channel_ids.split(",") if x.strip()]
+    if not isinstance(channel_ids, list):
+        channel_ids = []
+    ordered_ids = [str(x).strip() for x in channel_ids if str(x).strip()]
+    if not ordered_ids:
+        return enabled_channels, rk
+
+    by_id: Dict[str, dict] = {}
+    for c in enabled_channels:
+        cid = str(c.get("id") or "").strip()
+        if cid and cid not in by_id:
+            by_id[cid] = c
+    ordered: list[dict] = [by_id[sid] for sid in ordered_ids if sid in by_id]
+    return ordered or enabled_channels, rk
+
+
+def _to_target_dict(base_api_url: str, base_api_key: str, base_model: str, chosen: dict | None) -> Dict[str, Any]:
+    target = {
+        "model": base_model,
+        "api_url": base_api_url,
+        "api_key": base_api_key,
+        "channel_id": None,
+    }
+    if not isinstance(chosen, dict):
+        return target
+    target["channel_id"] = str(chosen.get("id") or "").strip() or None
+    if str(chosen.get("model") or "").strip():
+        target["model"] = str(chosen.get("model") or "").strip()
+    if str(chosen.get("api_url") or "").strip():
+        target["api_url"] = str(chosen.get("api_url") or "").strip()
+    if str(chosen.get("api_key") or "").strip():
+        target["api_key"] = str(chosen.get("api_key") or "").strip()
+    return target
+
+
+def resolve_chat_targets(
+    conf: Dict[str, Any],
+    *,
+    route_kind: str,
+    route_key: str | None,
+    model_override: str | None,
+) -> List[Dict[str, Any]]:
+    """Resolve ordered model/api targets with optional router and fallback sequence."""
+    if route_kind == "tool":
+        default_model = str(model_override or conf.get("tool_model") or conf.get("model") or "").strip()
+    elif route_kind == "mid":
+        default_model = str(model_override or conf.get("tool_model_messages") or conf.get("tool_model") or conf.get("model") or "").strip()
+    else:
+        default_model = str(model_override or conf.get("model") or "").strip()
+    base_api_url = str(conf.get("api_url") or "https://api.siliconflow.cn/v1").strip()
+    base_api_key = str(conf.get("api_key") or "").strip()
+    default_target = _to_target_dict(base_api_url, base_api_key, default_model, None)
+
+    router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+    if not router or not bool(router.get("enabled")):
+        return [default_target]
+
+    prefer_router = bool(router.get("prefer_router", True))
+    # Keep strict override behavior when user chooses not to prioritize router.
+    if model_override and not prefer_router:
+        return [default_target]
+
+    candidates, rk = _route_pool(conf, route_kind=route_kind, route_key=route_key)
+    ordered = _dynamic_rank_channels(candidates, route_key=f"{route_kind}:{rk}", conf=conf)
+    if not ordered:
+        return [default_target]
+
+    targets: list[Dict[str, Any]] = []
+    seen: set[tuple[str | None, str, str]] = set()
+    for c in ordered:
+        t = _to_target_dict(base_api_url, base_api_key, default_model, c)
+        key = (t.get("channel_id"), str(t.get("api_url") or ""), str(t.get("model") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append(t)
+
+    # Always keep base model as final fallback to avoid full outage when all channels fail.
+    base_key = (None, str(default_target.get("api_url") or ""), str(default_target.get("model") or ""))
+    if base_key not in seen:
+        targets.append(default_target)
+    return targets
+
+
+def resolve_chat_target(
+    conf: Dict[str, Any],
+    *,
+    route_kind: str,
+    route_key: str | None,
+    model_override: str | None,
+) -> Dict[str, Any]:
+    """Resolve current primary target (backward compatible helper)."""
+    targets = resolve_chat_targets(
+        conf,
+        route_kind=route_kind,
+        route_key=route_key,
+        model_override=model_override,
+    )
+    if route_kind == "tool":
+        fallback_model = str(model_override or conf.get("tool_model") or conf.get("model") or "").strip()
+    elif route_kind == "mid":
+        fallback_model = str(model_override or conf.get("tool_model_messages") or conf.get("tool_model") or conf.get("model") or "").strip()
+    else:
+        fallback_model = str(model_override or conf.get("model") or "").strip()
+    return targets[0] if targets else {
+        "model": fallback_model,
+        "api_url": str(conf.get("api_url") or "https://api.siliconflow.cn/v1").strip(),
+        "api_key": str(conf.get("api_key") or "").strip(),
+        "channel_id": None,
+    }
+
+
+def get_router_runtime_stats() -> Dict[str, Dict[str, Any]]:
+    """Return current in-process router runtime metrics for observability."""
+    with _MODEL_ROUTER_LOCK:
+        return {k: dict(v) for k, v in _MODEL_ROUTER_STATS.items()}
 
 
 def _post_with_backoff(url: str, headers: dict, payload: dict, *, timeout: int = 180) -> requests.Response:
@@ -382,60 +1289,165 @@ def siliconflow_chat(
     model_override: str | None = None,
     *,
     force_json: bool = False,
+    route_kind: str = "main",
+    route_key: str | None = None,
 ) -> str:
     """Call SiliconFlow once; auto‑retry with gentle backoff on rate limits.
     If it still fails, caller should handle local fallback.
     """
     conf = load_ai_config()
-    api_key = conf.get("api_key")
-    api_url = conf.get("api_url", "https://api.siliconflow.cn/v1")
-    model = model_override or conf.get("model", "Qwen/Qwen3-30B-A3B")
-    if not api_key:
-        raise RuntimeError("SILICONFLOW_API_KEY not configured")
-    url = api_url.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    targets = resolve_chat_targets(
+        conf,
+        route_kind=route_kind,
+        route_key=route_key,
+        model_override=model_override,
+    )
+
     # resolve runtime params from config
     max_tokens = int(conf.get("max_tokens") or 4000)
     temp = float(temperature if temperature is not None else conf.get("model_temperature") or 0.7)
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temp,
-        "max_tokens": max_tokens,
-        "stream": False,
-    }
-    # Encourage JSON-only output for tool calls when supported
-    if force_json:
+    errors: list[str] = []
+    for idx, target in enumerate(targets):
+        api_key = str(target.get("api_key") or "").strip()
+        api_url = str(target.get("api_url") or "https://api.siliconflow.cn/v1").strip()
+        model = str(target.get("model") or conf.get("model") or "Qwen/Qwen3-30B-A3B").strip()
+        channel_id = str(target.get("channel_id") or "").strip() or "base"
+        channel_dict: dict | None = None
+        if channel_id != "base":
+            router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+            channels = (
+                router.get("tool_channels")
+                if route_kind == "tool"
+                else (
+                    router.get("mid_channels")
+                    if route_kind == "mid"
+                    else router.get("main_channels")
+                )
+            )
+            if isinstance(channels, list):
+                for ch in channels:
+                    if isinstance(ch, dict) and str(ch.get("id") or "").strip() == channel_id:
+                        channel_dict = ch
+                        break
+
+        if not api_key:
+            errors.append(f"[{idx+1}/{len(targets)} {channel_id}] missing_api_key")
+            continue
+
+        url = api_url.rstrip("/") + "/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if "openrouter.ai" in api_url:
+            headers.setdefault("HTTP-Referer", "https://localhost")
+            headers.setdefault("X-Title", "Dr.Lemon Information Aggregation AI")
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if force_json:
+            try:
+                payload["response_format"] = {"type": "json_object"}
+            except Exception:
+                pass
+        attempt_start = time.perf_counter()
+        if channel_dict is not None:
+            _router_mark_inflight(channel_id, +1)
         try:
-            payload["response_format"] = {"type": "json_object"}
-        except Exception:
-            pass
-    # Throttle concurrent calls globally to reduce 429 spikes
-    with _LLM_SEMAPHORE:
-        # Allow configuring HTTP timeout via ai_config (defaults to 90s to avoid long hangs)
-        try:
-            http_timeout = int(conf.get("http_timeout") or 90)
-        except Exception:
-            http_timeout = 90
-        resp = _post_with_backoff(url, headers, payload, timeout=http_timeout)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as exc:  # type: ignore[name-defined]
-        detail = resp.text.strip()
-        message = f"LLM request failed: {exc}"
-        if detail:
-            message += f" | detail: {detail[:500]}"
-        raise RuntimeError(message) from exc
-    data = resp.json()
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return content or ""
+            with _LLM_SEMAPHORE:
+                try:
+                    http_timeout = int(conf.get("http_timeout") or 90)
+                except Exception:
+                    http_timeout = 90
+                resp = _post_with_backoff(url, headers, payload, timeout=http_timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if isinstance(content, str) and content:
+                latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
+                if channel_dict is not None:
+                    _router_mark_result(channel_dict, ok=True, latency_ms=latency_ms, conf=conf)
+                _append_router_trace(
+                    route_kind=route_kind,
+                    route_key=route_key,
+                    channel_id=channel_id,
+                    model=model,
+                    api_url=api_url,
+                    ok=True,
+                    latency_ms=latency_ms,
+                    reason="ok",
+                )
+                return content
+            latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
+            if channel_dict is not None:
+                _router_mark_result(
+                    channel_dict,
+                    ok=False,
+                    latency_ms=latency_ms,
+                    err="empty_content",
+                    conf=conf,
+                )
+            _append_router_trace(
+                route_kind=route_kind,
+                route_key=route_key,
+                channel_id=channel_id,
+                model=model,
+                api_url=api_url,
+                ok=False,
+                latency_ms=latency_ms,
+                reason="empty_content",
+            )
+            errors.append(f"[{idx+1}/{len(targets)} {channel_id}] empty_content model={model}")
+        except Exception as exc:
+            latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
+            if channel_dict is not None:
+                _router_mark_result(
+                    channel_dict,
+                    ok=False,
+                    latency_ms=latency_ms,
+                    err=str(exc),
+                    conf=conf,
+                )
+            _append_router_trace(
+                route_kind=route_kind,
+                route_key=route_key,
+                channel_id=channel_id,
+                model=model,
+                api_url=api_url,
+                ok=False,
+                latency_ms=latency_ms,
+                reason=f"{type(exc).__name__}: {str(exc)[:160]}",
+            )
+            errors.append(f"[{idx+1}/{len(targets)} {channel_id}] {type(exc).__name__}: {str(exc)[:220]}")
+            continue
+        finally:
+            if channel_dict is not None:
+                _router_mark_inflight(channel_id, -1)
+
+    if not errors:
+        raise RuntimeError("LLM request failed: no route target available")
+    raise RuntimeError("LLM request failed across all routes: " + " | ".join(errors))
 
 
-def siliconflow_tool_chat(messages: list[dict], temperature: float = 0.2, model_override: str | None = None) -> str:
+def siliconflow_tool_chat(
+    messages: list[dict],
+    temperature: float = 0.2,
+    model_override: str | None = None,
+    *,
+    route_key: str | None = None,
+) -> str:
     conf = load_ai_config()
     tool_model = model_override or conf.get("tool_model") or "Qwen/Qwen3-8B"
     # Tool calls expect strict JSON; request JSON object formatting when supported
-    return siliconflow_chat(messages, temperature=temperature, model_override=tool_model, force_json=True)
+    return siliconflow_chat(
+        messages,
+        temperature=temperature,
+        model_override=tool_model,
+        force_json=True,
+        route_kind="tool",
+        route_key=route_key,
+    )
 
 
 def siliconflow_chat_stream(messages: list, temperature: float = 0.7, model_override: str = None) -> str:

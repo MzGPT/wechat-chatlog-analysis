@@ -10,16 +10,147 @@ from ..schemas import PaginatedMessages, MessageOut, UpDownVoteResult, TagUpdate
 from ..services.ai_tools import ensure_message_features
 from ..services.llm_client import load_ai_config
 from ..services.message_filters import filter_effective_messages
-from starlette.responses import Response
+from starlette.responses import Response, RedirectResponse
 from typing import Dict, Any, List
 import csv, io, html, json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+import requests
 
 
 router = APIRouter(prefix="/api/messages", tags=["messages"])
 
 # simple in-memory progress for derive tasks
 PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+_DROP_META_KEYS = {
+    # common heavy fields we never need in list responses
+    "raw",
+    "xml",
+    "xmlstr",
+    "xml_str",
+    "payload",
+    "buffer",
+    "bytes",
+    "base64",
+    "data_base64",
+    "thumb_base64",
+    "content",
+    "content_text",
+    "full_text",
+}
+
+
+def _normalize_media_host(host: str | None) -> str:
+    v = (host or "").strip()
+    if not v:
+        v = "http://127.0.0.1:5030"
+    if not v.startswith(("http://", "https://")):
+        v = "http://" + v
+    return v.rstrip("/")
+
+
+def _encode_rel_path(path: str | None) -> str:
+    p = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not p:
+        return ""
+    return "/".join(quote(seg, safe="") for seg in p.split("/") if seg)
+
+
+def _build_image_candidates(*, host: str | None, md5: str | None, path: str | None, direct_url: str | None) -> List[str]:
+    base = _normalize_media_host(host)
+    key = (md5 or "").strip()
+    rel = _encode_rel_path(path)
+    out: List[str] = []
+    if direct_url:
+        out.append(direct_url.strip())
+    # 优先尝试中图/原图，再回退到默认 image 路由（常会给缩略图）
+    if rel:
+        out.append(f"{base}/data/{rel}_M.dat")
+        out.append(f"{base}/data/{rel}.dat")
+    if key and rel:
+        out.append(f"{base}/image/{quote(key, safe='')},{rel}")
+    if key:
+        out.append(f"{base}/image/{quote(key, safe='')}")
+    if rel:
+        out.append(f"{base}/data/{rel}_t.dat")
+        out.append(f"{base}/data/{rel}")
+    # dedupe preserving order
+    seen = set()
+    uniq: List[str] = []
+    for u in out:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+    return uniq
+
+
+def _coerce_json_field(v: Any) -> Any:
+    """Coerce possibly-stringified JSON fields (meta/derived/tags) to python objects."""
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
+
+
+def _truncate_text(s: Any, max_chars: int) -> str | None:
+    if s is None:
+        return None
+    txt = str(s)
+    if max_chars <= 0:
+        return txt
+    if len(txt) <= max_chars:
+        return txt
+    return txt[: max_chars - 1] + "…"
+
+
+def _prune_meta(obj: Any, *, depth: int, max_depth: int, max_items: int, max_str: int) -> Any:
+    """Best-effort prune of meta payload to avoid huge JSON responses crashing the UI."""
+    if obj is None:
+        return None
+    if depth >= max_depth:
+        if isinstance(obj, str):
+            return obj[:max_str]
+        if isinstance(obj, (dict, list)):
+            return None
+        if isinstance(obj, (int, float, bool)):
+            return obj
+        return None
+    if isinstance(obj, str):
+        return obj if len(obj) <= max_str else obj[: max_str - 1] + "…"
+    if isinstance(obj, (int, float, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [
+            _prune_meta(x, depth=depth + 1, max_depth=max_depth, max_items=max_items, max_str=max_str)
+            for x in obj[:max_items]
+        ]
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in list(obj.items())[:max_items]:
+            kk = str(k)
+            if kk.strip().lower() in _DROP_META_KEYS:
+                continue
+            out[kk] = _prune_meta(v, depth=depth + 1, max_depth=max_depth, max_items=max_items, max_str=max_str)
+        return out
+    return None
+
+
+def _sanitize_meta_for_list(meta: Any, *, max_depth: int = 4, max_items: int = 80, max_str: int = 600) -> dict | None:
+    m = _coerce_json_field(meta)
+    if not isinstance(m, dict):
+        return None
+    return _prune_meta(m, depth=0, max_depth=max_depth, max_items=max_items, max_str=max_str)
 
 
 def get_db():
@@ -29,6 +160,29 @@ def get_db():
     finally:
         # ensure proper close even if generator exits early
         db.close()
+
+
+@router.get("/media/image")
+def resolve_image_media(
+    md5: str | None = Query(default=None),
+    path: str | None = Query(default=None),
+    host: str | None = Query(default=None),
+    url: str | None = Query(default=None, description="optional direct media url"),
+):
+    candidates = _build_image_candidates(host=host, md5=md5, path=path, direct_url=url)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="missing md5/path/url")
+
+    for c in candidates:
+        try:
+            # GET (not HEAD): chatlog 会在这里做解密并返回正确 content-type/302。
+            resp = requests.get(c, allow_redirects=False, timeout=4)
+            if resp.status_code in (200, 301, 302):
+                return RedirectResponse(url=c, status_code=302)
+        except Exception:
+            continue
+
+    return RedirectResponse(url=candidates[0], status_code=302)
 
 
 @router.get("", response_model=PaginatedMessages)
@@ -42,6 +196,9 @@ def list_messages(
     time_to: Optional[str] = None,
     page: int = 1,
     size: int = 50,
+    fast: bool = Query(default=False, description="Skip expensive total count; total will be len(items)."),
+    include_meta: bool = Query(default=True, description="Include meta payload (pruned) for list rendering."),
+    content_max_chars: int = Query(default=4000, ge=0, le=20000, description="Truncate content_text to avoid huge payloads."),
     db: Session = Depends(get_db),
 ):
     page = max(1, page)
@@ -111,7 +268,11 @@ def list_messages(
         derived_map: dict[int, dict | None] = {}
         # 为了保证列表接口快速稳定，这里不触发小模型派生；
         # 派生由前端在进入页面或点击“拉取”时调用 /api/messages/derive 完成
-        total = db.execute(count_sql, {k: v for k, v in params.items() if k != "limit" and k != "offset"}).scalar() or 0
+        total = (
+            len(items)
+            if fast
+            else (db.execute(count_sql, {k: v for k, v in params.items() if k != "limit" and k != "offset"}).scalar() or 0)
+        )
         def _compose_display_summary(d: dict | None) -> str:
             try:
                 if not isinstance(d, dict):
@@ -152,6 +313,13 @@ def list_messages(
                     rd["tags"] = json.loads(rd["tags"]) if rd["tags"] else None
             except (json.JSONDecodeError, TypeError):
                 rd["tags"] = None
+
+            # Prune meta/content for stability (FTS path returns mapping rows).
+            if not include_meta:
+                rd["meta"] = None
+            else:
+                rd["meta"] = _sanitize_meta_for_list(rd.get("meta"))
+            rd["content_text"] = _truncate_text(rd.get("content_text"), content_max_chars)
             
             # include raw meta to allow frontend to render link/image badges
             if rd.get("meta") is None and hasattr(row, 'meta'):
@@ -218,8 +386,8 @@ def list_messages(
     if dt_to:
         query = query.where(Message.timestamp <= dt_to)
 
-    total = db.execute(select(func.count()).select_from(query.subquery())).scalar() or 0
     items = db.execute(query.order_by(Message.timestamp.desc()).limit(size).offset((page - 1) * size)).scalars().all()
+    total = len(items) if fast else (db.execute(select(func.count()).select_from(query.subquery())).scalar() or 0)
     # 同理：列表接口不做派生，避免阻塞首屏。/derive 负责派生。
     # try:
     #     conf = load_ai_config()
@@ -248,7 +416,24 @@ def list_messages(
 
     compat_items: list[MessageOut] = []
     for i in items:
-        out = MessageOut.model_validate(i)
+        out = MessageOut(
+            id=int(i.id),
+            chat_id=i.chat_id,
+            sender_id=i.sender_id,
+            sender_name=i.sender_name,
+            talker_name=i.talker_name,
+            timestamp=i.timestamp,
+            direction=i.direction,
+            type=i.type,
+            content_text=_truncate_text(i.content_text, content_max_chars),
+            media_url=i.media_url,
+            meta=(None if not include_meta else _sanitize_meta_for_list(i.meta)),
+            tags=_coerce_json_field(i.tags),
+            derived=_coerce_json_field(i.derived),
+            importance_score=int(i.importance_score or 0),
+            upvotes=int(i.upvotes or 0),
+            downvotes=int(i.downvotes or 0),
+        )
         try:
             d = dict(out.derived or {})
             if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
