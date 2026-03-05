@@ -1,8 +1,10 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import AnyUrl, Field
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     # chatlog
     CHATLOG_HTTP_BASE: str = Field(default="http://127.0.0.1:5030")
     CHATLOG_DIR: str | None = None
@@ -42,9 +44,5 @@ class Settings(BaseSettings):
     # Microsoft OAuth for Outlook/Hotmail
     MS_CLIENT_ID: str | None = None
     MS_TENANT: str | None = "consumers"  # common/organizations/consumers
-
-    class Config:
-        env_file = ".env"
-
 
 settings = Settings()
