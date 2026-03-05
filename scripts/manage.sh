@@ -75,6 +75,20 @@ is_running() {
   return 1
 }
 
+wait_health() {
+  local host=${1:-127.0.0.1}
+  local port=${2:-8000}
+  local max_try=${3:-10}
+  local i
+  for ((i=1; i<=max_try; i++)); do
+    if curl -fsS "http://$host:$port/api/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 start_bg() {
   ensure_env
   maybe_ensure_venv
@@ -93,16 +107,29 @@ start_bg() {
   if [[ ! -x "$pybin" ]]; then
     pybin="$VENV_DIR/bin/python3"
   fi
-  nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" >"$LOG_FILE" 2>&1 < /dev/null &
-  echo $! > "$PID_FILE"
-  sleep 1
-  if ps -p "$(cat "$PID_FILE")" >/dev/null 2>&1; then
+  nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" >"$LOG_FILE" 2>&1 < /dev/null & echo $! > "$PID_FILE"
+  if wait_health "$host" "$port" 8; then
     ok "已启动 (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
-  else
-    err "启动失败，请查看日志: $LOG_FILE"
-    tail -n 80 "$LOG_FILE" || true
-    return 1
+    return 0
   fi
+  warn "默认模式启动后健康检查失败，尝试兼容模式重启（--loop asyncio）"
+  if [[ -f "$PID_FILE" ]]; then
+    local oldpid
+    oldpid=$(cat "$PID_FILE" || true)
+    if [[ -n "$oldpid" ]] && ps -p "$oldpid" >/dev/null 2>&1; then
+      kill "$oldpid" || true
+      sleep 1
+    fi
+    rm -f "$PID_FILE"
+  fi
+  nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" --loop asyncio >"$LOG_FILE" 2>&1 < /dev/null & echo $! > "$PID_FILE"
+  if wait_health "$host" "$port" 12; then
+    ok "已启动(兼容模式) (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
+    return 0
+  fi
+  err "启动失败，请查看日志: $LOG_FILE"
+  tail -n 120 "$LOG_FILE" || true
+  return 1
 }
 
 start_fg() {
