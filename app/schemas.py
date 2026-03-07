@@ -112,6 +112,22 @@ class Health(BaseModel):
     chatlog_dir: Optional[str]
 
 
+class HealthCheckItem(BaseModel):
+    name: str
+    status: str
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    latency_ms: Optional[int] = None
+
+
+class ReadyOut(BaseModel):
+    status: str
+    healthy: bool
+    error_code: Optional[str] = None
+    checks: List[HealthCheckItem] = Field(default_factory=list)
+    timestamp: Optional[str] = None
+
+
 class ChatlogWebhookMessage(BaseModel):
     seq: int
     time: str

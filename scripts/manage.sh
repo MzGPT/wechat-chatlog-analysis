@@ -64,13 +64,28 @@ export_env() {
   set +a
 }
 
-is_running() {
+read_pid() {
   if [[ -f "$PID_FILE" ]]; then
-    local pid
-    pid=$(cat "$PID_FILE" || true)
-    if [[ -n "${pid}" ]] && ps -p "$pid" >/dev/null 2>&1; then
-      return 0
-    fi
+    cat "$PID_FILE" 2>/dev/null || true
+  fi
+}
+
+is_port_listening() {
+  local port=${1:-8000}
+  lsof -nPiTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+health_ok() {
+  local host=${1:-127.0.0.1}
+  local port=${2:-8000}
+  curl -fsS --max-time 3 "http://$host:$port/api/health" >/dev/null 2>&1
+}
+
+is_running() {
+  local pid
+  pid=$(read_pid)
+  if [[ -n "${pid}" ]] && ps -p "$pid" >/dev/null 2>&1; then
+    return 0
   fi
   return 1
 }
@@ -100,6 +115,19 @@ start_bg() {
   local host port
   host=${HOST:-127.0.0.1}
   port=${PORT:-8000}
+
+  # 检测端口冲突（非本 PID 占用）
+  if is_port_listening "$port"; then
+    local pid_on_port pid_file
+    pid_on_port=$(lsof -nPiTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+    pid_file=$(read_pid)
+    if [[ -n "$pid_on_port" ]] && [[ "$pid_on_port" != "$pid_file" ]]; then
+      err "端口 $port 已被其他进程占用 (PID: $pid_on_port)"
+      err "请先执行: bash scripts/manage.sh stop"
+      return 1
+    fi
+  fi
+
   info "以后台方式启动: http://$host:$port"
   cd "$ROOT_DIR"
   local pybin
@@ -180,11 +208,23 @@ stop_svc() {
 }
 
 status_svc() {
+  local host port pid
+  host=${HOST:-127.0.0.1}
+  port=${PORT:-8000}
+  pid=$(read_pid)
   if is_running; then
-    ok "运行中 (PID: $(cat "$PID_FILE"))"
-  else
-    warn "未运行"
+    if is_port_listening "$port" && health_ok "$host" "$port"; then
+      ok "运行中且健康 (PID: $pid, http://$host:$port)"
+    else
+      warn "运行中但不健康 (PID: $pid, code: SYS-STATE-001)"
+      warn "建议执行: bash scripts/manage.sh restart"
+    fi
+    return 0
   fi
+  if [[ -n "$pid" ]]; then
+    warn "发现陈旧 PID 文件 (PID: $pid)，已判定未运行"
+  fi
+  warn "未运行"
 }
 
 logs_svc() {
@@ -227,6 +267,7 @@ usage() {
   dev            前台启动（--reload 热重载，建议开发环境使用；可配合 NO_INSTALL=1）
   stop           停止后台服务
   status         查看服务状态
+  doctor         诊断状态（进程/端口/health）
   logs [-f]      查看日志（-f 持续跟随）
   sync           触发一次从 chatlog 拉取增量
   emailsync [id] 同步邮箱（可选账户ID，省略则同步全部已启用账户）
@@ -242,6 +283,22 @@ usage() {
 USAGE
 }
 
+doctor_svc() {
+  local host port pid pid_on_port
+  host=${HOST:-127.0.0.1}
+  port=${PORT:-8000}
+  pid=$(read_pid)
+  pid_on_port=$(lsof -nPiTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+  echo "pid_file=${pid:-<empty>}"
+  echo "pid_alive=$([[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1 && echo yes || echo no)"
+  echo "port_listen_pid=${pid_on_port:-<none>}"
+  if health_ok "$host" "$port"; then
+    echo "health=ok"
+  else
+    echo "health=fail"
+  fi
+}
+
 cmd=${1:-}
 case "$cmd" in
   install) ensure_env; ensure_venv ;;
@@ -250,6 +307,7 @@ case "$cmd" in
   dev) ensure_env; maybe_ensure_venv; export_env; cd "$ROOT_DIR"; "$VENV_DIR/bin/uvicorn" "$APP_IMPORT" --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" --reload ;;
   stop) stop_svc ;;
   status) status_svc ;;
+  doctor) doctor_svc ;;
   logs) shift || true; logs_svc "${1:-}" ;;
   restart) stop_svc; start_bg ;;
   sync) sync_once ;;
