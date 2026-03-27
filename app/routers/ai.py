@@ -17,6 +17,7 @@ from ..services.llm_client import (
     siliconflow_chat,
     siliconflow_tool_chat,
     get_router_runtime_stats,
+    reset_router_runtime_stats,
     DEFAULT_MODULE_PROMPTS,
     DEFAULT_TOOL_PROMPTS,
 )
@@ -78,6 +79,31 @@ router = APIRouter(prefix="/api/ai", tags=["ai"])
 # 进程内 LRU 缓存：按 (snapshot_id, module, prompt_hash, temperature) 缓存模块产出
 SUMMARY_CACHE_MAX = int(os.getenv("SUMMARY_CACHE_MAX", "64"))
 SUMMARY_CACHE: "OrderedDict[tuple[object, str, str, float], str]" = OrderedDict()
+
+
+def _sanitize_secret_value(value: Any) -> tuple[Any, bool]:
+    text = str(value or "").strip()
+    if not text:
+        return "", False
+    return "", True
+
+
+def _sanitize_model_router_for_ui(router_conf: Any) -> Any:
+    if isinstance(router_conf, list):
+        return [_sanitize_model_router_for_ui(item) for item in router_conf]
+    if not isinstance(router_conf, dict):
+        return router_conf
+
+    sanitized: dict[str, Any] = {}
+    for key, value in router_conf.items():
+        lowered = str(key).lower()
+        if lowered in {"api_key", "token", "auth_token", "secret"}:
+            masked, has_value = _sanitize_secret_value(value)
+            sanitized[key] = masked
+            sanitized[f"has_{key}"] = has_value
+            continue
+        sanitized[key] = _sanitize_model_router_for_ui(value)
+    return sanitized
 
 def _summary_cache_get(key: tuple) -> str | None:
     try:
@@ -707,7 +733,7 @@ def get_ai_config():
         "default_module_prompts": DEFAULT_MODULE_PROMPTS,
         "tool_prompts": conf.get("tool_prompts", {}),
         "default_tool_prompts": DEFAULT_TOOL_PROMPTS,
-        "model_router": conf.get("model_router") or {},
+        "model_router": _sanitize_model_router_for_ui(conf.get("model_router") or {}),
         "analysis_defaults": {
             # 默认包含新闻舆情模块（默认必出）
             "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts", "newswatch", "mediawatch", "mpwatch", "minuteswatch"],
@@ -2669,6 +2695,15 @@ def router_stats():
     return {"status": "ok", "stats": get_router_runtime_stats()}
 
 
+@router.post("/router-stats/reset")
+def router_stats_reset(body: dict | None = None):
+    target = ""
+    if isinstance(body, dict):
+        target = str(body.get("channel_id") or "").strip()
+    reset_router_runtime_stats(channel_id=target or None)
+    return {"status": "ok", "channel_id": target or None}
+
+
 # ===== 缓存调试与清理 =====
 @router.get("/debug/caches")
 def debug_caches():
@@ -2759,7 +2794,15 @@ def test_tool_summary(payload: dict):
     # 尝试解析为 JSON；若失败也返回 200 并带上 raw，方便前端直观核对
     parsed = None
     try:
-        parsed = json.loads(raw)
+        raw_clean = str(raw or "").strip()
+        if raw_clean.startswith("```"):
+            lines = raw_clean.split("\n")
+            if lines:
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw_clean = "\n".join(lines).strip()
+        parsed = json.loads(raw_clean)
     except Exception:
         parsed = None
     return {

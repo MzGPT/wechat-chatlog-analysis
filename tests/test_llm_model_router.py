@@ -211,3 +211,25 @@ def test_siliconflow_chat_sets_openrouter_headers(monkeypatch):
     assert out == "ok-openrouter"
     assert captured_headers.get("HTTP-Referer") == "https://localhost"
     assert captured_headers.get("X-Title") == "Dr.Lemon Information Aggregation AI"
+
+
+def test_router_runtime_stats_has_remaining_cooldown(monkeypatch):
+    llm_client.reset_router_runtime_stats()
+    st = llm_client._get_channel_runtime("x-1")
+    st["calls"] = 3
+    st["success"] = 2
+    st["failure"] = 1
+    st["cooldown_until"] = llm_client._now_ts() + 30
+
+    out = llm_client.get_router_runtime_stats()
+    assert "x-1" in out
+    assert out["x-1"]["calls"] == 3
+    assert out["x-1"]["cooldown_remaining_sec"] > 0
+
+
+def test_router_runtime_stats_reset_clears_all():
+    st = llm_client._get_channel_runtime("x-2")
+    st["calls"] = 9
+    assert "x-2" in llm_client.get_router_runtime_stats()
+    llm_client.reset_router_runtime_stats()
+    assert llm_client.get_router_runtime_stats() == {}

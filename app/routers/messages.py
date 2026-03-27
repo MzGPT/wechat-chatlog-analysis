@@ -7,7 +7,7 @@ from typing import Optional
 from ..db import session_scope, SessionLocal
 from ..models import Message, Interaction, InteractionExt
 from ..schemas import PaginatedMessages, MessageOut, UpDownVoteResult, TagUpdateIn, MessageDeriveRequest
-from ..services.ai_tools import ensure_message_features
+from ..services.ai_tools import ensure_message_features, populate_fallback_derived
 from ..services.llm_client import load_ai_config
 from ..services.message_filters import filter_effective_messages
 from starlette.responses import Response, RedirectResponse
@@ -834,6 +834,14 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
         id_list = [int(getattr(m, 'id')) for m in messages if getattr(m, 'id', None) is not None]
         while idx < len(messages):
             chunk = messages[idx : idx + bs]
+            try:
+                populate_fallback_derived(
+                    db,
+                    chunk,
+                    force=bool(body.force),
+                )
+            except Exception:
+                pass
             res = ensure_message_features(
                 db,
                 chunk,
@@ -872,6 +880,14 @@ def derive_message_features(body: MessageDeriveRequest, progress_key: str | None
 
     # 非进度路径：同样遵循增量策略，除非调用方显式 force=true
     id_list = [int(getattr(m, 'id')) for m in messages if getattr(m, 'id', None) is not None]
+    try:
+        populate_fallback_derived(
+            db,
+            messages,
+            force=bool(body.force),
+        )
+    except Exception:
+        pass
     res = ensure_message_features(
         db,
         messages,

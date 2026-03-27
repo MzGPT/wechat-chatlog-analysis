@@ -21,6 +21,36 @@ _ACCOUNT_LOCKS: dict[int, Lock] = {}
 EMAIL_PROGRESS: dict[str, dict] = {}
 
 
+def _mask_account_auth(auth: dict | None) -> dict:
+    payload = dict(auth or {})
+    password = str(payload.get("password") or "")
+    oauth_token = str(payload.get("oauth_token") or "")
+    payload["password"] = ""
+    payload["oauth_token"] = ""
+    payload["has_password"] = bool(password)
+    payload["has_oauth_token"] = bool(oauth_token)
+    return payload
+
+
+def _build_account_out(row: EmailAccount) -> EmailAccountOut:
+    data = {
+        "id": row.id,
+        "name": row.name,
+        "email_address": row.email_address,
+        "provider": row.provider,
+        "imap_host": row.imap_host,
+        "imap_port": row.imap_port,
+        "imap_ssl": row.imap_ssl,
+        "smtp_host": row.smtp_host,
+        "smtp_port": row.smtp_port,
+        "smtp_ssl": row.smtp_ssl,
+        "auth": _mask_account_auth(row.auth),
+        "enabled": row.enabled,
+        "last_sync_at": row.last_sync_at,
+    }
+    return EmailAccountOut.model_validate(data)
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -32,7 +62,7 @@ def get_db():
 @router.get("/accounts", response_model=list[EmailAccountOut])
 def list_accounts(db: Session = Depends(get_db)):
     rows = db.execute(select(EmailAccount).order_by(EmailAccount.id.desc())).scalars().all()
-    return [EmailAccountOut.model_validate(r) for r in rows]
+    return [_build_account_out(r) for r in rows]
 
 
 @router.post("/accounts", response_model=EmailAccountOut)
@@ -44,7 +74,7 @@ def create_account(body: EmailAccountIn, db: Session = Depends(get_db)):
     db.add(row)
     db.commit()
     db.refresh(row)
-    return EmailAccountOut.model_validate(row)
+    return _build_account_out(row)
 
 
 @router.put("/accounts/{account_id}", response_model=EmailAccountOut)
@@ -54,11 +84,19 @@ def update_account(account_id: int, body: EmailAccountIn, db: Session = Depends(
         raise HTTPException(404, "account not found")
     if not (body.imap_host or "").strip() or not (body.smtp_host or "").strip():
         raise HTTPException(400, "imap_host 和 smtp_host 不能为空")
-    for k, v in body.model_dump().items():
+    incoming = body.model_dump()
+    incoming_auth = dict(incoming.get("auth") or {})
+    existing_auth = dict(row.auth or {})
+    if not str(incoming_auth.get("password") or "").strip() and str(existing_auth.get("password") or "").strip():
+        incoming_auth["password"] = existing_auth.get("password")
+    if not str(incoming_auth.get("oauth_token") or "").strip() and str(existing_auth.get("oauth_token") or "").strip():
+        incoming_auth["oauth_token"] = existing_auth.get("oauth_token")
+    incoming["auth"] = incoming_auth
+    for k, v in incoming.items():
         setattr(row, k, v)
     db.commit()
     db.refresh(row)
-    return EmailAccountOut.model_validate(row)
+    return _build_account_out(row)
 
 
 @router.delete("/accounts/{account_id}")
@@ -105,6 +143,7 @@ def list_email_messages(
     q: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    include_bodies: bool = Query(default=False, description="Include body_text/body_html in list payload."),
     db: Session = Depends(get_db),
 ):
     query = select(EmailMessage)
@@ -169,8 +208,19 @@ def list_email_messages(
         d["display_summary"] = _compose_display_summary(d)
         # 确保类型为 dict（pydantic 模型允许赋值）
         out.derived = d
+        if not include_bodies:
+            out.body_text = None
+            out.body_html = None
         items.append(out)
     return {"total": len(total), "items": items}
+
+
+@router.get("/messages/{message_id}", response_model=EmailMessageOut)
+def get_email_message(message_id: int, db: Session = Depends(get_db)):
+    row = db.get(EmailMessage, message_id)
+    if not row:
+        raise HTTPException(404, "message not found")
+    return EmailMessageOut.model_validate(row)
 
 
 @router.post("/features")

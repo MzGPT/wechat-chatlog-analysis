@@ -4,9 +4,12 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import json
+import uuid
+from time import perf_counter
 from ..db import SessionLocal
 from ..services.sync_service import sync_from_chatlog, sync_full, compare_with_chatlog, sync_from_langbot_adapters
 from ..services.snapshot_service import refresh_default_snapshots
+from ..services import sync_runtime
 from ..models import SyncState
 
 
@@ -32,10 +35,16 @@ def _langbot_backup_enabled(db: Session) -> bool:
         return False
 
 
+def _load_chatlog_sync_policy(db: Session) -> dict[str, float | int]:
+    return sync_runtime.get_chatlog_sync_policy(db, model_cls=SyncState)
+
+
 @router.post("/chatlog")
 def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
     # Accept ISO strings with/without timezone and trailing Z; normalize to naive local time
     parsed_since = None
+    started_at = datetime.utcnow()
+    run_id = f"chatlog-{uuid.uuid4().hex[:12]}"
     if since:
         try:
             s = since.replace("Z", "+00:00")
@@ -46,7 +55,45 @@ def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
         except Exception:
             parsed_since = None
     try:
-        res = sync_from_chatlog(db, parsed_since)
+        t0 = perf_counter()
+        policy = _load_chatlog_sync_policy(db)
+        res, attempts, sync_err = sync_runtime.run_with_retry(
+            lambda: sync_from_chatlog(db, parsed_since),
+            max_attempts=int(policy["max_attempts"]),
+            sleep_seconds=float(policy["sleep_seconds"]),
+            on_error=lambda _exc: db.rollback(),
+        )
+        if sync_err is not None:
+            error_code, _ = sync_runtime.classify_sync_error(sync_err)
+            payload = {
+                "run_id": run_id,
+                "status": "error",
+                "started_at": started_at.isoformat(),
+                "ended_at": datetime.utcnow().isoformat(),
+                "duration_ms": int((perf_counter() - t0) * 1000),
+                "attempts": int(attempts),
+                "error_code": error_code,
+                "error": str(sync_err),
+                "fetched": 0,
+                "inserted": 0,
+                "since": parsed_since.isoformat() if parsed_since else None,
+            }
+            sync_runtime.persist_sync_run(db, SyncState, payload)
+            db.commit()
+            return {
+                "status": "error",
+                "run_id": run_id,
+                "attempts": int(attempts),
+                "error_code": error_code,
+                "error": str(sync_err),
+                "fetched": 0,
+                "inserted": 0,
+                "since": parsed_since.isoformat() if parsed_since else None,
+                "until": datetime.now().isoformat(),
+            }
+        res = dict(res or {})
+        res["run_id"] = run_id
+        res["attempts"] = int(attempts)
         # Also ingest LangBot adapter logs as a backup source and merge into main messages table (deduped).
         if _langbot_backup_enabled(db):
             try:
@@ -97,18 +144,58 @@ def sync_chatlog(since: str | None = None, db: Session = Depends(get_db)):
             threading.Thread(target=_overlay, args=(ids,), daemon=True).start()
         except Exception:
             pass
-        refresh_default_snapshots(db)
+        try:
+            refresh_default_snapshots(db)
+        except Exception as e:
+            res["snapshot_error"] = str(e)
+        payload = {
+            "run_id": run_id,
+            "status": "ok",
+            "started_at": started_at.isoformat(),
+            "ended_at": datetime.utcnow().isoformat(),
+            "duration_ms": int((perf_counter() - t0) * 1000),
+            "attempts": int(attempts),
+            "error_code": None,
+            "error": None,
+            "fetched": int(res.get("fetched") or 0),
+            "inserted": int(res.get("inserted") or 0),
+            "since": res.get("since"),
+            "until": res.get("until"),
+        }
+        sync_runtime.persist_sync_run(db, SyncState, payload)
         db.commit()
         return res
-    except Exception:
+    except Exception as e:
         db.rollback()
-        raise
+        error_code, _ = sync_runtime.classify_sync_error(e)
+        return {
+            "status": "error",
+            "run_id": run_id,
+            "attempts": 1,
+            "error_code": error_code,
+            "error": str(e),
+            "fetched": 0,
+            "inserted": 0,
+            "since": parsed_since.isoformat() if parsed_since else None,
+            "until": datetime.now().isoformat(),
+        }
 
 
 @router.get("/state")
 def sync_state(db: Session = Depends(get_db)):
-    row = db.get(SyncState, "chatlog_last_sync")
-    return {"last_sync": row.value if row else None}
+    return sync_runtime.build_sync_state_payload(db, _model_cls=SyncState)
+
+
+@router.get("/policy")
+def get_sync_policy(db: Session = Depends(get_db)):
+    return sync_runtime.get_chatlog_sync_policy(db, model_cls=SyncState)
+
+
+@router.post("/policy")
+def set_sync_policy(body: dict, db: Session = Depends(get_db)):
+    policy = sync_runtime.save_chatlog_sync_policy(db, model_cls=SyncState, payload=body or {})
+    db.commit()
+    return {"status": "ok", "policy": policy}
 
 
 @router.post("/chatlog/full")

@@ -3,9 +3,14 @@ from pydantic import AnyUrl, Field
 
 
 class Settings(BaseSettings):
+    APP_ENV: str = "development"
+    CORS_ALLOW_ORIGINS: str | None = None
+
     # chatlog
     CHATLOG_HTTP_BASE: str = Field(default="http://127.0.0.1:5030")
     CHATLOG_DIR: str | None = None
+    CHATLOG_HTTP_SESSION_TIMEOUT_SECONDS: int = Field(default=5)
+    CHATLOG_HTTP_TIMEOUT_SECONDS: int = Field(default=10)
 
     # n8n webhooks
     N8N_REPLY_WEBHOOK: str | None = None
@@ -16,6 +21,10 @@ class Settings(BaseSettings):
 
     # API
     API_TOKEN: str | None = None
+    AGENT_API_TOKEN: str | None = None
+    AGENT_API_TOKENS: str | None = None
+    AGENT_API_ALLOWLIST: str | None = None
+    AGENT_API_BLOCKLIST: str | None = None
 
     # DB
     DATABASE_URL: str = Field(default="sqlite:///./data/app.db")

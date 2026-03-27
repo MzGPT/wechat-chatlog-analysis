@@ -11,7 +11,7 @@ class ChatlogClient:
 
     def get_sessions(self):
         url = f"{self.base}/api/v1/session"
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=settings.CHATLOG_HTTP_SESSION_TIMEOUT_SECONDS)
         r.raise_for_status()
         # Some builds return plain text instead of JSON
         ctype = r.headers.get("content-type", "")
@@ -32,7 +32,7 @@ class ChatlogClient:
         if offset is not None:
             params["offset"] = str(offset)
         url = f"{self.base}/api/v1/chatlog"
-        r = requests.get(url, params=params, timeout=30)
+        r = requests.get(url, params=params, timeout=settings.CHATLOG_HTTP_TIMEOUT_SECONDS)
         # Some versions return 400 for range queries; try fallback to single day for end date
         if r.status_code == 400 and "~" in time_range:
             # try split and query each day will be handled at higher level; here just raise

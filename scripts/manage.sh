@@ -7,6 +7,7 @@ REQ_FILE="$ROOT_DIR/requirements.txt"
 ENV_FILE="$ROOT_DIR/.env"
 PID_FILE="$ROOT_DIR/.uvicorn.pid"
 LOG_FILE="$ROOT_DIR/uvicorn.log"
+REQ_HASH_FILE="$VENV_DIR/.requirements.sha256"
 
 APP_IMPORT="app.main:app"
 
@@ -47,13 +48,43 @@ ensure_venv() {
   "$VENV_DIR/bin/pip" install -r "$REQ_FILE"
 }
 
+calc_requirements_hash() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$REQ_FILE" | awk '{print $1}'
+    return 0
+  fi
+  "$VENV_DIR/bin/python" - <<'PY'
+import hashlib, pathlib
+path = pathlib.Path("requirements.txt")
+print(hashlib.sha256(path.read_bytes()).hexdigest())
+PY
+}
+
 # 在网络受限或本地已装好的场景，允许跳过安装
 maybe_ensure_venv() {
-  if [[ -d "$VENV_DIR" && "${NO_INSTALL:-}" == "1" ]]; then
+  if [[ "${NO_INSTALL:-}" == "1" && -d "$VENV_DIR" ]]; then
     warn "跳过依赖安装 (NO_INSTALL=1)"
     return 0
   fi
+
+  # 首次创建或虚拟环境损坏时，走完整安装流程
+  if [[ ! -d "$VENV_DIR" || ! -x "$VENV_DIR/bin/python" ]]; then
+    ensure_venv
+    calc_requirements_hash > "$REQ_HASH_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  # 若 requirements 未变化，跳过重复安装以加快启动
+  local current_hash cached_hash
+  current_hash="$(calc_requirements_hash 2>/dev/null || true)"
+  cached_hash="$(cat "$REQ_HASH_FILE" 2>/dev/null || true)"
+  if [[ -n "$current_hash" && "$current_hash" == "$cached_hash" ]]; then
+    info "依赖未变化，跳过安装"
+    return 0
+  fi
+
   ensure_venv
+  calc_requirements_hash > "$REQ_HASH_FILE" 2>/dev/null || true
 }
 
 export_env() {
@@ -70,9 +101,20 @@ read_pid() {
   fi
 }
 
+tracked_pid_running() {
+  local pid
+  pid=$(read_pid)
+  [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1
+}
+
 is_port_listening() {
   local port=${1:-8000}
   lsof -nPiTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+pid_on_port() {
+  local port=${1:-8000}
+  lsof -nPiTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true
 }
 
 health_ok() {
@@ -82,9 +124,21 @@ health_ok() {
 }
 
 is_running() {
+  local port
+  port=${1:-${PORT:-8000}}
   local pid
   pid=$(read_pid)
   if [[ -n "${pid}" ]] && ps -p "$pid" >/dev/null 2>&1; then
+    local bound_pid
+    bound_pid=$(pid_on_port "$port")
+    if [[ -n "$bound_pid" ]] && [[ "$bound_pid" == "$pid" ]]; then
+      return 0
+    fi
+  fi
+  local pid2
+  pid2=$(pid_on_port "$port")
+  if [[ -n "$pid2" ]] && ps -p "$pid2" >/dev/null 2>&1; then
+    echo "$pid2" > "$PID_FILE"
     return 0
   fi
   return 1
@@ -108,13 +162,17 @@ start_bg() {
   ensure_env
   maybe_ensure_venv
   export_env
-  if is_running; then
-    ok "服务已在运行 (PID: $(cat "$PID_FILE"))"
-    exit 0
-  fi
   local host port
   host=${HOST:-127.0.0.1}
   port=${PORT:-8000}
+  if is_running "$port"; then
+    ok "服务已在运行 (PID: $(cat "$PID_FILE"))"
+    exit 0
+  fi
+  if tracked_pid_running; then
+    err "检测到已有受管服务正在运行，但不在端口 $port 上。该脚本当前按单实例管理，请先执行: bash scripts/manage.sh stop"
+    return 1
+  fi
 
   # 检测端口冲突（非本 PID 占用）
   if is_port_listening "$port"; then
@@ -136,7 +194,19 @@ start_bg() {
     pybin="$VENV_DIR/bin/python3"
   fi
   nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" >"$LOG_FILE" 2>&1 < /dev/null & echo $! > "$PID_FILE"
+  disown || true
   if wait_health "$host" "$port" 8; then
+    local live_pid
+    live_pid=$(pid_on_port "$port")
+    if [[ -n "$live_pid" ]]; then
+      echo "$live_pid" > "$PID_FILE"
+    fi
+    sleep 1
+    if ! is_running "$port" || ! is_port_listening "$port"; then
+      err "服务启动后未保持存活，请查看日志: $LOG_FILE"
+      tail -n 120 "$LOG_FILE" || true
+      return 1
+    fi
     ok "已启动 (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
     return 0
   fi
@@ -151,7 +221,19 @@ start_bg() {
     rm -f "$PID_FILE"
   fi
   nohup "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port" --loop asyncio >"$LOG_FILE" 2>&1 < /dev/null & echo $! > "$PID_FILE"
+  disown || true
   if wait_health "$host" "$port" 12; then
+    local live_pid
+    live_pid=$(pid_on_port "$port")
+    if [[ -n "$live_pid" ]]; then
+      echo "$live_pid" > "$PID_FILE"
+    fi
+    sleep 1
+    if ! is_running "$port" || ! is_port_listening "$port"; then
+      err "兼容模式启动后未保持存活，请查看日志: $LOG_FILE"
+      tail -n 120 "$LOG_FILE" || true
+      return 1
+    fi
     ok "已启动(兼容模式) (PID: $(cat "$PID_FILE"))，日志: $LOG_FILE"
     return 0
   fi
@@ -169,14 +251,19 @@ start_fg() {
   port=${PORT:-8000}
   info "以前台方式启动: Ctrl+C 退出"
   cd "$ROOT_DIR"
-  "$VENV_DIR/bin/uvicorn" "$APP_IMPORT" --host "$host" --port "$port"
+  local pybin
+  pybin="$VENV_DIR/bin/python"
+  if [[ ! -x "$pybin" ]]; then
+    pybin="$VENV_DIR/bin/python3"
+  fi
+  "$pybin" -m uvicorn "$APP_IMPORT" --host "$host" --port "$port"
 }
 
 stop_svc() {
   local host port
   host=${HOST:-127.0.0.1}
   port=${PORT:-8000}
-  if is_running; then
+  if is_running "$port"; then
     local pid
     pid=$(cat "$PID_FILE")
     info "停止服务 (PID: $pid)"
@@ -212,7 +299,8 @@ status_svc() {
   host=${HOST:-127.0.0.1}
   port=${PORT:-8000}
   pid=$(read_pid)
-  if is_running; then
+  if is_running "$port"; then
+    pid=$(read_pid)
     if is_port_listening "$port" && health_ok "$host" "$port"; then
       ok "运行中且健康 (PID: $pid, http://$host:$port)"
     else
@@ -223,6 +311,7 @@ status_svc() {
   fi
   if [[ -n "$pid" ]]; then
     warn "发现陈旧 PID 文件 (PID: $pid)，已判定未运行"
+    rm -f "$PID_FILE"
   fi
   warn "未运行"
 }
@@ -304,7 +393,15 @@ case "$cmd" in
   install) ensure_env; ensure_venv ;;
   start) start_bg ;;
   run) start_fg ;;
-  dev) ensure_env; maybe_ensure_venv; export_env; cd "$ROOT_DIR"; "$VENV_DIR/bin/uvicorn" "$APP_IMPORT" --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" --reload ;;
+  dev)
+    ensure_env
+    maybe_ensure_venv
+    export_env
+    cd "$ROOT_DIR"
+    pybin="$VENV_DIR/bin/python"
+    [[ -x "$pybin" ]] || pybin="$VENV_DIR/bin/python3"
+    "$pybin" -m uvicorn "$APP_IMPORT" --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" --reload
+    ;;
   stop) stop_svc ;;
   status) status_svc ;;
   doctor) doctor_svc ;;

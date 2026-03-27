@@ -5,6 +5,7 @@ import json
 import time
 import random
 import threading
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 import requests
@@ -838,6 +839,26 @@ def _safe_domain(url: str) -> str:
         return ""
 
 
+_THINK_BLOCK_RE = re.compile(r"<\s*(think|reasoning)[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _normalize_llm_content(raw: Any) -> str:
+    """Normalize provider output and reject whitespace-only payloads."""
+    if not isinstance(raw, str):
+        return ""
+    text = raw.replace("\ufeff", "").replace("\x00", "")
+    # Some providers prepend chain-of-thought-like blocks; drop them for stability.
+    text = _THINK_BLOCK_RE.sub("", text)
+    text = text.strip()
+    if not text:
+        return ""
+    # Guard against pathological outputs made of mostly whitespace/control chars.
+    visible = "".join(ch for ch in text if ch.isprintable() and not ch.isspace())
+    if not visible:
+        return ""
+    return text
+
+
 def _get_channel_runtime(channel_id: str) -> Dict[str, Any]:
     with _MODEL_ROUTER_LOCK:
         st = _MODEL_ROUTER_STATS.get(channel_id)
@@ -1238,8 +1259,29 @@ def resolve_chat_target(
 
 def get_router_runtime_stats() -> Dict[str, Dict[str, Any]]:
     """Return current in-process router runtime metrics for observability."""
+    now = _now_ts()
     with _MODEL_ROUTER_LOCK:
-        return {k: dict(v) for k, v in _MODEL_ROUTER_STATS.items()}
+        out: Dict[str, Dict[str, Any]] = {}
+        for k, v in _MODEL_ROUTER_STATS.items():
+            item = dict(v)
+            try:
+                until = float(item.get("cooldown_until") or 0.0)
+            except Exception:
+                until = 0.0
+            item["cooldown_remaining_sec"] = max(0, int(until - now)) if until > now else 0
+            out[k] = item
+        return out
+
+
+def reset_router_runtime_stats(*, channel_id: str | None = None) -> None:
+    """Reset in-process router runtime stats, optionally for a single channel."""
+    target = str(channel_id or "").strip()
+    with _MODEL_ROUTER_LOCK:
+        if target:
+            _MODEL_ROUTER_STATS.pop(target, None)
+        else:
+            _MODEL_ROUTER_STATS.clear()
+    _persist_router_metrics(force=True)
 
 
 def _post_with_backoff(url: str, headers: dict, payload: dict, *, timeout: int = 180) -> requests.Response:
@@ -1363,8 +1405,9 @@ def siliconflow_chat(
                 resp = _post_with_backoff(url, headers, payload, timeout=http_timeout)
             resp.raise_for_status()
             data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if isinstance(content, str) and content:
+            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            content = _normalize_llm_content(raw_content)
+            if content:
                 latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
                 if channel_dict is not None:
                     _router_mark_result(channel_dict, ok=True, latency_ms=latency_ms, conf=conf)

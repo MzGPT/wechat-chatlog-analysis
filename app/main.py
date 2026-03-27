@@ -4,30 +4,79 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import FileResponse, Response
+from starlette.responses import FileResponse, Response, JSONResponse
 from .db import init_db
 from .background import install_background
-from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, minutes, tools, media, mp_rss, tasks, recorder, wechat8061, admin, langbot, invitations
+from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, minutes, tools, media, mp_rss, tasks, recorder, wechat8061, admin, langbot, invitations, agent_api
 from .routers import news as newsfeed
 from .db import SessionLocal
 from .models import Message
+from .config import settings
 import orjson
 import os
+
+
+def _configured_api_tokens() -> set[str]:
+    token = str(getattr(settings, "API_TOKEN", "") or "").strip()
+    return {token} if token else set()
+
+
+def _extract_api_token(request: Request) -> str:
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return (request.headers.get("x-api-token") or "").strip()
+
+
+def _is_api_auth_exempt_path(path: str) -> bool:
+    if not path.startswith("/api"):
+        return True
+    if path in {"/api/health", "/api/ready"}:
+        return True
+    if path.startswith("/api/agent"):
+        return True
+    return False
+
+
+def _cors_options() -> dict | None:
+    env = str(getattr(settings, "APP_ENV", "development") or "development").strip().lower()
+    raw_origins = str(getattr(settings, "CORS_ALLOW_ORIGINS", "") or "").strip()
+    if env in {"dev", "development", "local", "test", "testing"}:
+        return {
+            "allow_origins": ["*"],
+            "allow_credentials": True,
+            "allow_methods": ["*"],
+            "allow_headers": ["*"],
+        }
+    origins = [item.strip() for item in raw_origins.split(",") if item.strip()]
+    if not origins:
+        return None
+    return {
+        "allow_origins": origins,
+        "allow_credentials": True,
+        "allow_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Authorization", "Content-Type", "X-API-Token"],
+    }
 
 
 def create_app() -> FastAPI:
     init_db()
     app = FastAPI(title="WeChat Chatlog Analysis API")
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    cors = _cors_options()
+    if cors:
+        app.add_middleware(CORSMiddleware, **cors)
     # Compress large HTML/JSON responses (index.html ~27MB before gzip)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    @app.middleware("http")
+    async def require_api_token(request: Request, call_next):
+        configured = _configured_api_tokens()
+        if configured and not _is_api_auth_exempt_path(request.url.path):
+            provided = _extract_api_token(request)
+            if provided not in configured:
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return await call_next(request)
 
     app.include_router(health.router)
     app.include_router(messages.router)
@@ -55,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(wechat8061.router)
     app.include_router(admin.router)
     app.include_router(langbot.router)
+    app.include_router(agent_api.router)
     # News feed aggregation (API-only, no frontend)
     app.include_router(newsfeed.router)
     app.include_router(market.router)

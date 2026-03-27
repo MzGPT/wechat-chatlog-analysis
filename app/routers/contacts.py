@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from ..db import SessionLocal
@@ -23,9 +23,22 @@ def get_db():
 
 
 @router.get("", response_model=list[ContactOut])
-def list_contacts(db: Session = Depends(get_db)):
+def list_contacts(
+    include_labels: bool = Query(default=False, description="Include contact labels in list payload."),
+    db: Session = Depends(get_db),
+):
     items = db.execute(select(Contact).order_by(Contact.rating.desc())).scalars().all()
-    return [ContactOut.model_validate(i) for i in items]
+    out: list[ContactOut] = []
+    for i in items:
+        payload = {
+            "id": i.id,
+            "name": i.name,
+            "alias": i.alias,
+            "rating": i.rating,
+            "labels": i.labels if include_labels else None,
+        }
+        out.append(ContactOut.model_validate(payload))
+    return out
 
 
 @router.get("/labels")
