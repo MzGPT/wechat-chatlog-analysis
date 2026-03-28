@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..db import SessionLocal
 from ..models import Contact, SyncState
@@ -24,10 +24,19 @@ def get_db():
 
 @router.get("", response_model=list[ContactOut])
 def list_contacts(
-    include_labels: bool = Query(default=False, description="Include contact labels in list payload."),
+    limit: int | None = None,
+    offset: int = 0,
+    include_labels: bool = False,
+    response: Response = None,
     db: Session = Depends(get_db),
 ):
-    items = db.execute(select(Contact).order_by(Contact.rating.desc())).scalars().all()
+    total = db.execute(select(func.count()).select_from(Contact)).scalar() or 0
+    query = select(Contact).order_by(Contact.rating.desc())
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    items = db.execute(query).scalars().all()
+    if response is not None:
+        response.headers["X-Total-Count"] = str(int(total))
     out: list[ContactOut] = []
     for i in items:
         payload = {
@@ -39,6 +48,12 @@ def list_contacts(
         }
         out.append(ContactOut.model_validate(payload))
     return out
+
+
+@router.get("/ratings")
+def list_contact_ratings(db: Session = Depends(get_db)):
+    rows = db.execute(select(Contact.id, Contact.rating)).all()
+    return {str(contact_id): int(rating or 50) for contact_id, rating in rows if contact_id}
 
 
 @router.get("/labels")

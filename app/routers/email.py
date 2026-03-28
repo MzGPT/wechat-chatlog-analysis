@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from threading import Lock
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, or_, case
+from sqlalchemy import select, desc, or_, case, func
 from datetime import datetime
 from typing import Optional
 
@@ -154,7 +154,7 @@ def list_email_messages(
         query = query.where(
             or_(EmailMessage.subject.like(like), EmailMessage.snippet.like(like), EmailMessage.from_addr.like(like))
         )
-    total = db.execute(query.with_only_columns(EmailMessage.id)).all()
+    total = db.execute(query.with_only_columns(func.count()).order_by(None)).scalar() or 0
     # SQLite 不支持 NULLS LAST 语法，这里用 CASE 将 NULL 置后
     order_nulls_last = case((EmailMessage.sent_at == None, 1), else_=0)  # noqa: E711
     rows = (
@@ -212,7 +212,7 @@ def list_email_messages(
             out.body_text = None
             out.body_html = None
         items.append(out)
-    return {"total": len(total), "items": items}
+    return {"total": int(total), "items": items}
 
 
 @router.get("/messages/{message_id}", response_model=EmailMessageOut)

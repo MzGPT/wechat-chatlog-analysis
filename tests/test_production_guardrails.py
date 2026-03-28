@@ -29,6 +29,14 @@ class _DummyExecuteResult:
     def __init__(self, rows):
         self._rows = rows
 
+    def all(self):
+        return self._rows
+
+    def scalar(self):
+        if isinstance(self._rows, list):
+            return self._rows[0] if self._rows else None
+        return self._rows
+
     def scalars(self):
         return _DummyScalars(self._rows)
 
@@ -195,11 +203,11 @@ def test_list_email_messages_omits_bodies_by_default():
     )
     db = _DummyDb(
         execute_results=[
-            _DummyExecuteResult([object(), object()]),
+            _DummyExecuteResult(2),
             _DummyExecuteResult([row]),
         ]
     )
-    out = email.list_email_messages(db=db)
+    out = email.list_email_messages(limit=50, offset=0, include_bodies=False, db=db)
     assert out["total"] == 2
     assert out["items"][0].body_text is None
     assert out["items"][0].body_html is None
@@ -208,11 +216,38 @@ def test_list_email_messages_omits_bodies_by_default():
 def test_list_contacts_omits_labels_unless_requested():
     row = _ContactRow(id="wxid_a", name="Alice", alias="A", rating=88, labels={"tags": ["重点"]})
     db = _DummyDb(rows=[row])
-    compact = contacts.list_contacts(db=db)
+    compact = contacts.list_contacts(include_labels=False, db=db)
     assert compact[0].labels is None
 
     full = contacts.list_contacts(include_labels=True, db=_DummyDb(rows=[row]))
     assert full[0].labels == {"tags": ["重点"]}
+
+
+def test_list_contacts_supports_limit_offset_and_total_header():
+    rows = [
+        _ContactRow(id="wxid_a", name="Alice", alias="A", rating=88, labels={"tags": ["重点"]}),
+        _ContactRow(id="wxid_b", name="Bob", alias="B", rating=77, labels={"tags": ["次重点"]}),
+    ]
+    db = _DummyDb(
+        execute_results=[
+            _DummyExecuteResult(2),
+            _DummyExecuteResult([rows[1]]),
+        ]
+    )
+    class _Resp:
+        headers = {}
+
+    response = _Resp()
+    page = contacts.list_contacts(limit=1, offset=1, include_labels=False, response=response, db=db)
+    assert len(page) == 1
+    assert page[0].id == "wxid_b"
+    assert response.headers["X-Total-Count"] == "2"
+
+
+def test_list_contact_ratings_returns_compact_mapping():
+    db = _DummyDb(execute_results=[_DummyExecuteResult([("wxid_a", 88), ("wxid_b", None)])])
+    ratings = contacts.list_contact_ratings(db=db)
+    assert ratings == {"wxid_a": 88, "wxid_b": 50}
 
 
 
