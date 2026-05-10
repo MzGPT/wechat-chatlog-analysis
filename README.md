@@ -1,143 +1,54 @@
-% 信息聚合AI系统（FastAPI + SQLite + AI）
+# 0913 Platform
 
-版本：**v0.8.0**（见 `VERSION` / `docs/RELEASE_NOTES_v0.8.0.md`）
+独立微信消息管理与自动化平台。支持 wechatapi.net 回调接入、智能回复、消息聚合、情报分析。
 
-![python](https://img.shields.io/badge/python-3.11%2B-blue.svg?logo=python)
-![fastapi](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)
-![sqlite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite)
+## 安装
 
-一个面向“多源信息聚合 + 检索过滤 + AI 总结 + 自动发送”的本地优先系统：
-- FastAPI + SQLite(FTS5) 提供高效存储与全文检索
-- 支持从 chatlog HTTP 服务增量拉取微信消息；支持邮件、多媒体、自媒体、公众号、会议纪要等多源聚合
-- 本地 SiliconFlow 接口完成总结/摘要/候选回复生成；发送通道可对接 LangBot 网关/WeChatPadPro/n8n
-- 自带极简 UI（`/static/index.html`）：数据看板、AI 总结、聚合列表、发送管理、功能设置等一体化
+```bash
+git clone git@github.com:leecyno1/wechat-chatlog-analysis-v0.8.git 0913
+cd 0913
+bash scripts/manage.sh install
+bash scripts/manage.sh start
+```
 
-v0.8.0 重点能力（面向验收）
-- AI 总结：增量摘要缓存（刷新可恢复）+ payload 瘦身降 Token
-- 会议信息：3 列紧凑表格（时间｜平台/会议号｜主题要点），主题仅取摘要 summary 并自动换行
-- 新闻舆情：来源徽标/气泡可点击查看引用来源（消息/新闻），支持按 id 回查
-- 联系人：评分可编辑保存；消息行“顶/踩”可加减分；评分 < 40 自动拉黑（持久化）
-- 黑白名单：支持联系人 + 群聊（talkers）管理；黑名单对象强制不进入微信/邮件列表
+## 功能模块
 
-预览界面（示例截图，已脱敏）
+| 模块 | 说明 |
+|------|------|
+| 微信网关 | wechatapi 回调 → 规则评估 → LLM 回复 → 出站发送 |
+| 消息管理 | 微信/邮件消息列表、搜索、标签、导出 |
+| 情报分析 | 市场观点、会议路演、新闻舆情、自媒体聚合、公众号聚合 |
+| 联系人评分 | 基于消息频率和内容质量的联系人价值评分 |
+| 消息群发 | 手动/自动批量发送 |
+| 子 session | 独立 AI 分身（人格/路由/上下文隔离） |
 
-![Preview](docs/assets/screenshots/01-ai-summary-light.jpg)
+## WeChat API 对接
 
-更多截图（建议查看 `docs/SCREENSHOTS.md`）
+0913 通过 wechatapi.net 的 iPad 协议接入微信。配置要求：
 
-![WeChat](docs/assets/screenshots/03-wechat-light.jpg)
-![Email](docs/assets/screenshots/04-email-light.jpg)
-![Media](docs/assets/screenshots/06-media-light.jpg)
-![MP](docs/assets/screenshots/07-mp-light.jpg)
+1. wechatapi token + app_id（从 [wechatapi 控制台](https://wechatapi.net/) 获取）
+2. 回调公网 URL（需 natapp/ngrok/frp 隧道）
+3. MiniMax API key（用于自动回复路由）
 
-目录导航
-- 快速开始
-- 主要特性
-- 目录结构
-- 配置说明
-- 常用 API
-- 开发与调试
-- 安全与发布建议
- - 文档与截图
+详细对接方案见 [wechat-automation](https://github.com/leecyno1/wechat-automation) 仓库。
 
-快速开始
-1) 初始化环境变量
-   cp .env.example .env
+## API 端点
 
-2) 安装并启动（推荐脚本）
-   bash scripts/manage.sh install
-   bash scripts/manage.sh start
+| 端点 | 用途 |
+|------|------|
+| `POST /api/wechat-gateway/callback` | wechatapi 回调入口 |
+| `GET /api/messages` | 消息列表 |
+| `GET /api/messages/mp` | 公众号消息 |
+| `GET /api/wechat-gateway/config` | 网关配置 |
+| `POST /api/wechat-gateway/trigger-rules` | 触发规则 |
 
-   常用：
-   - 状态：bash scripts/manage.sh status
-   - 日志：bash scripts/manage.sh logs -f
-   - 停止：bash scripts/manage.sh stop
-   - 同步：bash scripts/manage.sh sync
+## 开发
 
-3) 手动方式（可选）
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   uvicorn app.main:app --host 127.0.0.1 --port 8000
+```bash
+python -m pytest -q              # 运行测试
+bash scripts/manage.sh dev       # 热重载开发
+```
 
-4) 验证与访问
-   - 前端最小页：http://127.0.0.1:8000/
-   - 健康检查：curl http://127.0.0.1:8000/api/health
-   - 搜索示例：curl 'http://127.0.0.1:8000/api/messages?q=hello'
+## 许可证
 
-主要特性
-- 全文检索：基于 SQLite FTS5 的消息/联系人检索
-- AI 总结：本地接口生成摘要、争议分析、候选回复等
-- 同步能力：支持 chatlog HTTP 增量/全量拉取
-- 发送通道：集成 WeChatPadPro（HTTP+WS），可扩展 n8n
-- 极简 UI：检索、过滤、总结与群发一体化验收页
-- 邮件引擎：多账户 IMAP 收取 + SMTP 发送，UI 与微信消息对齐
-- 新闻聚合：对接 @newsnow，内嵌其原生页面
-- 自媒体聚合：对接 @folo，以同样的列表风格融合展示
-- 自媒体聚合（MediaCrawlerPro）：读取本地 `MediaCrawlerPro-Python` 落盘数据并以紧凑表格展示（支持跳转链接）
-- 公众号聚合（we-mp-rss）：读取本地 `we-mp-rss` SQLite（含 insight summary）并以紧凑表格展示（支持展开详情）
-- 纪要聚合增强：合并展示本项目 minutes + MediaCrawlerPro meeting_records（支持音频下载）
-- 扩展消息：按 langbot 适配器配置生成动态标签页（Telegram/QQ/企微/飞书等）
-- （可选）macOS 提醒事项：会议路演“📅 预约”可写入 Reminders（仅 macOS）
-
-目录结构
-app/            FastAPI 应用/路由/服务/模型/配置/模式
-data/           运行期数据库与 AI 产物（默认 data/app.db，已忽略）
-scripts/        管理脚本入口 scripts/manage.sh
-static/         最小 UI；站点根与 /static/*
-docs/ n8n/      参考文档与示例工作流
-
-配置说明（.env）
-- CHATLOG_HTTP_BASE：chatlog HTTP 服务地址
-- CHATLOG_DIR：本地聊天目录，用于离线导入（可留空）
-- N8N_REPLY_WEBHOOK / N8N_SUMMARY_WEBHOOK / N8N_CONTACT_WEBHOOK / N8N_SEND_WEBHOOK / N8N_AUTH_TOKEN
-- DATABASE_URL：默认 sqlite:///./data/app.db
-- MEDIA_PROJECT_DIR：MediaCrawlerPro-Python 项目根目录（缺省尝试同级目录 `../MediaCrawlerPro-Python`）
-- MEDIA_SERVER_BASE：MediaCrawlerPro 后端地址（用于会议录音“监听/停止”等控制代理），示例 `http://127.0.0.1:8001`
-- WE_MP_RSS_DIR / WE_MP_RSS_DB：we-mp-rss 项目目录或 SQLite 路径（缺省尝试 `../we-mp-rss/data/db.db`）
-
-常用 API（节选）
-- GET /api/health
-- GET /api/messages?q=关键词
-- POST /api/messages/{id}/upvote|downvote
-- POST /api/messages/{id}/tags
-- GET /api/chats  GET /api/contacts
-- POST /api/contacts/{id}/rating?delta=1
-- POST /api/ai/suggest-replies  POST /api/ai/summary
-- POST /api/send
-- POST /api/sync/chatlog
-- 邮件：GET/POST /api/email/accounts，POST /api/email/accounts/{id}/sync，GET /api/email/messages，POST /api/email/send
-- 新闻：GET /api/news/config（前端 iframe 使用）；配置：GET/POST /api/config/newsnow
-- 新闻回查：GET /api/newsfeed/by-ids?ids=...
-- 自媒体：GET /api/folo/posts；配置：GET/POST /api/config/folo
-- MediaCrawlerPro：GET /api/media/items，GET /api/media/meeting-records，GET /api/media/meeting/audio/{record_id}
-- we-mp-rss：GET /api/mp/articles，GET /api/mp/articles/{article_id}?include_content=true
-- 任务：GET /api/tasks，GET /api/tasks/{id}
-- 黑/白名单：GET/POST /api/filters
-- （可选）提醒事项：POST /api/tools/reminders/add
-- 扩展消息：GET/POST /api/extensions/adapters，POST /api/extensions/adapters/{key}/ingest，GET /api/extensions/messages?adapter_key=xxx；配置：GET/POST /api/config/extensions
-
-开发与调试
-- 热重载：bash scripts/manage.sh dev 或 uvicorn app.main:app --reload
-- 本地数据：python scripts/seed_sample_data.py
-- 生成快照：python scripts/run_summary_snapshot.py --period 3days
-- 运行测试：pytest -q 或 python test_summary_improvement.py
-
-安全与发布建议
-- 切勿提交 .env / data/（已在 .gitignore 中忽略）
-- 默认 CORS 较宽松，用于本地调试；上线前在 app/main.py 收紧
-- 备份 data/app.db；如迁移位置，设置 DATABASE_URL
-- 若使用 n8n，请使用 Bearer Token 并妥善保管
-
-关于许可
-本项目采用 Apache-2.0 许可证，详见 LICENSE。
-
-致谢
-本项目基于 FastAPI/Starlette/SQLite 等优秀组件构建，感谢开源社区。
-
-文档与截图
-- 功能总览：`docs/OVERVIEW.md`
-- 模块说明：`docs/MODULES.md`
-- 配置与集成：`docs/INTEGRATIONS.md`
-- 架构说明：`docs/ARCHITECTURE.md`
-- 截图集：`docs/SCREENSHOTS.md`
+Private — leecyno1

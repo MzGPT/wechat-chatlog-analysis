@@ -1,0 +1,33 @@
+{
+  "api_key": "sk-your-siliconflow-key",
+  "api_url": "https://api.siliconflow.cn/v1",
+  "model": "Qwen/Qwen3-30B-A3B",
+  "tool_model": "Qwen/Qwen3-8B",
+  "tool_model_messages": "Qwen/Qwen3-8B",
+  "tool_model_emails": "Qwen/Qwen3-8B",
+  "max_tokens": 4096,
+  "model_temperature": 0.7,
+  "message_filters": {"external_only": true, "exclude_short": true, "exclude_system": true},
+  "derive_defaults": {"batch_size": 20, "concurrency": 8, "temperature": 0.1, "force": false},
+  "model_router": {
+    "enabled": true,
+    "prefer_router": true,
+    "dynamic_weighting": true,
+    "breaker_failures": 3,
+    "cooldown_seconds": 45,
+    "latency_ref_ms": 3000,
+    "main_channels": [
+      {"id": "main-1", "name": "\u4e3b\u901a\u9053-1", "model": "Qwen/Qwen3-30B-A3B", "weight": 1, "enabled": true, "api_url": "", "api_key": ""}
+    ],
+    "tool_channels": [
+      {"id": "tool-minimax-cn-m27", "name": "\u5c0f\u6a21\u578b/\u56de\u590d MiniMax.CN M2.7", "model": "MiniMax-M2.7", "weight": 1, "enabled": true, "api_url": "https://api.minimaxi.com/v1", "api_key": "your-minimax-api-key"},
+      {"id": "tool-sf-qwen8b", "name": "\u5c0f\u6a21\u578b/\u7845\u57fa Qwen3-8B", "model": "Qwen/Qwen3-8B", "weight": 1, "enabled": true, "api_url": "", "api_key": ""}
+    ],
+    "tool_route_channels": {
+      "default": ["tool-sf-qwen8b"],
+      "messages": ["tool-sf-qwen8b"],
+      "emails": ["tool-sf-qwen8b"],
+      "reply": ["tool-minimax-cn-m27"]
+    }
+  }
+}

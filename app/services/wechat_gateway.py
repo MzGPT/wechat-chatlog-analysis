@@ -1,0 +1,1130 @@
+from __future__ import annotations
+
+import json
+import random
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from xml.etree import ElementTree as ET
+
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import Session
+
+from ..models import Chat, Contact, Message, SyncState, WechatSubsession, WechatSubsessionMembership, WechatSubsessionTurn
+
+CONFIG_KEY = "wechat_gateway_config"
+TRIGGER_RULES_KEY = "wechat_gateway_trigger_rules"
+DEDUP_PREFIX = "wechat_gateway_dedup"
+_RULE_SCOPE = "wechat_gateway"
+_GROUP_TEXT_PREFIX_RE = re.compile(r"^(?P<sender>[^:\n]{1,128}):\n(?P<body>.*)$", re.DOTALL)
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "outbound_enabled": False,
+    "sessionized_reply_enabled": False,
+    "fixed_subsession_enabled": False,
+    "fixed_subsession_id": "",
+    "fixed_subsession_name": "",
+    "auto_learn_subsession_members": True,
+    "base_url": "http://api.wechatapi.net/finder/v2/api",
+    "header_name": "VideosApi-token",
+    "token": "",
+    "app_id": "",
+    "callback_path": "/api/wechat-gateway/callback",
+    "callback_public_url": "",
+    "device_type": "ipad",
+    "region_id": "11000",
+    "allow_chat_ids_enabled": False,
+    "allow_chat_ids": [],
+    "block_chat_ids_enabled": False,
+    "block_chat_ids": [],
+    "keyword_blocklist": [],
+    "rate_limit_per_chat_per_minute": 30,
+    "outbound_random_delay_min_seconds": 0,
+    "outbound_random_delay_max_seconds": 0,
+}
+
+DEFAULT_TRIGGER_RULES: dict[str, Any] = {
+    "enabled": True,
+    "smart_reply_enabled": True,
+    "group_enabled": True,
+    "private_enabled": True,
+    "prefixes": ["ai"],
+    "regexp_patterns": [],
+    "at_mention_enabled": False,
+    "random_rate": 0,
+    "whitelist_chat_ids_enabled": False,
+    "whitelist_chat_ids": [],
+    "blacklist_chat_ids_enabled": False,
+    "blacklist_chat_ids": [],
+    "whitelist_sender_ids_enabled": False,
+    "whitelist_sender_ids": [],
+    "blacklist_sender_ids_enabled": False,
+    "blacklist_sender_ids": [],
+    "private_wakeup_window_seconds": 180,
+    "private_wakeup_whitelist_enabled": False,
+    "private_wakeup_whitelist_chat_ids": [],
+    "private_wakeup_exit_commands": [],
+    "min_text_length": 1,
+    "human_reply_suppression_seconds": 0,
+}
+
+
+def _json_load(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _dedupe_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return max(low, min(high, parsed))
+
+
+def _normalize_callback_public_url(value: Any, callback_path: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    path = str(callback_path or DEFAULT_CONFIG["callback_path"]).strip() or DEFAULT_CONFIG["callback_path"]
+    if not path.startswith("/"):
+        path = f"/{path}"
+    stripped = text.rstrip("/")
+    lowered = stripped.lower()
+    if lowered.endswith(path.lower()):
+        return stripped
+    scheme_idx = stripped.find("://")
+    path_start = stripped.find("/", scheme_idx + 3) if scheme_idx >= 0 else stripped.find("/")
+    if path_start == -1:
+        return f"{stripped}{path}"
+    existing_path = stripped[path_start:]
+    if existing_path in {"", "/"}:
+        return f"{stripped[:path_start]}{path}"
+    return stripped
+
+
+def _load_state_dict(db: Session, key: str) -> dict[str, Any]:
+    row = db.get(SyncState, key)
+    return _json_load(row.value if row else None)
+
+
+def _save_state_dict(db: Session, key: str, payload: dict[str, Any]) -> None:
+    row = db.get(SyncState, key)
+    serialized = json.dumps(payload, ensure_ascii=False)
+    if not row:
+        row = SyncState(key=key, value=serialized)
+    else:
+        row.value = serialized
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+
+def _normalize_trigger_rules(payload: dict[str, Any] | None) -> dict[str, Any]:
+    conf = dict(DEFAULT_TRIGGER_RULES)
+    conf.update({k: v for k, v in (payload or {}).items() if v is not None})
+    for key in (
+        "prefixes",
+        "regexp_patterns",
+        "whitelist_chat_ids",
+        "blacklist_chat_ids",
+        "whitelist_sender_ids",
+        "blacklist_sender_ids",
+        "private_wakeup_whitelist_chat_ids",
+        "private_wakeup_exit_commands",
+    ):
+        conf[key] = _dedupe_list(conf.get(key))
+    conf["enabled"] = bool(conf.get("enabled"))
+    conf["smart_reply_enabled"] = bool(conf.get("smart_reply_enabled"))
+    conf["group_enabled"] = bool(conf.get("group_enabled"))
+    conf["private_enabled"] = bool(conf.get("private_enabled"))
+    conf["at_mention_enabled"] = bool(conf.get("at_mention_enabled"))
+    conf["whitelist_chat_ids_enabled"] = bool(conf.get("whitelist_chat_ids_enabled"))
+    conf["blacklist_chat_ids_enabled"] = bool(conf.get("blacklist_chat_ids_enabled"))
+    conf["whitelist_sender_ids_enabled"] = bool(conf.get("whitelist_sender_ids_enabled"))
+    conf["blacklist_sender_ids_enabled"] = bool(conf.get("blacklist_sender_ids_enabled"))
+    conf["private_wakeup_whitelist_enabled"] = bool(conf.get("private_wakeup_whitelist_enabled"))
+    conf["min_text_length"] = _clamp_int(conf.get("min_text_length"), 1, 0, 10000)
+    conf["random_rate"] = _clamp_int(conf.get("random_rate"), 0, 0, 100)
+    conf["human_reply_suppression_seconds"] = _clamp_int(conf.get("human_reply_suppression_seconds"), 0, 0, 864000)
+    conf["private_wakeup_window_seconds"] = _clamp_int(conf.get("private_wakeup_window_seconds"), 180, 0, 864000)
+    return conf
+
+
+def load_trigger_rules(db: Session) -> dict[str, Any]:
+    return _normalize_trigger_rules(_load_state_dict(db, TRIGGER_RULES_KEY))
+
+
+def save_trigger_rules(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    current = load_trigger_rules(db)
+    merged = {**current, **(payload or {})}
+    normalized = _normalize_trigger_rules(merged)
+    _save_state_dict(db, TRIGGER_RULES_KEY, normalized)
+    return normalized
+
+
+def load_config(db: Session) -> dict[str, Any]:
+    row = db.get(SyncState, CONFIG_KEY)
+    raw = _json_load(row.value if row else None)
+    conf = dict(DEFAULT_CONFIG)
+    conf.update({k: v for k, v in raw.items() if v is not None})
+    conf.pop("allow_sender_ids", None)
+    conf.pop("block_sender_ids", None)
+    for key in ("allow_chat_ids", "block_chat_ids", "keyword_blocklist"):
+        conf[key] = _dedupe_list(conf.get(key))
+    conf["enabled"] = bool(conf.get("enabled"))
+    conf["outbound_enabled"] = bool(conf.get("outbound_enabled"))
+    conf["sessionized_reply_enabled"] = bool(conf.get("sessionized_reply_enabled"))
+    conf["fixed_subsession_enabled"] = bool(conf.get("fixed_subsession_enabled"))
+    conf["auto_learn_subsession_members"] = bool(conf.get("auto_learn_subsession_members", True))
+    conf["allow_chat_ids_enabled"] = bool(conf.get("allow_chat_ids_enabled"))
+    conf["block_chat_ids_enabled"] = bool(conf.get("block_chat_ids_enabled"))
+    conf["rate_limit_per_chat_per_minute"] = _clamp_int(conf.get("rate_limit_per_chat_per_minute"), 30, 1, 5000)
+    min_delay = _clamp_int(conf.get("outbound_random_delay_min_seconds"), 0, 0, 3600)
+    max_delay = _clamp_int(conf.get("outbound_random_delay_max_seconds"), 0, 0, 3600)
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+    conf["outbound_random_delay_min_seconds"] = min_delay
+    conf["outbound_random_delay_max_seconds"] = max_delay
+    conf["base_url"] = str(conf.get("base_url") or DEFAULT_CONFIG["base_url"]).strip().rstrip("/")
+    conf["header_name"] = str(conf.get("header_name") or DEFAULT_CONFIG["header_name"]).strip() or DEFAULT_CONFIG["header_name"]
+    conf["callback_path"] = str(conf.get("callback_path") or DEFAULT_CONFIG["callback_path"]).strip() or DEFAULT_CONFIG["callback_path"]
+    conf["device_type"] = str(conf.get("device_type") or DEFAULT_CONFIG["device_type"]).strip() or DEFAULT_CONFIG["device_type"]
+    conf["region_id"] = str(conf.get("region_id") or DEFAULT_CONFIG["region_id"]).strip() or DEFAULT_CONFIG["region_id"]
+    conf["token"] = str(conf.get("token") or "").strip()
+    conf["app_id"] = str(conf.get("app_id") or "").strip()
+    conf["fixed_subsession_id"] = str(conf.get("fixed_subsession_id") or "").strip()
+    conf["fixed_subsession_name"] = str(conf.get("fixed_subsession_name") or "").strip()
+    conf["callback_public_url"] = _normalize_callback_public_url(conf.get("callback_public_url"), conf["callback_path"])
+    return conf
+
+
+def save_config(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    current = load_config(db)
+    merged = {**current, **(payload or {})}
+    normalized = load_config_from_payload(merged)
+    row = db.get(SyncState, CONFIG_KEY)
+    serialized = json.dumps(normalized, ensure_ascii=False)
+    if not row:
+        row = SyncState(key=CONFIG_KEY, value=serialized)
+    else:
+        row.value = serialized
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return normalized
+
+
+def load_subsession_config(db: Session, subsession_id: str) -> dict[str, Any] | None:
+    sid = _normalize_subsession_id(subsession_id)
+    if not sid:
+        return None
+    row = db.get(WechatSubsession, sid)
+    if not row:
+        return None
+    return {
+        "id": row.id,
+        "channel": row.channel,
+        "name": row.name,
+        "enabled": bool(row.enabled),
+        "mode": row.mode,
+        "system_prompt": row.system_prompt,
+        "workflow_guardrails": row.workflow_guardrails,
+        "model_route_kind": row.model_route_kind,
+        "model_route_key": row.model_route_key,
+        "model_override": row.model_override,
+        "history_max_messages": row.history_max_messages,
+        "history_max_tokens": row.history_max_tokens,
+        "rolling_summary": row.rolling_summary,
+        "pinned_memory": row.pinned_memory,
+        "allow_cross_chat_context": bool(row.allow_cross_chat_context),
+        "allow_cross_sender_context": bool(row.allow_cross_sender_context),
+    }
+
+
+def save_subsession_config(db: Session, *, subsession_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    sid = _normalize_subsession_id(subsession_id)
+    if not sid:
+        raise ValueError("invalid subsession_id")
+    row = db.get(WechatSubsession, sid)
+    now = datetime.now()
+    if not row:
+        row = WechatSubsession(
+            id=sid,
+            channel="wechat_gateway",
+            name=sid,
+            enabled=True,
+            mode="fixed",
+            last_active_at=now,
+        )
+        db.add(row)
+        db.flush()
+    if "name" in payload and payload.get("name") is not None:
+        row.name = str(payload.get("name") or "").strip() or row.name
+    if "enabled" in payload and payload.get("enabled") is not None:
+        row.enabled = bool(payload.get("enabled"))
+    if "mode" in payload and payload.get("mode") is not None:
+        row.mode = str(payload.get("mode") or "").strip() or row.mode or "fixed"
+    if "system_prompt" in payload:
+        row.system_prompt = str(payload.get("system_prompt") or "").strip() or None
+    if "workflow_guardrails" in payload:
+        row.workflow_guardrails = payload.get("workflow_guardrails") if isinstance(payload.get("workflow_guardrails"), dict) else None
+    if "model_route_kind" in payload:
+        row.model_route_kind = str(payload.get("model_route_kind") or "").strip() or None
+    if "model_route_key" in payload:
+        row.model_route_key = str(payload.get("model_route_key") or "").strip() or None
+    if "model_override" in payload:
+        row.model_override = str(payload.get("model_override") or "").strip() or None
+    if "history_max_messages" in payload and payload.get("history_max_messages") is not None:
+        row.history_max_messages = _clamp_int(payload.get("history_max_messages"), row.history_max_messages or 30, 1, 500)
+    if "history_max_tokens" in payload and payload.get("history_max_tokens") is not None:
+        row.history_max_tokens = _clamp_int(payload.get("history_max_tokens"), row.history_max_tokens or 4000, 256, 64000)
+    if "rolling_summary" in payload:
+        row.rolling_summary = str(payload.get("rolling_summary") or "").strip() or None
+    if "pinned_memory" in payload:
+        row.pinned_memory = payload.get("pinned_memory") if isinstance(payload.get("pinned_memory"), dict) else None
+    if "allow_cross_chat_context" in payload and payload.get("allow_cross_chat_context") is not None:
+        row.allow_cross_chat_context = bool(payload.get("allow_cross_chat_context"))
+    if "allow_cross_sender_context" in payload and payload.get("allow_cross_sender_context") is not None:
+        row.allow_cross_sender_context = bool(payload.get("allow_cross_sender_context"))
+    row.channel = "wechat_gateway"
+    row.updated_at = now
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    loaded = load_subsession_config(db, sid)
+    if loaded is None:
+        raise RuntimeError("failed to load saved subsession config")
+    return loaded
+
+
+def load_config_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    conf = dict(DEFAULT_CONFIG)
+    conf.update({k: v for k, v in (payload or {}).items() if v is not None})
+    conf.pop("allow_sender_ids", None)
+    conf.pop("block_sender_ids", None)
+    for key in ("allow_chat_ids", "block_chat_ids", "keyword_blocklist"):
+        conf[key] = _dedupe_list(conf.get(key))
+    conf["enabled"] = bool(conf.get("enabled"))
+    conf["outbound_enabled"] = bool(conf.get("outbound_enabled"))
+    conf["sessionized_reply_enabled"] = bool(conf.get("sessionized_reply_enabled"))
+    conf["fixed_subsession_enabled"] = bool(conf.get("fixed_subsession_enabled"))
+    conf["auto_learn_subsession_members"] = bool(conf.get("auto_learn_subsession_members", True))
+    conf["allow_chat_ids_enabled"] = bool(conf.get("allow_chat_ids_enabled"))
+    conf["block_chat_ids_enabled"] = bool(conf.get("block_chat_ids_enabled"))
+    conf["rate_limit_per_chat_per_minute"] = _clamp_int(conf.get("rate_limit_per_chat_per_minute"), 30, 1, 5000)
+    min_delay = _clamp_int(conf.get("outbound_random_delay_min_seconds"), 0, 0, 3600)
+    max_delay = _clamp_int(conf.get("outbound_random_delay_max_seconds"), 0, 0, 3600)
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+    conf["outbound_random_delay_min_seconds"] = min_delay
+    conf["outbound_random_delay_max_seconds"] = max_delay
+    conf["base_url"] = str(conf.get("base_url") or DEFAULT_CONFIG["base_url"]).strip().rstrip("/")
+    conf["header_name"] = str(conf.get("header_name") or DEFAULT_CONFIG["header_name"]).strip() or DEFAULT_CONFIG["header_name"]
+    conf["callback_path"] = str(conf.get("callback_path") or DEFAULT_CONFIG["callback_path"]).strip() or DEFAULT_CONFIG["callback_path"]
+    conf["device_type"] = str(conf.get("device_type") or DEFAULT_CONFIG["device_type"]).strip() or DEFAULT_CONFIG["device_type"]
+    conf["region_id"] = str(conf.get("region_id") or DEFAULT_CONFIG["region_id"]).strip() or DEFAULT_CONFIG["region_id"]
+    conf["token"] = str(conf.get("token") or "").strip()
+    conf["app_id"] = str(conf.get("app_id") or "").strip()
+    conf["fixed_subsession_id"] = str(conf.get("fixed_subsession_id") or "").strip()
+    conf["fixed_subsession_name"] = str(conf.get("fixed_subsession_name") or "").strip()
+    conf["callback_public_url"] = _normalize_callback_public_url(conf.get("callback_public_url"), conf["callback_path"])
+    return conf
+
+
+def _dedupe_key(app_id: str, new_msg_id: str) -> str:
+    return f"{DEDUP_PREFIX}:{app_id}:{new_msg_id}"
+
+
+def _string_field(value: Any) -> str:
+    if isinstance(value, dict):
+        if isinstance(value.get("string"), str):
+            return value.get("string").strip()
+    return str(value or "").strip()
+
+
+
+def _extract_appmsg_fields(content: Any) -> dict[str, str]:
+    text_value = str(content or "").strip()
+    if not text_value or "<appmsg" not in text_value.lower():
+        return {}
+    try:
+        root = ET.fromstring(text_value)
+    except Exception:
+        return {}
+
+    def find_text(*paths: str) -> str:
+        for path in paths:
+            try:
+                value = root.findtext(path)
+            except Exception:
+                value = None
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    return {
+        "title": find_text(".//appmsg/title", ".//title"),
+        "desc": find_text(".//appmsg/des", ".//appmsg/description", ".//des"),
+        "url": find_text(".//appmsg/url", ".//url"),
+        "sourceusername": find_text(".//appmsg/sourceusername", ".//sourceusername"),
+        "sourcedisplayname": find_text(".//appmsg/sourcedisplayname", ".//sourcedisplayname"),
+        "thumburl": find_text(".//appmsg/thumburl", ".//thumburl", ".//weappinfo/weappiconurl"),
+    }
+
+def _normalize_message_type(msg_type: Any) -> str:
+    mapping = {
+        1: "text",
+        3: "image",
+        34: "voice",
+        43: "video",
+        47: "emoji",
+        48: "location",
+        49: "app",
+        10000: "system",
+        10002: "system",
+    }
+    try:
+        num = int(msg_type)
+    except Exception:
+        return "other"
+    return mapping.get(num, "other")
+
+
+def _split_group_sender(chat_id: str, content: str) -> tuple[str | None, str]:
+    text = str(content or "")
+    if not str(chat_id or "").endswith("@chatroom"):
+        return None, text
+    match = _GROUP_TEXT_PREFIX_RE.match(text)
+    if match:
+        sender = str(match.group("sender") or "").strip() or None
+        body = str(match.group("body") or "")
+        return sender, body
+    if text.lstrip().startswith("<"):
+        try:
+            root = ET.fromstring(text)
+            sender = (
+                root.findtext("fromusername")
+                or root.findtext("fromUserName")
+                or root.findtext("senderusername")
+                or root.findtext("sender")
+                or ""
+            ).strip()
+            if sender:
+                return sender, text
+        except Exception:
+            pass
+    return None, text
+
+
+def _ensure_chat(db: Session, chat_id: str, title: str | None = None, timestamp: datetime | None = None) -> Chat:
+    chat = db.get(Chat, chat_id)
+    if not chat:
+        chat = Chat(id=chat_id, title=title or chat_id, is_chatroom=chat_id.endswith("@chatroom"))
+        db.add(chat)
+    elif title and not chat.title:
+        chat.title = title
+    if timestamp and (chat.last_message_at is None or timestamp >= chat.last_message_at):
+        chat.last_message_at = timestamp
+    return chat
+
+
+def _ensure_contact(db: Session, contact_id: str | None, name: str | None = None) -> Contact | None:
+    if not contact_id:
+        return None
+    contact = db.get(Contact, contact_id)
+    if not contact:
+        contact = Contact(id=contact_id, name=name or contact_id)
+        db.add(contact)
+    elif name and not contact.name:
+        contact.name = name
+    return contact
+
+
+def _normalize_subsession_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = re.sub(r"[^a-zA-Z0-9:_\-./]+", "_", text)
+    return normalized[:128].strip("_")
+
+
+def resolve_gateway_subsession(db: Session, *, conf: dict[str, Any], chat_id: str | None, sender_id: str | None) -> WechatSubsession | None:
+    if not conf.get("sessionized_reply_enabled"):
+        return None
+    if not conf.get("fixed_subsession_enabled"):
+        return None
+    subsession_id = _normalize_subsession_id(conf.get("fixed_subsession_id"))
+    if not subsession_id:
+        return None
+    name = str(conf.get("fixed_subsession_name") or "").strip() or subsession_id
+    now = datetime.now()
+
+    db.execute(
+        sqlite_insert(WechatSubsession)
+        .values(
+            id=subsession_id,
+            channel="wechat_gateway",
+            name=name,
+            enabled=True,
+            mode="fixed",
+            last_active_at=now,
+            updated_at=now,
+        )
+        .on_conflict_do_update(
+            index_elements=[WechatSubsession.id],
+            set_={
+                "channel": "wechat_gateway",
+                "name": name,
+                "enabled": True,
+                "mode": "fixed",
+                "last_active_at": now,
+                "updated_at": now,
+            },
+        )
+    )
+    subsession = db.get(WechatSubsession, subsession_id)
+    if not subsession:
+        db.flush()
+        subsession = db.get(WechatSubsession, subsession_id)
+    if not subsession:
+        return None
+    if conf.get("auto_learn_subsession_members", True):
+        ensure_subsession_memberships(db, subsession_id=subsession.id, chat_id=chat_id, sender_id=sender_id)
+    return subsession
+
+
+def ensure_subsession_memberships(db: Session, *, subsession_id: str, chat_id: str | None, sender_id: str | None) -> None:
+    now = datetime.now()
+    members: list[tuple[str, str, str | None, str | None]] = []
+    if chat_id:
+        members.append(("chat", str(chat_id).strip(), str(chat_id).strip(), None))
+    if sender_id:
+        members.append(("sender", str(sender_id).strip(), None, str(sender_id).strip()))
+    for member_type, member_key, member_chat_id, member_sender_id in members:
+        if not member_key:
+            continue
+        values = {
+            "subsession_id": subsession_id,
+            "member_type": member_type,
+            "member_key": member_key,
+            "chat_id": member_chat_id,
+            "sender_id": member_sender_id,
+            "source": "wechat_gateway",
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "meta": {"channel": "wechat_gateway"},
+        }
+        update_values: dict[str, Any] = {
+            "last_seen_at": now,
+            "source": "wechat_gateway",
+            "meta": {"channel": "wechat_gateway"},
+        }
+        if member_chat_id:
+            update_values["chat_id"] = member_chat_id
+        if member_sender_id:
+            update_values["sender_id"] = member_sender_id
+        db.execute(
+            sqlite_insert(WechatSubsessionMembership)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[
+                    WechatSubsessionMembership.subsession_id,
+                    WechatSubsessionMembership.member_type,
+                    WechatSubsessionMembership.member_key,
+                ],
+                set_=update_values,
+            )
+        )
+
+
+def record_subsession_turn(
+    db: Session,
+    *,
+    subsession_id: str | None,
+    message_id: int | None,
+    chat_id: str | None,
+    sender_id: str | None,
+    direction: str,
+    timestamp: datetime | None,
+    content_text: str | None,
+    meta: dict[str, Any] | None = None,
+) -> WechatSubsessionTurn | None:
+    normalized_subsession_id = _normalize_subsession_id(subsession_id)
+    if not normalized_subsession_id:
+        return None
+    turn = WechatSubsessionTurn(
+        subsession_id=normalized_subsession_id,
+        message_id=message_id,
+        chat_id=str(chat_id or "").strip() or None,
+        sender_id=str(sender_id or "").strip() or None,
+        direction=str(direction or "").strip() or "in",
+        timestamp=timestamp,
+        content_text_snapshot=str(content_text or "") if content_text is not None else None,
+        meta=meta or {},
+    )
+    db.add(turn)
+    subsession = db.get(WechatSubsession, normalized_subsession_id)
+    if subsession:
+        subsession.last_active_at = timestamp or datetime.now()
+    return turn
+
+
+def _message_has_prefix(text: str, prefixes: list[str]) -> bool:
+    body = str(text or "").strip()
+    if not prefixes:
+        return True
+    return any(body.startswith(prefix) for prefix in prefixes if str(prefix or "").strip())
+
+
+def _strip_matching_prefix(text: str, prefixes: list[str]) -> str:
+    body = str(text or "").strip()
+    for prefix in prefixes:
+        pref = str(prefix or "").strip()
+        if pref and body.startswith(pref):
+            return body[len(pref):].strip()
+    return body
+
+
+def _message_matches_regexp(text: str, patterns: list[str]) -> bool:
+    body = str(text or "").strip()
+    if not patterns:
+        return False
+    for pattern in patterns:
+        compiled = str(pattern or "").strip()
+        if not compiled:
+            continue
+        try:
+            if re.match(compiled, body):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def _extract_at_user_list(msg_source: Any) -> list[str]:
+    source = str(msg_source or "").strip()
+    if not source:
+        return []
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError:
+        return []
+    text = (root.findtext("atuserlist") or "").strip()
+    if not text:
+        return []
+    text = text.replace("&#44;", ",")
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _message_has_at_mention(message_meta: Any) -> bool:
+    meta = message_meta if isinstance(message_meta, dict) else {}
+    raw = meta.get("raw") if isinstance(meta.get("raw"), dict) else {}
+    data = raw.get("Data") if isinstance(raw.get("Data"), dict) else {}
+    self_wxid = str(raw.get("Wxid") or "").strip()
+    mentioned = set(_extract_at_user_list(data.get("MsgSource")))
+    if self_wxid and self_wxid in mentioned:
+        return True
+    return bool(mentioned)
+
+
+def _pick_trigger_match(text: str, rules: dict[str, Any], message_meta: Any = None) -> tuple[bool, str | None]:
+    prefixes = list(rules.get("prefixes") or [])
+    regexp_patterns = list(rules.get("regexp_patterns") or [])
+    at_mention_enabled = bool(rules.get("at_mention_enabled"))
+    random_rate = int(rules.get("random_rate") or 0)
+    normalized_text = str(text or "").strip()
+
+    if prefixes and _message_has_prefix(normalized_text, prefixes):
+        return True, "prefix"
+    if regexp_patterns and _message_matches_regexp(normalized_text, regexp_patterns):
+        return True, "regexp"
+    if at_mention_enabled and _message_has_at_mention(message_meta):
+        return True, "at_mention"
+    if random_rate > 0 and random.random() < (float(random_rate) / 100.0):
+        return True, "random"
+
+    if prefixes:
+        return False, "prefix_miss"
+    if regexp_patterns:
+        return False, "regexp_miss"
+    if at_mention_enabled:
+        return False, "at_mention_required"
+    if random_rate > 0:
+        return False, "random_miss"
+    return True, "always"
+
+
+def _coerce_message_time(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            return datetime.fromtimestamp(int(value))
+    except Exception:
+        pass
+    text = str(value or "").strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+
+def _has_human_manual_reply_since(db: Session, chat_id: str, threshold: datetime) -> bool:
+    recent_rows = (
+        db.query(Message)
+        .filter(Message.chat_id == chat_id, Message.direction == "out", Message.timestamp.is_not(None), Message.timestamp >= threshold)
+        .order_by(Message.timestamp.desc(), Message.id.desc())
+        .limit(50)
+        .all()
+    )
+    for row in recent_rows:
+        meta = row.meta if isinstance(row.meta, dict) else {}
+        if meta.get("auto_reply"):
+            continue
+        if str(meta.get("source") or "").strip() == "wechat_gateway":
+            msg_type = str(meta.get("msg_type") or "").strip()
+            if msg_type == "51":
+                continue
+        return True
+    return False
+
+
+def _recent_human_reply_exists(db: Session, chat_id: str, seconds: int, *, message_time: Any = None, wait_for_window: bool = False) -> bool:
+    if seconds <= 0:
+        return False
+    baseline = _coerce_message_time(message_time) or datetime.now()
+    threshold = baseline - timedelta(seconds=seconds)
+    if _has_human_manual_reply_since(db, chat_id, threshold):
+        return True
+    if not wait_for_window:
+        return False
+    deadline = baseline + timedelta(seconds=seconds)
+    while True:
+        remaining = (deadline - datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.2, remaining))
+        if _has_human_manual_reply_since(db, chat_id, threshold):
+            return True
+    return _has_human_manual_reply_since(db, chat_id, threshold)
+
+
+def evaluate_auto_reply_rules(
+    db: Session,
+    *,
+    chat_id: str,
+    sender_id: str | None,
+    text: str,
+    is_group: bool,
+    message_time: Any = None,
+    wait_for_human_reply_suppression: bool = False,
+    message_meta: Any = None,
+) -> dict[str, Any]:
+    rules = load_trigger_rules(db)
+    if not rules.get("enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "trigger_rules_disabled", "rules": rules}
+    if not rules.get("smart_reply_enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "smart_reply_disabled", "rules": rules}
+    if is_group and not rules.get("group_enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "group_disabled", "rules": rules}
+    if (not is_group) and not rules.get("private_enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "private_disabled", "rules": rules}
+    if rules.get("whitelist_chat_ids_enabled") and rules.get("whitelist_chat_ids") and chat_id not in set(rules.get("whitelist_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "chat_not_whitelisted", "rules": rules}
+    if rules.get("blacklist_chat_ids_enabled") and chat_id in set(rules.get("blacklist_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "chat_blacklisted", "rules": rules}
+    if sender_id and rules.get("whitelist_sender_ids_enabled") and rules.get("whitelist_sender_ids") and sender_id not in set(rules.get("whitelist_sender_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "sender_not_whitelisted", "rules": rules}
+    if sender_id and rules.get("blacklist_sender_ids_enabled") and sender_id in set(rules.get("blacklist_sender_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "sender_blacklisted", "rules": rules}
+    normalized_text = str(text or "").strip()
+    matched, match_reason = _pick_trigger_match(normalized_text, rules, message_meta=message_meta)
+    if not matched:
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": str(match_reason or "no_trigger_match"), "rules": rules}
+    content_text = _strip_matching_prefix(normalized_text, list(rules.get("prefixes") or []))
+    if len(content_text) < int(rules.get("min_text_length") or 0):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "text_too_short", "rules": rules}
+    if _recent_human_reply_exists(
+        db,
+        chat_id,
+        int(rules.get("human_reply_suppression_seconds") or 0),
+        message_time=message_time,
+        wait_for_window=wait_for_human_reply_suppression,
+    ):
+        return {"scope": _RULE_SCOPE, "allowed": False, "reason": "human_reply_suppressed", "rules": rules}
+    return {"scope": _RULE_SCOPE, "allowed": True, "reason": "passed", "matched_by": str(match_reason or "always"), "rules": rules}
+
+
+def evaluate_inbound_message(conf: dict[str, Any], *, chat_id: str, sender_id: str | None, text: str) -> dict[str, Any]:
+    if not conf.get("enabled"):
+        return {"scope": _RULE_SCOPE, "action": "allow", "reason": "gateway_disabled"}
+    if conf.get("allow_chat_ids_enabled") and conf.get("allow_chat_ids") and chat_id not in set(conf.get("allow_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "action": "drop", "reason": "chat_not_whitelisted"}
+    if conf.get("block_chat_ids_enabled") and chat_id in set(conf.get("block_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "action": "drop", "reason": "chat_blocked"}
+    lowered = str(text or "").lower()
+    for keyword in conf.get("keyword_blocklist") or []:
+        if keyword and str(keyword).lower() in lowered:
+            return {"scope": _RULE_SCOPE, "action": "drop", "reason": "keyword_blocked", "keyword": keyword}
+    return {"scope": _RULE_SCOPE, "action": "allow", "reason": "passed"}
+
+
+def evaluate_outbound_message(conf: dict[str, Any], *, target: str, text: str) -> dict[str, Any]:
+    if not conf.get("enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": True, "action": "allow", "reason": "gateway_disabled"}
+    if not conf.get("outbound_enabled"):
+        return {"scope": _RULE_SCOPE, "allowed": False, "action": "block", "reason": "outbound_disabled"}
+    if conf.get("allow_chat_ids_enabled") and conf.get("allow_chat_ids") and target not in set(conf.get("allow_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "action": "block", "reason": "chat_not_whitelisted"}
+    if conf.get("block_chat_ids_enabled") and target in set(conf.get("block_chat_ids") or []):
+        return {"scope": _RULE_SCOPE, "allowed": False, "action": "block", "reason": "chat_blocked"}
+    lowered = str(text or "").lower()
+    for keyword in conf.get("keyword_blocklist") or []:
+        if keyword and str(keyword).lower() in lowered:
+            return {"scope": _RULE_SCOPE, "allowed": False, "action": "block", "reason": "keyword_blocked", "keyword": keyword}
+    return {"scope": _RULE_SCOPE, "allowed": True, "action": "allow", "reason": "passed"}
+
+
+def apply_outbound_random_delay(conf: dict[str, Any]) -> float:
+    min_delay = _clamp_int(conf.get("outbound_random_delay_min_seconds"), 0, 0, 3600)
+    max_delay = _clamp_int(conf.get("outbound_random_delay_max_seconds"), 0, 0, 3600)
+    if max_delay <= 0:
+        return 0.0
+    if min_delay > max_delay:
+        min_delay, max_delay = max_delay, min_delay
+    delay = random.uniform(float(min_delay), float(max_delay))
+    if delay > 0:
+        time.sleep(delay)
+    return delay
+
+
+def _message_timestamp(create_time: Any) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(int(create_time))
+    except Exception:
+        return None
+
+
+def _resolve_display_name(db: Session, wxid: str | None, fallback: str | None = None) -> str | None:
+    candidate = str(wxid or "").strip()
+    fb = str(fallback or "").strip()
+    if candidate:
+        try:
+            contact = db.get(Contact, candidate)
+            if contact:
+                alias = str(contact.alias or "").strip()
+                name = str(contact.name or "").strip()
+                if alias and alias != candidate:
+                    return alias
+                if name:
+                    return name
+                if alias:
+                    return alias
+        except Exception:
+            pass
+        try:
+            chat = db.get(Chat, candidate)
+            if chat:
+                title = str(chat.title or "").strip()
+                if title and title != candidate:
+                    return title
+        except Exception:
+            pass
+    if fb and fb != candidate:
+        return fb
+    if candidate:
+        return candidate
+    return fb or None
+
+
+def ingest_callback_event(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(payload.get("TypeName") or "").strip()
+    app_id = str(payload.get("Appid") or "").strip()
+    data = payload.get("Data") if isinstance(payload.get("Data"), dict) else {}
+    new_msg_id = str(data.get("NewMsgId") or "").strip()
+    if event_type != "AddMsg":
+        return {"ok": True, "duplicate": False, "stored": False, "reason": "ignored_event", "event_type": event_type}
+    if not app_id or not new_msg_id:
+        return {"ok": False, "duplicate": False, "stored": False, "reason": "missing_appid_or_newmsgid"}
+
+    dedupe = db.get(SyncState, _dedupe_key(app_id, new_msg_id))
+    if dedupe:
+        return {"ok": True, "duplicate": True, "stored": False, "message_id": dedupe.value}
+
+    conf = load_config(db)
+    from_user = _string_field(data.get("FromUserName"))
+    to_user = _string_field(data.get("ToUserName"))
+    self_wxid = str(payload.get("Wxid") or "").strip()
+    msg_type = _normalize_message_type(data.get("MsgType"))
+    raw_text = _string_field(data.get("Content"))
+    sender_id, clean_text = _split_group_sender(from_user, raw_text)
+    timestamp = _message_timestamp(data.get("CreateTime"))
+
+    direction = "out" if self_wxid and from_user == self_wxid else "in"
+    if direction == "out":
+        chat_id = to_user or from_user
+        sender_id = self_wxid or sender_id or from_user
+    else:
+        chat_id = from_user or to_user
+        sender_id = sender_id or from_user
+
+    appmsg_fields = _extract_appmsg_fields(clean_text)
+    display_text = appmsg_fields.get("title") or clean_text
+    if appmsg_fields.get("sourceusername") and str(appmsg_fields.get("sourceusername")).startswith("gh_"):
+        sender_id = appmsg_fields.get("sourceusername") or sender_id
+    pipeline = evaluate_inbound_message(conf, chat_id=chat_id, sender_id=sender_id, text=display_text)
+    if pipeline.get("action") == "drop":
+        dedupe = SyncState(key=_dedupe_key(app_id, new_msg_id), value="dropped")
+        db.add(dedupe)
+        db.commit()
+        return {"ok": True, "duplicate": False, "stored": False, "dropped": True, "pipeline": pipeline}
+
+    subsession = resolve_gateway_subsession(db, conf=conf, chat_id=chat_id, sender_id=sender_id)
+    subsession_meta = None
+    if subsession:
+        subsession_meta = {
+            "id": subsession.id,
+            "name": subsession.name,
+            "channel": subsession.channel,
+            "mode": subsession.mode,
+        }
+
+    _ensure_chat(db, chat_id, title=chat_id, timestamp=timestamp)
+    _ensure_contact(db, sender_id, name=appmsg_fields.get("sourcedisplayname") or sender_id)
+    sender_display_name = _resolve_display_name(db, sender_id, fallback=sender_id)
+    talker_display_name = _resolve_display_name(db, chat_id, fallback=chat_id)
+    message = Message(
+        chat_id=chat_id,
+        sender_id=sender_id,
+        sender_name=sender_display_name,
+        talker_name=talker_display_name,
+        timestamp=timestamp,
+        direction=direction,
+        type="link" if appmsg_fields else msg_type,
+        content_text=display_text,
+        media_url=None,
+        meta={
+            "source": "wechat_gateway",
+            "contents": appmsg_fields,
+            "display_title": appmsg_fields.get("title") or "",
+            "event_type": event_type,
+            "external_msg_id": data.get("MsgId"),
+            "external_new_msg_id": data.get("NewMsgId"),
+            "msg_type": data.get("MsgType"),
+            "pipeline": pipeline,
+            "subsession": subsession_meta,
+            "raw": payload,
+        },
+    )
+    db.add(message)
+    db.flush()
+    record_subsession_turn(
+        db,
+        subsession_id=subsession.id if subsession else None,
+        message_id=message.id,
+        chat_id=chat_id,
+        sender_id=sender_id,
+        direction=direction,
+        timestamp=timestamp,
+        content_text=display_text,
+        meta={"source": "wechat_gateway", "event_type": event_type, "contents": appmsg_fields},
+    )
+    db.add(SyncState(key=_dedupe_key(app_id, new_msg_id), value=str(message.id)))
+    db.commit()
+    db.refresh(message)
+    return {"ok": True, "duplicate": False, "stored": True, "message_id": message.id, "pipeline": pipeline, "subsession_id": subsession.id if subsession else None}
+
+
+def _parse_agent_timestamp(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone().replace(tzinfo=None)
+        return value
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            return datetime.fromtimestamp(int(value))
+    except Exception:
+        pass
+    text = str(value or "").strip().replace("Z", "+00:00")
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            # Preserve the sender-side wall clock for display in the unified UI.
+            return parsed.replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+
+def _agent_dedupe_key(source: str, channel: str, message_id: str) -> str:
+    return f"{DEDUP_PREFIX}:agent:{source}:{channel}:{message_id}"
+
+
+def ingest_agent_wechat_event(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    """Ingest a normalized agent-side WeChat event into the 0913 message aggregation.
+
+    This intentionally ignores non-WeChat agent channels so Hermes/OpenClaw main chat,
+    terminal UI, and other channels are not affected by the automation gateway.
+    """
+    data = payload if isinstance(payload, dict) else {}
+    channel = str(data.get("channel") or data.get("agent_channel") or "").strip().lower()
+    if channel not in {"wechat", "weixin", "wechat_gateway", "wechatapi"}:
+        return {"ok": True, "stored": False, "duplicate": False, "reason": "non_wechat_channel"}
+
+    source = str(data.get("source") or data.get("agent_source") or "agent").strip() or "agent"
+    message_id = str(data.get("message_id") or data.get("msg_id") or data.get("id") or "").strip()
+    chat_id = str(data.get("chat_id") or data.get("room_wxid") or data.get("from_wxid") or "").strip()
+    sender_id = str(data.get("sender_id") or data.get("sender") or data.get("from_wxid") or "").strip()
+    text = str(data.get("text") or data.get("content") or data.get("message") or "")
+    if not message_id or not chat_id:
+        return {"ok": False, "stored": False, "duplicate": False, "reason": "missing_message_id_or_chat_id"}
+
+    dedupe_key = _agent_dedupe_key(source, channel, message_id)
+    dedupe = db.get(SyncState, dedupe_key)
+    if dedupe:
+        return {"ok": True, "stored": False, "duplicate": True, "message_id": dedupe.value}
+
+    timestamp = _parse_agent_timestamp(data.get("timestamp") or data.get("time") or data.get("created_at"))
+    message_meta = data.get("message_meta") if isinstance(data.get("message_meta"), dict) else (data.get("meta") if isinstance(data.get("meta"), dict) else {})
+    sender_name = str(
+        data.get("sender_name")
+        or message_meta.get("sender_name")
+        or message_meta.get("sender")
+        or sender_id
+        or ""
+    ).strip() or None
+    talker_name = str(
+        data.get("chat_name")
+        or data.get("talker_name")
+        or message_meta.get("talker_name")
+        or message_meta.get("chat_name")
+        or message_meta.get("room_name")
+        or chat_id
+        or ""
+    ).strip() or None
+    raw_direction = str(data.get("direction") or "in").strip().lower()
+    direction = "out" if raw_direction in {"out", "send", "sent", "self"} else "in"
+    msg_type = str(data.get("type") or data.get("msg_type") or "text").strip() or "text"
+
+    pipeline = evaluate_inbound_message(load_config(db), chat_id=chat_id, sender_id=sender_id or None, text=text)
+    if pipeline.get("action") == "drop":
+        db.add(SyncState(key=dedupe_key, value="dropped"))
+        db.commit()
+        return {"ok": True, "stored": False, "duplicate": False, "dropped": True, "pipeline": pipeline}
+
+    _ensure_chat(db, chat_id, title=talker_name or str(data.get("chat_name") or chat_id), timestamp=timestamp)
+    _ensure_contact(db, sender_id, name=sender_name)
+    message = Message(
+        chat_id=chat_id,
+        sender_id=sender_id or None,
+        sender_name=sender_name,
+        talker_name=talker_name or _resolve_display_name(db, chat_id, fallback=str(data.get("chat_name") or chat_id)),
+        timestamp=timestamp,
+        direction=direction,
+        type=msg_type,
+        content_text=text,
+        media_url=str(data.get("media_url") or "").strip() or None,
+        meta={
+            "source": "wechat_gateway",
+            "agent_source": source,
+            "agent_channel": channel,
+            "agent_message_id": message_id,
+            "pipeline": pipeline,
+            "raw": data,
+        },
+    )
+    db.add(message)
+    db.flush()
+    db.add(SyncState(key=dedupe_key, value=str(message.id)))
+    db.commit()
+    db.refresh(message)
+    return {"ok": True, "stored": True, "duplicate": False, "message_id": message.id, "pipeline": pipeline}
+
+
+def record_outbound_message(db: Session, *, target: str, text: str, provider_result: dict[str, Any] | None = None) -> Message:
+    result = provider_result if isinstance(provider_result, dict) else {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    timestamp = datetime.now()
+    _ensure_chat(db, target, title=target, timestamp=timestamp)
+    _ensure_contact(db, target, name=target)
+    talker_display_name = _resolve_display_name(db, target, fallback=target)
+    subsession = resolve_gateway_subsession(db, conf=load_config(db), chat_id=target, sender_id=None)
+    subsession_meta = None
+    if subsession:
+        subsession_meta = {
+            "id": subsession.id,
+            "name": subsession.name,
+            "channel": subsession.channel,
+            "mode": subsession.mode,
+        }
+    message = Message(
+        chat_id=target,
+        sender_id=None,
+        sender_name=None,
+        talker_name=talker_display_name,
+        timestamp=timestamp,
+        direction="out",
+        type="text",
+        content_text=str(text or ""),
+        media_url=None,
+        meta={
+            "source": "wechat_gateway",
+            "external_msg_id": data.get("msgId") or data.get("MsgId"),
+            "external_new_msg_id": data.get("newMsgId") or data.get("NewMsgId"),
+            "provider_result": result,
+            "subsession": subsession_meta,
+        },
+        send_status="sent",
+    )
+    db.add(message)
+    db.flush()
+    record_subsession_turn(
+        db,
+        subsession_id=subsession.id if subsession else None,
+        message_id=message.id,
+        chat_id=target,
+        sender_id=None,
+        direction="out",
+        timestamp=timestamp,
+        content_text=str(text or ""),
+        meta={"source": "wechat_gateway", "provider_result": result},
+    )
+    db.commit()
+    db.refresh(message)
+    return message
