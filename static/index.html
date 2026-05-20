@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Deepseek - 深瞳：全面洞察自己的消息流管理引擎</title>
-    <link rel="icon" type="image/png" href="/static/assets/dasheng-brandmark.png">
+    <link rel="icon" type="image/webp" href="/static/assets/deepseek-brand-logo.webp">
     <!-- ECharts: 用于仪表盘可视化（包含词云扩展） -->
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/echarts-wordcloud@2/dist/echarts-wordcloud.min.js"></script>
@@ -199,19 +199,20 @@
             display: inline-flex;
             align-items: center;
             gap: 0;
-            padding: 2px 6px;
-            border-radius: 12px;
-            border: 1px solid var(--brand-badge-border);
-            background: var(--brand-badge-bg);
+            padding: 0;
+            border-radius: 10px;
+            border: 1px solid color-mix(in srgb, var(--brand-blue) 18%, var(--border-color));
+            background: #fff;
             box-shadow: var(--shadow-sm);
+            overflow: hidden;
         }
         .lemon-logo {
             display: inline-flex;
             align-items: center;
             justify-content: center;
             width: auto;
-            height: 30px;
-            border-radius: 6px;
+            height: 36px;
+            border-radius: 10px;
             background: transparent;
             border: none;
             box-shadow: none;
@@ -7538,14 +7539,14 @@
         
         <div class="header">
             <div class="progress"><div class="bar" id="globalProgressBar"></div></div>
-		            <h1 aria-label="Deepseek，深瞳：全面洞察自己的消息流管理引擎">
+		            <h1 aria-label="Deepseek，深瞳：全领域个人信息流 API 平台，支持 Agent 接入">
 		                <span class="brand-badge">
 		                    <span class="lemon-logo" aria-hidden="true">
-		                        <img src="/static/assets/dasheng-brandmark.png" alt="深瞳 Logo">
+		                        <img src="/static/assets/deepseek-brand-logo.webp" alt="Deepseek 深瞳 Logo">
 		                    </span>
 		                </span>
 		                <span class="brand-name">Deepsee<span class="brand-soft-letter">k</span></span>
-		                <span class="brand-sub">深瞳：<span class="brand-tagline">全面洞察自己的消息流管理引擎</span></span>
+		                <span class="brand-sub">深瞳：<span class="brand-tagline">Agent 可接入的全领域个人信息流 API 平台</span></span>
 		            </h1>
             <div style="margin-left:auto; display:flex; align-items:center; gap:8px;">
                 <button id="themeToggle" class="analysis-btn secondary" title="切换浅色/深色"><span class="button-with-icon"><span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.5"/><path d="M12 19v2.5"/><path d="m4.93 4.93 1.77 1.77"/><path d="m17.3 17.3 1.77 1.77"/><path d="M2.5 12H5"/><path d="M19 12h2.5"/><path d="m4.93 19.07 1.77-1.77"/><path d="m17.3 6.7 1.77-1.77"/></svg></span><span class="button-label">浅色</span></span></button>
