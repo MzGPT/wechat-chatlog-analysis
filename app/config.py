@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     PORT: int = Field(default=8000)
     SYNC_INTERVAL_SECONDS: int | None = Field(default=0)
     EMAIL_SYNC_INTERVAL_SECONDS: int | None = Field(default=0)
+    SUMMARY_OVERLAY_INTERVAL_SECONDS: int | None = Field(default=3600)
 
     # LLM
     SILICONFLOW_API_KEY: str | None = None
@@ -41,6 +42,9 @@ class Settings(BaseSettings):
     SILICONFLOW_MODEL: str | None = "Qwen/Qwen3-30B-A3B"
     SILICONFLOW_TOOL_MODEL: str | None = "Qwen/Qwen3-8B"
     AI_MAX_PARALLEL: int = 3
+
+    # Market data
+    TUSHARE_TOKEN: str | None = None
 
     # WeChatPadPro
     WECHATPAD_HTTP_BASE: str | None = None  # e.g., http://60.205.58.39:1238
@@ -59,6 +63,8 @@ class Settings(BaseSettings):
     NEWSNOW_REFRESH_INTERVAL_SECONDS: int | None = Field(default=3600)  # 0 = disabled (manual only)
     # 每3小时写入一次新闻舆情底层快照（datasets JSON）
     NEWS_SNAPSHOT_INTERVAL_SECONDS: int | None = Field(default=10800)
+    AGGREGATION_RETENTION_DAYS: int = Field(default=90)
+    AGGREGATION_RETENTION_INTERVAL_SECONDS: int = Field(default=86400)
 
     # Optional: MediaCrawlerPro server base (meeting recorder controls proxy)
     MEDIA_SERVER_BASE: str | None = None

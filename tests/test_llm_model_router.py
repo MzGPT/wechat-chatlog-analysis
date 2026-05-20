@@ -66,7 +66,7 @@ def test_router_honors_manual_override_when_prefer_router_disabled():
     assert target["api_url"] == "https://base.example/v1"
 
 
-def test_router_weighted_round_robin_sequence():
+def test_tool_default_route_keeps_weighted_round_robin_sequence():
     _MODEL_ROUTER_COUNTERS.clear()
     conf = {
         "api_url": "https://base.example/v1",
@@ -79,13 +79,13 @@ def test_router_weighted_round_robin_sequence():
                 {"id": "tool-a", "model": "tool-model-a", "weight": 1, "enabled": True},
                 {"id": "tool-b", "model": "tool-model-b", "weight": 2, "enabled": True},
             ],
-            "tool_route_channels": {"messages": ["tool-a", "tool-b"], "default": ["tool-a"]},
+            "tool_route_channels": {"reply": ["tool-a", "tool-b"], "default": ["tool-a"]},
         },
     }
 
     seq = []
     for _ in range(6):
-        target = resolve_chat_target(conf, route_kind="tool", route_key="messages", model_override=None)
+        target = resolve_chat_target(conf, route_kind="tool", route_key="reply", model_override=None)
         seq.append(target["channel_id"])
     assert seq == ["tool-a", "tool-b", "tool-b", "tool-a", "tool-b", "tool-b"]
 
@@ -115,6 +115,57 @@ def test_router_returns_ordered_fallback_targets():
     # base default should be included as final fallback
     assert targets[-1]["channel_id"] is None
     assert targets[-1]["model"] == "main-default"
+
+
+def test_tool_messages_route_includes_explicit_key_channels_before_base():
+    _MODEL_ROUTER_COUNTERS.clear()
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "tool_model": "tool-default",
+        "tool_model_messages": "msg-stable-model",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "tool_channels": [
+                {"id": "tool-a", "model": "tool-model-a", "weight": 1, "enabled": True, "api_url": "https://a.example/v1", "api_key": "ka"},
+                {"id": "tool-b", "model": "tool-model-b", "weight": 1, "enabled": True, "api_url": "https://b.example/v1", "api_key": "kb"},
+            ],
+            "tool_route_channels": {"messages": ["tool-a", "tool-b"], "default": ["tool-a"]},
+        },
+    }
+    targets = resolve_chat_targets(conf, route_kind="tool", route_key="messages", model_override="msg-stable-model")
+    assert [t["channel_id"] for t in targets] == ["tool-a", "tool-b", None]
+    assert targets[0]["model"] == "tool-model-a"
+    assert targets[1]["model"] == "tool-model-b"
+    assert targets[-1]["model"] == "msg-stable-model"
+    assert targets[-1]["api_url"] == "https://base.example/v1"
+
+
+def test_tool_messages_route_uses_stable_channel_pool_before_base():
+    _MODEL_ROUTER_COUNTERS.clear()
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "tool_model": "tool-default",
+        "tool_model_messages": "msg-stable-model",
+        "tool_messages_stable_only": True,
+        "tool_messages_stable_channels": ["tool-sf-qwen8b", "tool-sf-glm9b"],
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "tool_channels": [
+                {"id": "tool-sf-qwen8b", "model": "Qwen/Qwen3-8B", "weight": 5, "enabled": True, "api_url": "https://sf.example/v1", "api_key": "ksf"},
+                {"id": "tool-sf-glm9b", "model": "THUDM/GLM-4-9B-0414", "weight": 3, "enabled": True, "api_url": "https://sf.example/v1", "api_key": "ksf"},
+                {"id": "tool-bad", "model": "bad-model", "weight": 9, "enabled": True, "api_url": "https://bad.example/v1", "api_key": "kbad"},
+            ],
+            "tool_route_channels": {"messages": ["tool-bad", "tool-sf-qwen8b", "tool-sf-glm9b"]},
+        },
+    }
+    targets = resolve_chat_targets(conf, route_kind="tool", route_key="messages", model_override="msg-stable-model")
+    assert [t["channel_id"] for t in targets] == ["tool-sf-qwen8b", "tool-sf-glm9b", "tool-bad", None]
+    assert targets[0]["model"] == "Qwen/Qwen3-8B"
+    assert targets[1]["model"] == "THUDM/GLM-4-9B-0414"
 
 
 class _FakeResponse:
@@ -153,7 +204,7 @@ def test_siliconflow_chat_falls_back_to_next_channel(monkeypatch):
     monkeypatch.setattr(llm_client, "load_ai_config", lambda: conf)
     calls: list[str] = []
 
-    def _fake_post(url, headers, payload, timeout=180):  # noqa: ARG001
+    def _fake_post(url, headers, payload, timeout=180, attempts=5, backoff=0.6):  # noqa: ARG001
         calls.append(url)
         if len(calls) == 1:
             raise requests.RequestException("first route failed")
@@ -198,7 +249,7 @@ def test_siliconflow_chat_sets_openrouter_headers(monkeypatch):
     monkeypatch.setattr(llm_client, "load_ai_config", lambda: conf)
     captured_headers = {}
 
-    def _fake_post(url, headers, payload, timeout=180):  # noqa: ARG001
+    def _fake_post(url, headers, payload, timeout=180, attempts=5, backoff=0.6):  # noqa: ARG001
         captured_headers.update(headers)
         return _FakeResponse("ok-openrouter")
 
@@ -233,3 +284,38 @@ def test_router_runtime_stats_reset_clears_all():
     assert "x-2" in llm_client.get_router_runtime_stats()
     llm_client.reset_router_runtime_stats()
     assert llm_client.get_router_runtime_stats() == {}
+
+
+def test_dynamic_weighting_demotes_failing_high_weight_channel():
+    llm_client.reset_router_runtime_stats()
+    _MODEL_ROUTER_COUNTERS.clear()
+    bad = llm_client._get_channel_runtime("bad-heavy")
+    bad["calls"] = 8
+    bad["success"] = 0
+    bad["failure"] = 8
+    bad["consecutive_failures"] = 4
+    bad["ema_latency_ms"] = 9000
+    good = llm_client._get_channel_runtime("good-light")
+    good["calls"] = 8
+    good["success"] = 8
+    good["failure"] = 0
+    good["consecutive_failures"] = 0
+    good["ema_latency_ms"] = 800
+    conf = {
+        "api_url": "https://base.example/v1",
+        "api_key": "base-key",
+        "model": "main-default",
+        "model_router": {
+            "enabled": True,
+            "prefer_router": True,
+            "dynamic_weighting": True,
+            "latency_ref_ms": 3000,
+            "main_channels": [
+                {"id": "bad-heavy", "model": "bad-model", "weight": 32, "enabled": True, "api_url": "https://bad.example/v1", "api_key": "kb"},
+                {"id": "good-light", "model": "good-model", "weight": 1, "enabled": True, "api_url": "https://good.example/v1", "api_key": "kg"},
+            ],
+            "main_module_channels": {"market": ["bad-heavy", "good-light"]},
+        },
+    }
+    targets = resolve_chat_targets(conf, route_kind="main", route_key="market", model_override=None)
+    assert targets[0]["channel_id"] == "good-light"

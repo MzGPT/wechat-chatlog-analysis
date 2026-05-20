@@ -102,3 +102,39 @@ def test_build_email_features_fallback_avoids_title_monkeypatch(monkeypatch):
     assert "政企业务拐点" in f["summary_full"]
     # Fallback short summary shouldn't be a raw title echo (we don't assert exact string, just that title not forced)
     assert "华源电子&南方" not in (f.get("key_info") or "")
+
+
+def test_build_email_features_skips_short_content(monkeypatch):
+    from app.services import email_features
+
+    def fake_extract_message_features(messages, **kwargs):
+        raise AssertionError("short email content must not be sent to the tool model")
+
+    monkeypatch.setattr("app.services.email_features.extract_message_features", fake_extract_message_features)
+
+    out = email_features.build_email_features([
+        {
+            "id": 3,
+            "from_addr": "a@example.com",
+            "subject": "",
+            "body_text": "短邮件不摘要",
+            "snippet": "",
+        }
+    ])
+
+    assert out == {}
+
+
+def test_build_email_fallback_features_skips_short_content():
+    from app.services import email_features
+
+    out = email_features.build_email_fallback_features([
+        {
+            "id": 4,
+            "subject": "",
+            "body_text": "短邮件不摘要",
+            "snippet": "",
+        }
+    ])
+
+    assert out == {}

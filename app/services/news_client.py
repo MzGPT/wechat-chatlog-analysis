@@ -317,8 +317,8 @@ def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
     """
     # L1 cache: 3h TTL (与前端“每3小时刷新”一致)
     try:
-        key = f"direct:{int(limit)}:{q or ''}"
-        cached = _cache_get(key)
+        cache_key = f"direct:{int(limit)}:{q or ''}"
+        cached = _cache_get(cache_key)
         if cached:
             return cached
     except Exception:
@@ -407,16 +407,16 @@ def direct_from_sources_json(limit: int = 50, q: str | None = None) -> dict:
     seen: set[str] = set()
     uniq: List[dict] = []
     for it in agg:
-        key = it.get('id') or (it.get('url') or '') + '|' + (it.get('title') or '')
-        key = str(key)
-        if key in seen:
+        dedupe_key = it.get('id') or (it.get('url') or '') + '|' + (it.get('title') or '')
+        dedupe_key = str(dedupe_key)
+        if dedupe_key in seen:
             continue
-        seen.add(key)
+        seen.add(dedupe_key)
         uniq.append(it)
     result = {'total': len(uniq), 'items': uniq, 'upstream_ok': True}
     try:
         # Cache 3 hours
-        _cache_set(key, result, ttl=3 * 3600)
+        _cache_set(cache_key, result, ttl=3 * 3600)
     except Exception:
         pass
     return result

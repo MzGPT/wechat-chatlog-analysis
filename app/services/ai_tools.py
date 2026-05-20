@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import re
 import logging
+import time
 from typing import Any, Dict, Iterable, List
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from ..models import Message
 from .llm_client import DEFAULT_TOOL_PROMPTS, load_ai_config, siliconflow_tool_chat
@@ -24,6 +26,35 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------- helpers -----------------------------
+
+def _commit_with_retry(
+    db: Session,
+    *,
+    retries: int = 10,
+    base_delay: float = 0.12,
+) -> None:
+    """Retry SQLite commit on transient lock conflicts."""
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            db.commit()
+            return
+        except OperationalError as exc:
+            db.rollback()
+            last_exc = exc
+            msg = str(exc).lower()
+            try:
+                if getattr(exc, "orig", None):
+                    msg = f"{msg} | {str(exc.orig).lower()}"
+            except Exception:
+                pass
+            if "database is locked" in msg or "locked" in msg:
+                sleep_s = min(1.2, base_delay * (1.55 ** attempt))
+                time.sleep(max(0.05, sleep_s))
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
 
 def _batched(iterable: Iterable[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
     batch: List[Dict[str, Any]] = []
@@ -85,7 +116,7 @@ def _tool_prompt_payload(messages: List[Dict[str, Any]], prompt_conf: Dict[str, 
 
 def extract_message_features(
     messages: List[Dict[str, Any]],
-    batch_size: int = 1,  # 改为逐条调用
+    batch_size: int = 20,
     concurrency: int = 8,
     temperature: float = 0.1,
     *,
@@ -93,15 +124,20 @@ def extract_message_features(
     model_override: str | None = None,
     route_key: str | None = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """逐条调用小模型提取特征（不再批处理）"""
+    """小模型提取特征（按批并发调用）"""
 
     if concurrency < 1:
         concurrency = 1
+    if batch_size < 1:
+        batch_size = 1
+    # Message-summary extraction is sensitive to malformed multi-item JSON output.
+    # Keep batches small to improve success rate for WeChat short-form traffic.
+    batch_size = min(batch_size, 6)
 
     conf = load_ai_config()
     tool_prompt_conf = (conf.get("tool_prompts") or {}).get(prompt_key) or DEFAULT_TOOL_PROMPTS.get(prompt_key) or DEFAULT_TOOL_PROMPTS["message_summary"]
 
-    # 准备每条消息
+    # 准备消息
     prepared: List[Dict[str, Any]] = []
     for msg in messages:
         msg_id = msg.get("id") or msg.get("time") or msg.get("message_id") or ""
@@ -118,234 +154,304 @@ def extract_message_features(
     errors: List[str] = []
     debug: List[Dict[str, Any]] = []
 
-    def _process_single(single_msg: Dict[str, Any]) -> tuple[str, Dict[str, Any] | None, Dict[str, Any]]:
-        """处理单条消息，返回 (msg_id, result)"""
-        msg_id = single_msg["id"]
+    def _parse_response_content(content: str, for_log_id: str) -> Any:
+        if not content or not isinstance(content, str):
+            raise ValueError(f"API返回为空或非字符串: {type(content)}")
+
+        content_clean = content.strip()
+        original_content = content_clean
+        logger.debug("小模型原始返回 [%s] (前1000字符): %s", for_log_id, original_content[:1000])
+
+        if content_clean.startswith("```"):
+            lines = content_clean.split("\n", 1)
+            if len(lines) > 1:
+                content_clean = lines[1]
+            if content_clean.startswith("json"):
+                content_clean = content_clean[4:].lstrip()
+            elif content_clean.startswith("JSON"):
+                content_clean = content_clean[4:].lstrip()
+        if content_clean.endswith("```"):
+            content_clean = content_clean.rsplit("```", 1)[0].rstrip()
+
+        data = None
+        json_error = None
+        try:
+            data = json.loads(content_clean)
+        except json.JSONDecodeError as je:
+            json_error = je
+            # Support providers that emit multiple top-level JSON objects back-to-back:
+            # {"id":"1",...}{"id":"2",...}
+            decoder = json.JSONDecoder()
+            seq_items: List[Any] = []
+            seq_pos = 0
+            try:
+                while seq_pos < len(content_clean):
+                    while seq_pos < len(content_clean) and content_clean[seq_pos] in " \t\r\n,":
+                        seq_pos += 1
+                    if seq_pos >= len(content_clean):
+                        break
+                    obj, end = decoder.raw_decode(content_clean, seq_pos)
+                    seq_items.append(obj)
+                    seq_pos = end
+                while seq_pos < len(content_clean) and content_clean[seq_pos] in " \t\r\n,":
+                    seq_pos += 1
+                if seq_items and seq_pos >= len(content_clean):
+                    data = seq_items if len(seq_items) > 1 else seq_items[0]
+            except Exception:
+                pass
+            if data is None and _HAS_JSON5:
+                try:
+                    data = json5.loads(content_clean)  # type: ignore
+                except Exception:
+                    pass
+            array_match = re.search(r'\[[^\]]*(?:\{[^}]*\}[^\]]*)*\]', content_clean, re.DOTALL)
+            if data is None and array_match:
+                try:
+                    data = json.loads(array_match.group(0))
+                except json.JSONDecodeError:
+                    if _HAS_JSON5:
+                        try:
+                            data = json5.loads(array_match.group(0))  # type: ignore
+                        except Exception:
+                            pass
+            if data is None:
+                brace_start = content_clean.find('{')
+                if brace_start >= 0:
+                    brace_count = 0
+                    brace_end = -1
+                    for i in range(brace_start, len(content_clean)):
+                        if content_clean[i] == '{':
+                            brace_count += 1
+                        elif content_clean[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                brace_end = i
+                                break
+                    if brace_end > brace_start:
+                        try:
+                            json_str = content_clean[brace_start:brace_end + 1]
+                            data = json.loads(json_str)
+                        except json.JSONDecodeError:
+                            if _HAS_JSON5:
+                                try:
+                                    data = json5.loads(json_str)  # type: ignore
+                                except Exception:
+                                    pass
+            if data is None:
+                json_matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content_clean, re.DOTALL)
+                for match in json_matches:
+                    try:
+                        candidate = match.group(0)
+                        data = json.loads(candidate)
+                        break
+                    except json.JSONDecodeError:
+                        if _HAS_JSON5:
+                            try:
+                                data = json5.loads(candidate)  # type: ignore
+                                break
+                            except Exception:
+                                pass
+                        continue
+            if data is None:
+                error_detail = f"JSON解析失败: {json_error.msg if json_error else '未找到有效JSON'} (位置 {json_error.pos if json_error else 'N/A'})"
+                logger.warning("小模型返回内容无法解析 [%s]: %s | 原始返回(前500字符): %s", for_log_id, error_detail, original_content[:500])
+                raise ValueError(f"{error_detail}。原始返回(前300字符): {original_content[:300]}")
+        return data
+
+    def _normalize_item(item: Any, fallback_id: str) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            if isinstance(item, str):
+                item = {"summary": item}
+            else:
+                raise ValueError(f"返回元素不是dict: {type(item)}")
+
+        summary = str(item.get("summary") or "").strip()
+        if not summary:
+            alt = str(item.get("key_info") or item.get("markdown") or "").strip()
+            summary = alt if alt else "ai: 信息有限"
+        if not summary.lower().startswith("ai:"):
+            summary = f"ai: {summary}"
+
+        refined = str(
+            item.get("refined")
+            or item.get("content_refined")
+            or item.get("refined_content")
+            or item.get("minutes_refined")
+            or ""
+        ).strip()
+
+        def _clean_points(value: Any) -> List[str]:
+            if isinstance(value, list):
+                raw_points = value
+            elif isinstance(value, str):
+                raw_points = re.split(r"[\n；;]+", value)
+            else:
+                raw_points = []
+            points: List[str] = []
+            for raw in raw_points:
+                text = re.sub(r"^\s*[-*•\d.、）)]+\s*", "", str(raw or "")).strip()
+                if not text:
+                    continue
+                points.append(text[:120])
+                if len(points) >= 5:
+                    break
+            return points
+
+        key_points = _clean_points(
+            item.get("key_points")
+            or item.get("points")
+            or item.get("bullet_points")
+            or item.get("highlights")
+        )
+        comment = str(
+            item.get("comment")
+            or item.get("one_sentence_comment")
+            or item.get("review")
+            or item.get("insight")
+            or ""
+        ).strip()[:160]
+
+        meeting_number_raw = item.get("meeting_number") or ""
+        meeting_number_digits = re.sub(r"\D", "", str(meeting_number_raw))
+        meeting_number = meeting_number_digits if 9 <= len(meeting_number_digits) <= 13 else ""
+
+        tone = str(item.get("tone") or "neutral").lower()
+        allowed_tones = {"bullish", "bearish", "neutral", "meeting", "positive", "negative"}
+        if tone not in allowed_tones:
+            tone = "neutral"
+
+        try:
+            confidence = float(item.get("confidence", 0.5))
+        except Exception:
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "id": str(item.get("id") or fallback_id or "").strip(),
+            "summary": summary,
+            "meeting_number": meeting_number,
+            "tone": tone,
+            "confidence": confidence,
+            "refined": refined,
+            "key_points": key_points,
+            "comment": comment,
+            "keywords": item.get("keywords") if isinstance(item.get("keywords"), list) else [],
+            "platform": str(item.get("platform") or item.get("meeting_platform") or "").strip(),
+            "category": str(item.get("category") or "").strip(),
+        }
+
+    def _process_batch(batch: List[Dict[str, Any]], *, allow_single_fallback: bool = True) -> tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        batch_ids = [str(x.get("id") or "").strip() for x in batch]
+        batch_tag = ",".join(batch_ids[:3]) + ("..." if len(batch_ids) > 3 else "")
         content = None
         try:
-            # 构造单条消息的 prompt（包装成数组以兼容现有格式）
-            prompt = _tool_prompt_payload([single_msg], tool_prompt_conf)
+            prompt = _tool_prompt_payload(batch, tool_prompt_conf)
             content = siliconflow_tool_chat(
                 prompt,
                 temperature=temperature,
                 model_override=model_override,
                 route_key=route_key,
             )
-            
-            if not content or not isinstance(content, str):
-                raise ValueError(f"API返回为空或非字符串: {type(content)}")
-            
-            # 尝试从返回内容中提取JSON（可能被markdown代码块包围）
-            content_clean = content.strip()
-            original_content = content_clean  # 保存原始内容用于错误日志
-            
-            # 记录原始返回（前1000字符），便于诊断
-            logger.debug("小模型原始返回 [%s] (前1000字符): %s", msg_id, original_content[:1000])
-            
-            # 移除可能的markdown代码块标记
-            if content_clean.startswith("```"):
-                # 找到第一个换行后的内容
-                lines = content_clean.split("\n", 1)
-                if len(lines) > 1:
-                    content_clean = lines[1]
-                # 也尝试移除开头标记
-                if content_clean.startswith("json"):
-                    content_clean = content_clean[4:].lstrip()
-                elif content_clean.startswith("JSON"):
-                    content_clean = content_clean[4:].lstrip()
-            if content_clean.endswith("```"):
-                content_clean = content_clean.rsplit("```", 1)[0].rstrip()
-            
-            # 尝试多种方式解析JSON
-            data = None
-            json_error = None
-            
-            # 方法1: 直接解析
-            try:
-                data = json.loads(content_clean)
-            except json.JSONDecodeError as je:
-                json_error = je
-                # 尝试使用 json5（如可用）更宽松地解析（支持单引号、注释等）
-                if data is None and _HAS_JSON5:
-                    try:
-                        data = json5.loads(content_clean)  # type: ignore
-                    except Exception:
-                        pass
-                # 方法2: 查找JSON数组 [ ... ]
-                array_match = re.search(r'\[[^\]]*(?:\{[^}]*\}[^\]]*)*\]', content_clean, re.DOTALL)
-                if array_match:
-                    try:
-                        data = json.loads(array_match.group(0))
-                    except json.JSONDecodeError:
-                        # 再次尝试 json5
-                        if _HAS_JSON5:
-                            try:
-                                data = json5.loads(array_match.group(0))  # type: ignore
-                            except Exception:
-                                pass
-                
-                # 方法3: 查找JSON对象 { ... }（更健壮的匹配）
-                if data is None:
-                    # 尝试找到最外层的大括号对
-                    brace_start = content_clean.find('{')
-                    if brace_start >= 0:
-                        brace_count = 0
-                        brace_end = -1
-                        for i in range(brace_start, len(content_clean)):
-                            if content_clean[i] == '{':
-                                brace_count += 1
-                            elif content_clean[i] == '}':
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    brace_end = i
-                                    break
-                        if brace_end > brace_start:
-                            try:
-                                json_str = content_clean[brace_start:brace_end+1]
-                                data = json.loads(json_str)
-                            except json.JSONDecodeError:
-                                if _HAS_JSON5:
-                                    try:
-                                        data = json5.loads(json_str)  # type: ignore
-                                    except Exception:
-                                        pass
-                
-                # 方法4: 尝试提取所有可能的JSON对象
-                if data is None:
-                    json_matches = re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content_clean, re.DOTALL)
-                    for match in json_matches:
-                        try:
-                            candidate = match.group(0)
-                            data = json.loads(candidate)
-                            break
-                        except json.JSONDecodeError:
-                            if _HAS_JSON5:
-                                try:
-                                    data = json5.loads(candidate)  # type: ignore
-                                    break
-                                except Exception:
-                                    pass
-                            continue
-                
-                # 如果所有方法都失败，抛出详细错误
-                if data is None:
-                    error_detail = f"JSON解析失败: {json_error.msg if json_error else '未找到有效JSON'} (位置 {json_error.pos if json_error else 'N/A'})"
-                    logger.warning("小模型返回内容无法解析 [%s]: %s | 原始返回(前500字符): %s", msg_id, error_detail, original_content[:500])
-                    raise ValueError(f"{error_detail}。原始返回(前300字符): {original_content[:300]}")
-            
-            # 统一成 dict：允许返回 list[str|dict] 或单个 string
-            if isinstance(data, list) and len(data) > 0:
-                item = data[0]
+            data = _parse_response_content(content, batch_tag or "batch")
+
+            items: List[Any] = []
+            if isinstance(data, list):
+                items = data
             elif isinstance(data, dict):
-                # 某些模型会包一层 {"items": [...]}
-                if "items" in data and isinstance(data["items"], list) and data["items"]:
-                    item = data["items"][0]
+                if isinstance(data.get("items"), list):
+                    items = data["items"]
                 else:
-                    item = data
+                    items = [data]
+            elif isinstance(data, str):
+                items = [{"summary": data}]
             else:
-                item = data
+                raise ValueError(f"返回结构不支持: {type(data)}")
 
-            if not isinstance(item, dict):
-                # 宽松兼容：若返回 string，则当作 summary 文本
-                if isinstance(item, str):
-                    item = {"summary": item}
-                else:
-                    raise ValueError(f"返回元素不是dict: {type(item)}")
-            
-            # 提取核心字段
-            summary = str(item.get("summary") or "").strip()
-            if not summary:
-                # 宽松兜底：有时模型仅返回了 key_info/markdown 等字段，或解析失败
-                alt = str(item.get("key_info") or item.get("markdown") or "").strip()
-                if alt:
-                    summary = alt
-                else:
-                    # 最后兜底，给一个占位，避免上层视为失败
-                    summary = "ai: 信息有限"
-            if not summary.lower().startswith("ai:"):
-                summary = f"ai: {summary}"
+            out: Dict[str, Dict[str, Any]] = {}
+            for idx, it in enumerate(items):
+                fallback_id = batch_ids[idx] if idx < len(batch_ids) else (batch_ids[0] if len(batch_ids) == 1 else "")
+                norm = _normalize_item(it, fallback_id)
+                rid = str(norm.get("id") or "").strip() or fallback_id
+                if len(batch_ids) == 1 and fallback_id:
+                    rid = fallback_id
+                if not rid:
+                    continue
+                norm["id"] = rid
+                out[rid] = {k: v for k, v in norm.items() if k != "id"}
 
-            # Optional: refined minutes / structured transcript
-            refined = ""
-            try:
-                refined = str(
-                    item.get("refined")
-                    or item.get("content_refined")
-                    or item.get("refined_content")
-                    or item.get("minutes_refined")
-                    or ""
-                ).strip()
-            except Exception:
-                refined = ""
-            
-            # 禁止截断tool派生的文字，不设文字上限
-            
-            # 会议号处理
-            meeting_number_raw = item.get("meeting_number") or ""
-            meeting_number_digits = re.sub(r"\D", "", str(meeting_number_raw))
-            meeting_number = meeting_number_digits if 9 <= len(meeting_number_digits) <= 13 else ""
-            
-            # tone 标准化（支持新增的 meeting 类型）
-            tone = str(item.get("tone") or "neutral").lower()
-            allowed_tones = {"bullish", "bearish", "neutral", "meeting", "positive", "negative"}
-            if tone not in allowed_tones:
-                tone = "neutral"
-            
-            # confidence
-            confidence = float(item.get("confidence", 0.5))
-            confidence = max(0.0, min(1.0, confidence))  # clamp to [0, 1]
-            
-            dbg = {"id": msg_id, "ok": True, "raw": (content[:500] if isinstance(content, str) else str(type(content))) }
-            return msg_id, {
-                "summary": summary,
-                "meeting_number": meeting_number,
-                "tone": tone,
-                "confidence": confidence,
-                "refined": refined,
-                # 保留兼容字段（用于后续可能的扩展）
-                "keywords": [],
-                "platform": "",
-                "category": "",
-            }, dbg
+            if allow_single_fallback and len(batch_ids) > 1:
+                missing_ids = [bid for bid in batch_ids if bid and bid not in out]
+                if missing_ids:
+                    for item in batch:
+                        bid = str(item.get("id") or "").strip()
+                        if not bid or bid not in missing_ids:
+                            continue
+                        sub_res, sub_dbg = _process_batch([item], allow_single_fallback=False)
+                        out.update(sub_res)
+                        debug.extend(sub_dbg)
+
+            if len(batch_ids) == 1 and batch_ids[0] not in out:
+                # 单条消息场景，若模型漏回 id，兜底绑定回该条
+                out[batch_ids[0]] = {
+                    "summary": "ai: 信息有限",
+                    "meeting_number": "",
+                    "tone": "neutral",
+                    "confidence": 0.5,
+                    "refined": "",
+                    "keywords": [],
+                    "platform": "",
+                    "category": "",
+                }
+
+            dbg = [{
+                "id": bid,
+                "ok": (bid in out),
+                "raw": (content[:500] if isinstance(content, str) else str(type(content))),
+            } for bid in batch_ids]
+            return out, dbg
         except Exception as exc:
+            if allow_single_fallback and len(batch) > 1:
+                merged: Dict[str, Dict[str, Any]] = {}
+                merged_dbg: List[Dict[str, Any]] = []
+                for item in batch:
+                    sub_res, sub_dbg = _process_batch([item], allow_single_fallback=False)
+                    merged.update(sub_res)
+                    merged_dbg.extend(sub_dbg)
+                if merged:
+                    return merged, merged_dbg
             raw_preview = None
             try:
-                # 尝试截取原始返回文本，便于调试
                 if content:
                     raw_preview = content[:2000] if isinstance(content, str) else str(content)[:2000]
             except Exception:
                 raw_preview = None
-            
-            error_msg = f"{msg_id}: {exc}"
-            errors.append(error_msg)
-            
-            # 记录详细的错误日志（前20个错误全部记录，之后每10个记录一次）
-            should_log = len(errors) <= 20 or (len(errors) % 10 == 0)
-            if should_log:
+            for bid in batch_ids:
+                errors.append(f"{bid}: {exc}")
+            if len(errors) <= 20 or (len(errors) % 10 == 0):
                 logger.warning(
-                    "小模型提取失败 [%s]: %s | 原始返回(前800字符): %s",
-                    msg_id,
+                    "小模型批量提取失败 [%s]: %s | 原始返回(前800字符): %s",
+                    batch_tag,
                     str(exc),
-                    raw_preview[:800] if raw_preview else "(无返回内容)"
+                    raw_preview[:800] if raw_preview else "(无返回内容)",
                 )
-            
-            dbg = {"id": msg_id, "ok": False, "error": str(exc)}
+            dbg = [{"id": bid, "ok": False, "error": str(exc)} for bid in batch_ids]
             if raw_preview:
-                dbg["raw"] = raw_preview[:1000]  # 限制debug信息长度
-            return msg_id, None, dbg
+                for d in dbg[:1]:
+                    d["raw"] = raw_preview[:1000]
+            return {}, dbg
 
     results: Dict[str, Dict[str, Any]] = {}
-    
-    # 并发处理所有消息
+
+    batches = list(_batched(prepared, batch_size))
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        future_map = {executor.submit(_process_single, msg): msg for msg in prepared}
+        future_map = {executor.submit(_process_batch, b): b for b in batches}
         for future in as_completed(future_map):
             try:
-                msg_id, result, dbg = future.result()
-                if isinstance(dbg, dict):
-                    debug.append(dbg)
-                if result:
-                    results[msg_id] = result
+                batch_res, dbg = future.result()
+                if isinstance(dbg, list):
+                    debug.extend(dbg)
+                if isinstance(batch_res, dict):
+                    results.update(batch_res)
             except Exception as exc:
                 errors.append(str(exc))
 
@@ -405,7 +511,7 @@ def ensure_message_features(
     produced results. summary_origin will be set to "tool" for updated rows.
     """
     if not messages:
-        return
+        return {"updated": 0, "errors": []}
 
     cutoff = datetime.utcnow() - timedelta(days=days_to_keep)
     to_extract: List[Dict[str, Any]] = []
@@ -418,6 +524,12 @@ def ensure_message_features(
             return len((s or '').replace('\n',' ').replace('\r',' ').replace('\t',' ').strip())
         except Exception:
             return len(s or '')
+
+    def _should_send_to_tool(text: str) -> bool:
+        clean = str(text or '').replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').strip()
+        if not clean:
+            return False
+        return _vis_len(clean) >= 20
 
     for msg in messages:
         # Skip very old messages unless force=True (explicit derive request)
@@ -439,8 +551,8 @@ def ensure_message_features(
                 text = " \n".join(parts).strip()
             except Exception:
                 text = ""
-        # Skip short/low-signal texts to reduce token usage
-        if not text or _vis_len(text) < 20:
+        # Skip only truly low-signal texts; meaningful short WeChat messages should still be covered.
+        if not text or (not _should_send_to_tool(text)):
             continue
 
         # Skip non-text messages (image/file/video) entirely
@@ -476,6 +588,8 @@ def ensure_message_features(
     except Exception:
         model_ovr = None
 
+    content_by_id = {str(item.get("id")): str(item.get("content") or "") for item in to_extract}
+
     features = extract_message_features(
         to_extract,
         batch_size=batch_size,
@@ -505,34 +619,62 @@ def ensure_message_features(
         meeting_number = str(data.get("meeting_number") or "").strip()
         tone = str(data.get("tone") or "neutral").lower()
         confidence = float(data.get("confidence", 0.5))
+
+        def _fallback_points(source: str, summary: str) -> List[str]:
+            text_value = re.sub(r"\s+", " ", str(source or summary or "")).strip()
+            if not text_value:
+                return []
+            chunks = [x.strip() for x in re.split(r"[。；;！!？?\n]+", text_value) if x.strip()]
+            scored = sorted(chunks, key=lambda x: (len(x) < 8, -len(x)))
+            points: List[str] = []
+            for chunk in scored:
+                clean = re.sub(r"^\s*[-*•\d.、）)]+\s*", "", chunk).strip()
+                if not clean or clean in points:
+                    continue
+                points.append(clean[:120])
+                if len(points) >= 3:
+                    break
+            return points
+
+        key_points = data.get("key_points") or _fallback_points(content_by_id.get(fid, ""), summary_text)
+        comment = str(data.get("comment") or "").strip()
+        if not comment:
+            if tone in {"bullish", "positive"}:
+                comment = "信号偏积极，建议跟踪后续兑现。"
+            elif tone in {"bearish", "negative"}:
+                comment = "信号偏谨慎，建议关注风险扩散。"
+            elif tone == "meeting":
+                comment = "会议类信息，建议确认时间与参会安排。"
+            else:
+                comment = "信息已提炼，建议按重要性继续跟进。"
+        comment = comment[:160]
         
-        # 从 summary/正文提取平台信息（辅助逻辑）
-        platform = ""
+        platform = str(data.get("platform") or data.get("meeting_platform") or "").strip()
         summary_lower = summary_text.lower()
-        if "腾讯" in summary_text or "wemeet" in summary_lower:
+        if not platform and ("腾讯" in summary_text or "wemeet" in summary_lower):
             platform = "腾讯"
-        elif "进门" in summary_text or "jinmen" in summary_lower:
+        elif not platform and ("进门" in summary_text or "jinmen" in summary_lower):
             platform = "进门"
-        elif "飞书" in summary_text or "feishu" in summary_lower:
+        elif not platform and ("飞书" in summary_text or "feishu" in summary_lower):
             platform = "飞书"
-        elif "zoom" in summary_lower:
+        elif not platform and "zoom" in summary_lower:
             platform = "Zoom"
-        elif "teams" in summary_lower:
+        elif not platform and "teams" in summary_lower:
             platform = "Teams"
-        elif "钉钉" in summary_text:
+        elif not platform and "钉钉" in summary_text:
             platform = "钉钉"
-        elif "外呼" in summary_text or re.search(r"(?i)tel|电话|phone", summary_text):
+        elif not platform and ("外呼" in summary_text or re.search(r"(?i)tel|电话|phone", summary_text)):
             platform = "电话"
-        
-        # 前置平台与会议号到摘要中：ai: <platform> <number> <body>
+
         body = re.sub(r'^\s*ai:\s*', '', summary_text, flags=re.IGNORECASE).strip()
-        prefix_parts = []
         if platform:
-            prefix_parts.append(platform)
+            body = re.sub(rf"^\s*{re.escape(platform)}\s*[:：|]?\s*", "", body).strip()
         if meeting_number:
-            prefix_parts.append(meeting_number)
-        prefix = ' '.join(prefix_parts).strip()
-        display_summary = f"ai: {prefix} {body}".strip() if prefix else f"ai: {body}"
+            body = re.sub(rf"^\s*(会议号[:：]?\s*)?{re.escape(meeting_number)}\s*[:：|]?\s*", "", body).strip()
+            body = re.sub(rf"\s*(会议号[:：]?\s*)?{re.escape(meeting_number)}\s*$", "", body).strip()
+        if platform:
+            body = re.sub(rf"^\s*{re.escape(platform)}\s*[:：|]?\s*", "", body).strip()
+        display_summary = f"ai: {body}".strip() if body else "ai:"
 
         new_part: Dict[str, Any] = {
             "summary": display_summary,
@@ -541,6 +683,8 @@ def ensure_message_features(
             "tone": tone,
             "confidence": confidence,
             "summary_origin": "tool",
+            "key_points": key_points,
+            "comment": comment,
             # 兼容字段（保持向后兼容）
             "keywords": data.get("keywords") or [],
             "category": data.get("category") or "",
@@ -564,7 +708,7 @@ def ensure_message_features(
             pass
 
     if updated:
-        db.commit()
+        _commit_with_retry(db)
     return {"updated": updated_count, "errors": tool_errors or [], "debug": tool_debug or [], "applied": applied}
 
 
@@ -692,6 +836,8 @@ def populate_fallback_derived(
             text = " \n".join(parts).strip()
         if not text:
             continue
+        if len(text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').strip()) < 20:
+            continue
 
         kws = _fallback_keywords(text, topk=5)
         summ = _fallback_summary(text, limit=summary_limit)
@@ -766,7 +912,7 @@ def populate_fallback_derived(
             changed += 1
 
     if changed:
-        db.commit()
+        _commit_with_retry(db)
     return changed
 # ---------------------- lightweight entity dictionary ----------------------
 

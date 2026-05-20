@@ -1,12 +1,12 @@
-# 0913 Platform
+# Deepsee
 
-独立微信消息管理与自动化平台。支持 wechatapi.net 回调接入、智能回复、消息聚合、情报分析。
+全面洞察自己的消息流管理引擎。支持微信网关、邮件、会议、新闻、自媒体、公众号与联系人评分的统一分析。
 
 ## 安装
 
 ```bash
-git clone git@github.com:leecyno1/wechat-chatlog-analysis-v0.8.git 0913
-cd 0913
+git clone git@github.com:leecyno1/wechat-chatlog-analysis-v0.8.git deepsee
+cd deepsee
 bash scripts/manage.sh install
 bash scripts/manage.sh start
 ```
@@ -24,7 +24,7 @@ bash scripts/manage.sh start
 
 ## WeChat API 对接
 
-0913 通过 wechatapi.net 的 iPad 协议接入微信。配置要求：
+Deepsee 通过 wechatapi.net 的 iPad 协议接入微信。配置要求：
 
 1. wechatapi token + app_id（从 [wechatapi 控制台](https://wechatapi.net/) 获取）
 2. 回调公网 URL（需 natapp/ngrok/frp 隧道）

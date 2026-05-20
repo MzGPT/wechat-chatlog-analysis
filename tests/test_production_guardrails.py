@@ -1,19 +1,26 @@
 import os
 import sys
+import tempfile
+from datetime import datetime
 
 from starlette.requests import Request
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from app.main import (
+    _api_token_auth_enabled,
     _configured_api_tokens,
     _cors_options,
     _extract_api_token,
     _is_api_auth_exempt_path,
 )
-from app.routers import ai, contacts, email
+from app.db import Base
+from app.models import EmailAccount, EmailMessage
+from app.routers import ai, contacts, email, health as health_router
 from app.schemas import EmailAccountIn
 
 
@@ -213,6 +220,200 @@ def test_list_email_messages_omits_bodies_by_default():
     assert out["items"][0].body_html is None
 
 
+def test_list_email_messages_counts_real_filtered_rows():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        engine = create_engine(f"sqlite:///{path}", future=True)
+        TestingSession = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+        Base.metadata.create_all(engine, tables=[EmailAccount.__table__, EmailMessage.__table__])
+
+        with TestingSession() as db:
+            account = EmailAccount(
+                name="acct",
+                email_address="acct@example.com",
+                provider="custom",
+                imap_host="imap.example.com",
+                imap_port=993,
+                imap_ssl=True,
+                smtp_host="smtp.example.com",
+                smtp_port=465,
+                smtp_ssl=True,
+                auth={"username": "acct@example.com", "password": "x"},
+                enabled=True,
+            )
+            db.add(account)
+            db.flush()
+            db.add_all(
+                [
+                    EmailMessage(
+                        account_id=account.id,
+                        subject="alpha briefing",
+                        from_addr="a@example.com",
+                        to_addrs=["acct@example.com"],
+                        cc_addrs=[],
+                        bcc_addrs=[],
+                        sent_at=datetime(2026, 3, 28, 10, 0, 0),
+                        direction="in",
+                        snippet="alpha first",
+                        body_text="alpha first full body",
+                        body_html=None,
+                        flags=[],
+                        meta=None,
+                        derived={},
+                    ),
+                    EmailMessage(
+                        account_id=account.id,
+                        subject="beta note",
+                        from_addr="b@example.com",
+                        to_addrs=["acct@example.com"],
+                        cc_addrs=[],
+                        bcc_addrs=[],
+                        sent_at=datetime(2026, 3, 28, 11, 0, 0),
+                        direction="in",
+                        snippet="beta only",
+                        body_text="beta only full body",
+                        body_html=None,
+                        flags=[],
+                        meta=None,
+                        derived={},
+                    ),
+                    EmailMessage(
+                        account_id=account.id,
+                        subject="alpha followup",
+                        from_addr="c@example.com",
+                        to_addrs=["acct@example.com"],
+                        cc_addrs=[],
+                        bcc_addrs=[],
+                        sent_at=datetime(2026, 3, 28, 12, 0, 0),
+                        direction="in",
+                        snippet="alpha second",
+                        body_text="alpha second full body",
+                        body_html=None,
+                        flags=[],
+                        meta=None,
+                        derived={},
+                    ),
+                ]
+            )
+            db.commit()
+
+        with TestingSession() as db:
+            out = email.list_email_messages(q="alpha", limit=50, offset=0, include_bodies=False, db=db)
+            assert out["total"] == 2
+            assert [item.subject for item in out["items"]] == ["alpha followup", "alpha briefing"]
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def test_static_index_contains_summary_detail_modal_hooks():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "openSummaryDetailModal" in html
+    assert "summary-detail-mode" in html
+
+
+def test_static_index_uses_professional_summary_icons_and_title_dedupe_hook():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "stripDuplicateSummaryHeading" in html
+    assert "summary-title-group" in html
+    assert "summary-card-icon" in html
+    assert "📈 市场观点总结" not in html
+    assert "🎯 会议路演信息" not in html
+
+
+def test_static_index_contains_summary_divider_and_hover_enhancement_hooks():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "decorateSummaryHoverItems" in html
+    assert ".summary-hover-item" in html
+    assert "border-bottom: 1px solid rgba(148, 163, 184, 0.22);" in html
+
+
+def test_static_index_replaces_primary_ai_toolbar_emojis_with_svg_markup():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "buildButtonMarkup" in html
+    assert "applyThemeToggleMarkup" in html
+    assert "🚀 运行分析" not in html
+    assert "🖼 一页通" not in html
+    assert "📄 导出" not in html
+    assert "☀️ 浅色" not in html
+    assert "🌙 深色" not in html
+
+
+def test_static_index_contains_access_gate_and_guest_readonly_guards():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert 'id="accessGate"' in html
+    assert 'id="accessConfirmBtn"' in html
+    assert 'id="accessGuestBtn"' in html
+    assert "GUEST_CLEAR_MODULES = new Set(['dashboard', 'ai-summary'])" in html
+    assert "guest-blur-panel" in html
+    assert "bindGuestReadOnlyGuard" in html
+    assert "canAccessModule" in html
+    assert "function isGuestAllowedApiPath(urlLike)" in html
+    assert "游客模式不可访问此接口" in html
+    assert "if (guestUseCacheOnly() && !isGuestAllowedApiPath(url))" in html
+    assert "if (guestUseCacheOnly()) return;" in html
+    assert "if (guestUseCacheOnly() && isGuestBlurModule(targetModule))" in html
+    assert "function shouldSkipGuestModuleLoad(moduleId)" in html
+    assert "if (guestUseCacheOnly()) return;" in html
+
+
+def test_static_index_contains_background_runtime_panel():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "后台任务运行状态" in html
+    assert "loadBackgroundRuntimeStats" in html
+    assert 'id="backgroundRuntimeBody"' in html
+
+
+def test_static_index_contains_contact_scoring_hooks():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "refreshContactScoring" in html
+    assert "openContactScorecard" in html
+    assert "/api/contact-scoring/run" in html
+    assert "/scorecard" in html
+    assert "市场数据配置" in html
+    assert "loadMarketDataConfig" in html
+    assert "/api/config/market-data" in html
+    assert "期限命中画像" in html
+    assert "标的表现榜" in html
+    assert "renderContactSummaryPreview" in html
+    assert "renderContactSparkline" in html
+    assert "renderContactMarketCurve" in html
+    assert "评分摘要" in html
+    assert "contactSummaryFilter" in html
+    assert "contactSortMode" in html
+    assert "contactSubScoreMetric" in html
+    assert "contactSubScoreWindow" in html
+    assert "contactSubScoreFilter" in html
+    assert "contactSubScoreTrendFilter" in html
+    assert "contactWarningFilter" in html
+    assert "applyContactSortMode" in html
+    assert "contact-curve-anchor" in html
+    assert "核心标的走势" in html
+    assert "分期限命中拆解" in html
+    assert "事件流" in html
+    assert "renderContactEventTimeline" in html
+    assert "filterContactEventTimeline" in html
+    assert "评分矩阵" in html
+    assert "contact-score-compare" in html
+    assert "建议动作" in html
+    assert "renderContactActionRecommendation" in html
+    assert "contactWarningBoard" in html
+    assert "renderContactWarningBoard" in html
+    assert "/watch?" in html
+    assert "toggleContactWatch" in html
+
+
+def test_static_index_contains_router_batch_test_hooks():
+    html = open(os.path.join(PROJECT_ROOT, "static", "index.html"), "r", encoding="utf-8").read()
+    assert "testAllRouterModels" in html
+    assert "routerBatchTestStatus" in html
+    assert "router-status-dot" in html
+    assert "/api/ai/test-all-models" in html
+
+
 def test_list_contacts_omits_labels_unless_requested():
     row = _ContactRow(id="wxid_a", name="Alice", alias="A", rating=88, labels={"tags": ["重点"]})
     db = _DummyDb(rows=[row])
@@ -221,6 +422,32 @@ def test_list_contacts_omits_labels_unless_requested():
 
     full = contacts.list_contacts(include_labels=True, db=_DummyDb(rows=[row]))
     assert full[0].labels == {"tags": ["重点"]}
+
+
+def test_list_contacts_includes_score_summary_when_available(monkeypatch):
+    row = _ContactRow(id="wxid_a", name="Alice", alias="A", rating=88, labels={"tags": ["重点"]})
+    db = _DummyDb(
+        execute_results=[
+            _DummyExecuteResult(1),
+            _DummyExecuteResult([row]),
+        ]
+    )
+    monkeypatch.setattr(
+        contacts,
+        "build_contact_score_summaries",
+        lambda _db, _ids: {
+            "wxid_a": {
+                "total_predictions": 6,
+                "pending_predictions": 1,
+                "top_asset_name": "紫金矿业",
+                "hit_rate_1m": 0.75,
+            }
+        },
+    )
+
+    out = contacts.list_contacts(include_labels=False, db=db)
+    assert out[0].score_summary["total_predictions"] == 6
+    assert out[0].score_summary["top_asset_name"] == "紫金矿业"
 
 
 def test_list_contacts_supports_limit_offset_and_total_header():
@@ -252,10 +479,13 @@ def test_list_contact_ratings_returns_compact_mapping():
 
 
 def test_api_token_helpers_cover_core_api_and_exempt_paths(monkeypatch):
+    monkeypatch.setattr("app.main.settings.APP_ENV", "production")
     monkeypatch.setattr("app.main.settings.API_TOKEN", "prod-token")
+    assert _api_token_auth_enabled() is True
     assert _configured_api_tokens() == {"prod-token"}
     assert _is_api_auth_exempt_path("/api/health") is True
     assert _is_api_auth_exempt_path("/api/ready") is True
+    assert _is_api_auth_exempt_path("/api/access/verify") is True
     assert _is_api_auth_exempt_path("/api/agent/invoke") is True
     assert _is_api_auth_exempt_path("/api/ai/config") is False
 
@@ -264,6 +494,12 @@ def test_api_token_helpers_cover_core_api_and_exempt_paths(monkeypatch):
 
     header_request = Request({"type": "http", "headers": [(b"x-api-token", b"prod-token")]})
     assert _extract_api_token(header_request) == "prod-token"
+
+
+def test_api_token_auth_enabled_whenever_token_is_configured(monkeypatch):
+    monkeypatch.setattr("app.main.settings.APP_ENV", "development")
+    monkeypatch.setattr("app.main.settings.API_TOKEN", "dev-local-token")
+    assert _api_token_auth_enabled() is True
 
 
 
@@ -279,3 +515,94 @@ def test_cors_options_switch_between_dev_and_prod(monkeypatch):
     prod = _cors_options()
     assert prod is not None
     assert prod["allow_origins"] == ["https://a.example", "https://b.example"]
+
+
+def test_verify_access_token_requires_match_when_configured(monkeypatch):
+    monkeypatch.setattr("app.routers.health.settings.API_TOKEN", "iv19whot")
+    ok_req = Request({"type": "http", "headers": [(b"x-api-token", b"iv19whot")]})
+    assert health_router.verify_access_token(ok_req) == {"status": "ok", "configured": True}
+
+
+def test_verify_access_token_returns_config_unset(monkeypatch):
+    monkeypatch.setattr("app.routers.health.settings.API_TOKEN", "")
+    req = Request({"type": "http", "headers": []})
+    assert health_router.verify_access_token(req) == {"status": "ok", "configured": False}
+
+
+def test_background_runtime_endpoint_returns_runtime_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        health_router,
+        "get_background_runtime_snapshot",
+        lambda: {
+            "chatlog_sync": {
+                "name": "chatlog_sync",
+                "enabled": True,
+                "running": False,
+                "runs": 3,
+                "failures": 0,
+                "last_success_at": "2026-04-13T12:00:00+00:00",
+                "last_error": None,
+            },
+            "email_sync": {
+                "name": "email_sync",
+                "enabled": False,
+                "running": False,
+                "runs": 0,
+                "failures": 0,
+                "last_success_at": None,
+                "last_error": None,
+            },
+        },
+    )
+    payload = health_router.background_runtime()
+    assert payload["status"] == "ok"
+    assert payload["total"] == 2
+    assert payload["enabled"] == 1
+    assert payload["runtime"]["chatlog_sync"]["runs"] == 3
+
+
+def test_ai_router_batch_connectivity_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        ai,
+        "load_ai_config",
+        lambda: {
+            "api_url": "https://base.example/v1",
+            "api_key": "base-key",
+            "model": "base-main",
+            "tool_model": "base-tool",
+            "model_router": {
+                "enabled": True,
+                "main_channels": [
+                    {"id": "main-a", "model": "model-a", "api_url": "https://a.example/v1", "api_key": "ka", "enabled": True},
+                ],
+                "mid_channels": [
+                    {"id": "mid-a", "model": "model-mid", "api_url": "https://m.example/v1", "api_key": "km", "enabled": True},
+                ],
+                "tool_channels": [
+                    {"id": "tool-a", "model": "model-tool", "api_url": "https://t.example/v1", "api_key": "kt", "enabled": True},
+                ],
+            },
+        },
+    )
+
+    def _fake_post(url, headers, payload, timeout=180):  # noqa: ARG001
+        class _Resp:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "连接成功"}}]}
+
+        return _Resp()
+
+    monkeypatch.setattr("app.services.llm_client._post_with_backoff", _fake_post)
+    payload = ai.test_all_router_models()
+    assert payload["status"] == "ok"
+    assert payload["summary"]["total"] >= 3
+    assert payload["summary"]["ok"] >= 3
+    assert payload["lanes"]["main"][0]["status"] == "ok"
+    assert payload["lanes"]["mid"][0]["status"] == "ok"
+    assert payload["lanes"]["tool"][0]["status"] == "ok"

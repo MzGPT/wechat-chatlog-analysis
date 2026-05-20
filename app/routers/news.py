@@ -5,10 +5,23 @@ from typing import Optional
 
 from ..config import settings
 from fastapi import Body
-from ..services.news_client import (
-    direct_from_sources_json,
-    normalize_items,
+from ..services.news_engine import (
+    collect_news,
+    engine_payload,
+    list_sources as builtin_sources,
 )
+
+
+def direct_from_sources_json(limit: int = 50, q: str | None = None):
+    return engine_payload(limit=limit, q=q)
+
+
+def normalize_items(raw, **_kwargs):
+    if isinstance(raw, dict) and isinstance(raw.get("items"), list):
+        return raw
+    if isinstance(raw, list):
+        return {"items": raw}
+    return {"items": []}
 
 
 router = APIRouter(prefix="/api/newsfeed", tags=["newsfeed"])
@@ -16,14 +29,12 @@ router = APIRouter(prefix="/api/newsfeed", tags=["newsfeed"])
 
 @router.get("/health")
 def health():
-    # upstream removed; always ok
-    return {"status": "ok"}
+    return {"status": "ok", "engine": "builtin-trend-radar-lite"}
 
 
 @router.get("/sources")
 def list_sources():
-    # upstream removed; empty list
-    return {"success": True, "data": []}
+    return {"success": True, "data": builtin_sources()}
 
 
 @router.get("/items")
@@ -36,33 +47,28 @@ def list_items(
     finance_only: bool = True,
     whitelist_only: bool = True,
 ):
-    from ..services.news_client import _load_source_whitelist
-    wl = _load_source_whitelist() if whitelist_only else []
-    # 直接采集
-    direct = direct_from_sources_json(limit=limit + offset, q=keyword)
-    # 本地白名单与财经过滤（若白名单非空则忽略财经关键词）
-    fo = finance_only if not wl else False
-    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=fo, whitelist=wl)
-    items = norm.get("items") or []
-    # pagination on normalized list
+    payload = engine_payload(limit=limit + offset, q=keyword, source=source)
+    items = payload.get("items") or []
     page = items[offset: offset + limit]
-    return {"total": len(items), "items": page, "upstream_ok": norm.get("upstream_ok")}
+    return {
+        "success": True,
+        "total": len(items),
+        "items": page,
+        "analysis": payload.get("analysis") or {},
+        "sources": payload.get("sources") or [],
+        "engine": payload.get("engine"),
+        "upstream_ok": True,
+    }
 
 
 @router.get("/search")
 def search(q: str, limit: int = Query(20, ge=1, le=200), finance_only: bool = True, whitelist_only: bool = True):
-    from ..services.news_client import _load_source_whitelist
-    wl = _load_source_whitelist() if whitelist_only else []
-    direct = direct_from_sources_json(limit=limit, q=q)
-    fo = finance_only if not wl else False
-    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=fo, whitelist=wl)
-    return norm
+    return engine_payload(limit=limit, q=q)
 
 
 @router.post("/refresh")
 def refresh():
-    # upstream removed; no-op
-    return {"success": True}
+    return engine_payload(limit=80, force=True)
 
 
 @router.get("/by-ids")
@@ -76,9 +82,8 @@ def by_ids(ids: str, limit: int = Query(200, ge=1, le=1000)):
     idset = {x.strip() for x in ids.split(',') if x.strip()}
     if not idset:
         return {"total": 0, "items": []}
-    direct = direct_from_sources_json(limit=limit)
-    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=True)
-    items = norm.get('items') or []
+    payload = collect_news(limit=limit)
+    items = payload.get('items') or []
     out = [it for it in items if str(it.get('id')) in idset]
     # keep input order if single id; otherwise arbitrary order is fine
     return {"total": len(out), "items": out}
@@ -86,17 +91,8 @@ def by_ids(ids: str, limit: int = Query(200, ge=1, le=1000)):
 
 @router.get("/stats")
 def stats():
-    # pass through for now (frontend can consume directly)
-    if not settings.NEWSNOW_ENABLED:
-        return {"success": False, "data": {}}
-    try:
-        import requests
-        base = settings.NEWSNOW_API_BASE.rstrip("/")
-        r = requests.get(f"{base}/api/stats", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"success": False, "error": str(e), "data": {}}
+    payload = engine_payload(limit=120)
+    return {"success": True, "data": payload.get("analysis") or {}, "engine": payload.get("engine")}
 
 
 @router.post("/ai/summarize")
@@ -108,20 +104,15 @@ def summarize_news(payload: dict = Body(default={})):  # accepts JSON body { ids
     """
     from ..services.llm_client import load_ai_config, DEFAULT_MODULE_PROMPTS, siliconflow_chat
     import json as _json
-    ids = payload.get('ids') if isinstance(payload, dict) else None
-    q = payload.get('q') if isinstance(payload, dict) else None
+    req_payload = payload if isinstance(payload, dict) else {}
+    ids = req_payload.get('ids')
+    q = req_payload.get('q')
     try:
-        limit = int(payload.get('limit', 50))
+        limit = int(req_payload.get('limit', 50))
     except Exception:
         limit = 50
-    # 取数据：直接采集
-    direct = direct_from_sources_json(limit=limit, q=q)
-    # 使用来源白名单优先；若白名单非空，则不再按关键词 finance_only 过滤
-    from ..services.news_client import _load_source_whitelist
-    wl = _load_source_whitelist()
-    fo = False if wl else True
-    norm = normalize_items({'success': True, 'data': direct.get('items', [])}, finance_only=fo, whitelist=wl)
-    raw_items = norm.get('items') or []
+    engine_result = normalize_items(direct_from_sources_json(limit=limit, q=q))
+    raw_items = engine_result.get('items') or []
     # 仅保留近72小时新闻，避免模型被陈旧信息稀释
     from time import time as _time
     now_ms = int(_time() * 1000)
@@ -154,7 +145,7 @@ def summarize_news(payload: dict = Body(default={})):  # accepts JSON body { ids
         user_content = user_template + "\n\n数据：\n" + payload_json
     # 调模型（温度优先用参数，其次用配置中的 model_temperature，默认 0.6）
     try:
-        temp = float(payload.get('temperature')) if isinstance(payload, dict) and payload.get('temperature') is not None else None
+        temp = float(req_payload.get('temperature')) if req_payload.get('temperature') is not None else None
     except Exception:
         temp = None
     if temp is None:

@@ -14,6 +14,7 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime, getaddresses
 import imaplib
+import os
 import smtplib
 import ssl
 from typing import Iterable, List, Optional
@@ -54,6 +55,10 @@ def _addr_list(raw: str | None) -> list[str] | None:
         return [raw]
 
 
+EMAIL_CONNECT_TIMEOUT_SECONDS = max(3, int(os.getenv("EMAIL_CONNECT_TIMEOUT_SECONDS", "8")))
+EMAIL_POP3_TIMEOUT_SECONDS = max(3, int(os.getenv("EMAIL_POP3_TIMEOUT_SECONDS", "8")))
+
+
 @dataclass
 class FetchOptions:
     folder: str = "INBOX"
@@ -76,9 +81,9 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
     new_rows: List[EmailMessage] = []
 
     if account.imap_ssl:
-        M = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=context)
+        M = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=context, timeout=EMAIL_CONNECT_TIMEOUT_SECONDS)
     else:
-        M = imaplib.IMAP4(account.imap_host, account.imap_port)
+        M = imaplib.IMAP4(account.imap_host, account.imap_port, timeout=EMAIL_CONNECT_TIMEOUT_SECONDS)
 
     try:
         username = (account.auth or {}).get("username") or account.email_address
@@ -385,12 +390,11 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
     new_count = 0
     server = None
     new_rows: List[EmailMessage] = []
-    new_rows: List[EmailMessage] = []
     try:
         last_err: Exception | None = None
         for host, port in candidates:
             try:
-                server = poplib.POP3_SSL(host, port, timeout=30)
+                server = poplib.POP3_SSL(host, port, timeout=EMAIL_POP3_TIMEOUT_SECONDS)
                 server.user(username)
                 server.pass_(password)
                 break

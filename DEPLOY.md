@@ -1,4 +1,4 @@
-# 0913 WeChat Automation Platform — Deployment Guide
+# 深瞳 DeepPupil — Deployment Guide
 
 ## Quick Start (New Server)
 
@@ -14,12 +14,12 @@ bash scripts/deploy-0913.sh
 #   - wechatapi token + app_id
 #   - Callback public URL
 #   - SiliconFlow API key
-#   - MiniMax API key
+#   - LLM API key
 #   - API token
 ```
 
 After deploy, set up a public tunnel (ngrok/natapp/frp) to expose port 8000,
-then visit http://127.0.0.1:8000.
+then visit the configured service URL, for example http://127.0.0.1:8000 or your reverse-proxy domain.
 
 ## What Gets Deployed
 
@@ -27,8 +27,8 @@ then visit http://127.0.0.1:8000.
 |-----------|-------------|
 | FastAPI server | Port 8000 — message ingestion, auto-reply, analysis dashboard |
 | SQLite DB | data/app.db — messages, contacts, config, subsession state |
-| WeChat gateway | Callback → rules → reply generation → outbound send |
-| 8000 Dashboard | Message list, WeChat settings, analysis modules, 公众号, send management |
+| WeChat gateway | Callback → trigger rules → reply generation → outbound send |
+| DeepPupil Dashboard | 信息流看板、微信/邮件/新闻/自媒体/公众号/会议引擎、AI分析与群发管理 |
 | Sub-session | wechat_gateway_default — independent persona, MiniMax routing, multi-turn history |
 
 ## Configuration Files
@@ -44,6 +44,8 @@ then visit http://127.0.0.1:8000.
 ## Post-Deploy Checklist
 
 - [ ] `curl http://127.0.0.1:8000/api/health` returns 200
+- [ ] `curl http://127.0.0.1:8000/api/ready` returns readiness checks
+- [ ] If exposed beyond localhost, `API_TOKEN` is set and reverse proxy forwards `Authorization` headers
 - [ ] Public tunnel set up to forward to port 8000
 - [ ] 8000 → WeChat Settings → verify callback URL → Bind Callback
 - [ ] Send `ai test` from WeChat → verify auto-reply
@@ -65,6 +67,23 @@ then visit http://127.0.0.1:8000.
 ├── requirements.txt     # Python dependencies
 └── DEPLOY.md            # This file
 ```
+
+
+## Hermes / 龙虾(OpenClaw) Integration
+
+DeepPupil exposes an agent bridge under `/api/agent` for cloud-side assistants such as Hermes and 龙虾/OpenClaw.
+
+Recommended production settings:
+
+```env
+AGENT_API_TOKEN=<strong-random-token>
+AGENT_API_ALLOWLIST=/api/health,/api/ready,/api/messages,/api/email,/api/newsfeed,/api/ai,/api/send,/api/wechat-gateway,/api/config
+AGENT_API_BLOCKLIST=/api/admin/cleanup,/api/admin/aggregation-retention/prune
+HERMES_HOME=/opt/hermes
+OPENCLAW_HOME=/opt/openclaw
+```
+
+Use `/api/admin/diagnostics` after login/API-token configuration to confirm database, background tasks, Chatlog, LLM routing, Hermes and OpenClaw availability.
 
 ## Adding Hermes Skill (Optional)
 
@@ -98,6 +117,6 @@ Environment variables are injected per instance — no code changes needed.
 | Symptom | Check |
 |---------|-------|
 | No messages | curl /api/health; check wechatapi checkOnline; verify token |
-| No auto-reply | check trigger_rules; verify MiniMax API key; check logs |
+| No auto-reply | check trigger_rules; verify LLM API key; check logs |
 | 公众号 empty | Check /api/mp/articles returns data; verify mp_config |
 | Token expired | Update token in 8000 → WeChat Settings; re-bind callback |

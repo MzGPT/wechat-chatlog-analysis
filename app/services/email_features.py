@@ -202,6 +202,10 @@ def _compose_summary_body(
     return " | ".join(cleaned).strip()
 
 
+def _visible_len(value: str) -> int:
+    return len(str(value or "").replace("\n", " ").replace("\r", " ").replace("\t", " ").strip())
+
+
 def _extract_time_window(text: str) -> str:
     if not text:
         return ""
@@ -224,12 +228,6 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
 
     prepared: List[dict] = []
     id_map: Dict[str, dict] = {}
-    def _vis_len(s: str) -> int:
-        try:
-            return len((s or '').replace('\n',' ').replace('\r',' ').replace('\t',' ').strip())
-        except Exception:
-            return len(s or '')
-
     for it in items:
         mid = str(it.get('id')) if it.get('id') is not None else ''
         if not mid:
@@ -266,7 +264,7 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
                     break
         
         # Skip very short bodies to save tokens (<20 visible chars)
-        if _vis_len(trimmed) < 20:
+        if _visible_len(trimmed) < 20:
             continue
         # Compose content for the tool model.
         # 需求：小模型的生成必须“基于原文正文”，不要基于标题。
@@ -343,6 +341,8 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
             continue
         base = id_map.get(mid, {})
         raw_text = base.get('raw_text', '')
+        if _visible_len(raw_text) < 20:
+            continue
         feat = features.get(mid, {}).copy() if isinstance(features, dict) else {}
 
         meeting_link = feat.get('meeting_link') or _extract_field(r"会议链接[:：]?\s*(https?://\S+)", raw_text)
@@ -416,12 +416,29 @@ def build_email_features(items: List[dict]) -> Dict[str, dict]:
         key_info = (key_info_src or '').strip()[:30]
         key_info_origin = 'tool' if feat.get('key_info') or tool_summary else 'fallback'
 
+        key_points_raw = feat.get('key_points') or feat.get('points') or []
+        if isinstance(key_points_raw, str):
+            key_points = [x.strip(' -•\t') for x in re.split(r'[\n；;]+', key_points_raw) if x.strip()]
+        elif isinstance(key_points_raw, list):
+            key_points = [str(x).strip() for x in key_points_raw if str(x or '').strip()]
+        else:
+            key_points = []
+        if not key_points:
+            key_points = [x.strip(' -•\t') for x in re.split(r'[\n；;。]+', summary_full or main_point or key_info_body) if x.strip()][:3]
+        key_points = [x[:120] for x in key_points[:4]]
+        comment = str(feat.get('comment') or feat.get('one_sentence_comment') or '').strip()
+        if not comment:
+            comment = '建议关注后续进展。' if category in {'会议', '观点'} else '信息价值有限，建议按需跟进。'
+        comment = comment[:160]
+
         results[mid] = {
             'summary': summary_text,
             'summary_full': summary_full,
             'summary_origin': summary_origin,
             'key_info': key_info,
             'key_info_origin': key_info_origin,
+            'key_points': key_points,
+            'comment': comment,
             'tone': tone,
             'category': category,
             'meeting_link': meeting_link,
@@ -489,6 +506,8 @@ def build_email_fallback_features(items: List[dict]) -> Dict[str, dict]:
             continue
         text = (it.get('body_text') or _html_to_text(it.get('body_html')) or it.get('snippet') or it.get('subject') or '').strip()
         subject = (it.get('subject') or '').strip()
+        if _visible_len(text) < 20:
+            continue
         # meeting & platform
         m = re.search(r"(?:会议号[:：]?\s*)?(\d{3}[-\s]?\d{3}[-\s]?\d{3,6}|\d{8,12})", text)
         meeting_raw = m.group(1) if m else ''
@@ -576,6 +595,9 @@ def persist_email_features(
         derived = em.derived if isinstance(em.derived, dict) else {}
         if derived and not force and derived.get('summary_origin') == 'tool':
             continue
+        text = (em.body_text or _html_to_text(em.body_html) or em.snippet or em.subject or "").strip()
+        if _visible_len(text) < 20:
+            continue
         items.append({
             'id': em.id,
             'sent_at': em.sent_at.isoformat() if em.sent_at else None,
@@ -632,6 +654,9 @@ def persist_email_fallback(
     for em in emails:
         derived = em.derived if isinstance(em.derived, dict) else {}
         if derived and not force and derived.get('summary_origin') == 'tool':
+            continue
+        text = (em.body_text or _html_to_text(em.body_html) or em.snippet or em.subject or "").strip()
+        if _visible_len(text) < 20:
             continue
         items.append({
             'id': em.id,

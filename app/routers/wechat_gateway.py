@@ -4,9 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response, WebSocket, WebS
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
-from ..models import Message
+from ..models import Message, WechatSubsession
 from ..services.wechatapi_client import WechatApiClient
-from ..services.reply_generation import generate_local_reply
 from ..services.wechat_gateway import (
     apply_outbound_random_delay,
     evaluate_auto_reply_rules,
@@ -120,21 +119,22 @@ def receive_wechat_gateway_callback(payload: dict, response: Response, db: Sessi
     if result.get("stored") and not result.get("duplicate"):
         message = db.get(Message, int(result.get("message_id") or 0)) if result.get("message_id") else None
         if message and message.direction == "in" and str(message.type or "") == "text":
-            generated = generate_local_reply(
-                db,
-                {
-                    "message_id": message.id,
-                    "message_text": str(message.content_text or ""),
-                    "chat_id": str(message.chat_id or ""),
-                    "sender_id": str(message.sender_id or ""),
-                    "sender_name": str(message.sender_name or ""),
-                    "talker_name": str(message.talker_name or message.chat_id or ""),
-                    "is_group": str(message.chat_id or "").endswith("@chatroom"),
-                    "message_time": message.timestamp.isoformat() if message.timestamp else None,
-                    "wait_for_human_reply_suppression": True,
-                    "message_meta": message.meta,
-                    "subsession_id": ((message.meta or {}).get("subsession") or {}).get("id"),
-                },
+            # ── Hermes 智能回复 (wiki + 记忆 + 工具 + 技能) ──
+            from ..services.hermes_bridge import call_hermes_for_reply
+
+            # 读取子 session system_prompt（0913 前端可编辑）
+            subsession_id = ((message.meta or {}).get("subsession") or {}).get("id") or "wechat_gateway_default"
+            sub = db.get(WechatSubsession, subsession_id)
+            subsession_prompt = sub.system_prompt if sub and sub.system_prompt else None
+
+            generated = call_hermes_for_reply(
+                message_text=str(message.content_text or ""),
+                chat_id=str(message.chat_id or ""),
+                sender_id=str(message.sender_id or ""),
+                sender_name=str(message.sender_name or ""),
+                talker_name=str(message.talker_name or message.chat_id or ""),
+                is_group=str(message.chat_id or "").endswith("@chatroom"),
+                system_prompt=subsession_prompt,
             )
             if generated.get("status") == "ok":
                 final_gate = evaluate_auto_reply_rules(

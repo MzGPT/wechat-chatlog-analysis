@@ -300,6 +300,8 @@ def list_minutes(
                     it["summary"] = cached.get("summary")
                     it["summary_origin"] = cached.get("summary_origin") or "tool"
                     it["derived"]["tone"] = cached.get("tone") or it["derived"].get("tone")
+                    it["derived"]["key_points"] = cached.get("key_points") or it["derived"].get("key_points") or []
+                    it["derived"]["comment"] = cached.get("comment") or it["derived"].get("comment") or ""
                     out.append(it)
                     continue
             to_summarize.append({"id": it["id"], "time": it["time"], "sender": it["sender_name"], "content": it["content_text"]})
@@ -335,7 +337,15 @@ def list_minutes(
                             it["summary"] = txt
                             it["summary_origin"] = "tool"
                             it["derived"]["tone"] = f.get("tone") or it["derived"].get("tone")
-                            _cache_set(db, f"minutes:{it['id']}", {"summary": txt, "summary_origin": "tool", "tone": it["derived"]["tone"]})
+                            it["derived"]["key_points"] = f.get("key_points") or []
+                            it["derived"]["comment"] = f.get("comment") or ""
+                            _cache_set(db, f"minutes:{it['id']}", {
+                                "summary": txt,
+                                "summary_origin": "tool",
+                                "tone": it["derived"]["tone"],
+                                "key_points": it["derived"]["key_points"],
+                                "comment": it["derived"]["comment"],
+                            })
                         else:
                             local = _summarize_locally(it.get("content_text") or "")
                             it["summary"] = local

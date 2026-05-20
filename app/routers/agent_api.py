@@ -286,11 +286,11 @@ def agent_modules() -> dict[str, Any]:
             },
             {
                 "module": "sending",
-                "apis": ["/api/send", "/api/send/out", "/api/send/langbot", "/api/send/wechatpad"],
+                "apis": ["/api/send", "/api/send/out", "/api/send/wechatpad"],
             },
             {
                 "module": "sync_and_backup",
-                "apis": ["/api/sync/chatlog", "/api/sync/chatlog/full", "/api/sync/langbot", "/api/sync/state", "/api/sync/policy"],
+                "apis": ["/api/sync/chatlog", "/api/sync/chatlog/full", "/api/sync/state", "/api/sync/policy"],
             },
             {
                 "module": "system_and_config",

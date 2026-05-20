@@ -37,6 +37,18 @@ HORIZON_DAYS = {"1m": 30, "3m": 90, "1y": 365}
 DEFAULT_BENCHMARK = DEFAULT_BENCHMARK_CODE
 MANUAL_WEIGHT = 0.3
 AUTO_WEIGHT = 0.7
+SALES_ROLE_PATTERNS = (
+    r"券商销售",
+    r"机构销售",
+    r"研究所销售",
+    r"证券销售",
+    r"销售$",
+    r"[\s\-_/｜|（(]销售[）)]?$",
+    r"销售[\s\-_/｜|]",
+)
+SALES_TEXT_HINT_PATTERNS = (
+    r"(转发|分享|转载|群发|供参考|FYI|仅供参考|路演报名|欢迎报名|会议邀请)",
+)
 
 INDEX_ALIASES = {
     "沪深300": "sh000300",
@@ -137,6 +149,40 @@ def _extract_text(message: dict[str, Any]) -> str:
     if isinstance(derived, dict):
         return str(derived.get("summary_full") or derived.get("summary") or "").strip()
     return ""
+
+
+def _identity_text(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("sender_name", "talker_name", "name", "alias", "display_name", "remark", "nickname"):
+        value = payload.get(key)
+        if value:
+            parts.append(str(value))
+    labels = payload.get("labels")
+    if isinstance(labels, dict):
+        for key in ("tags", "labels", "label_names", "names"):
+            values = labels.get(key)
+            if isinstance(values, list):
+                parts.extend(str(item) for item in values if item)
+            elif values:
+                parts.append(str(values))
+    elif isinstance(labels, list):
+        parts.extend(str(item) for item in labels if item)
+    return " ".join(parts)
+
+
+def is_sales_contact_payload(payload: dict[str, Any]) -> bool:
+    identity = _identity_text(payload)
+    if not identity:
+        return False
+    return any(re.search(pattern, identity, re.IGNORECASE) for pattern in SALES_ROLE_PATTERNS)
+
+
+def _is_sales_forward_payload(payload: dict[str, Any], text: str) -> bool:
+    if not is_sales_contact_payload(payload):
+        return False
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in SALES_TEXT_HINT_PATTERNS):
+        return True
+    return True
 
 
 def _find_direction(text: str) -> str | None:
@@ -568,6 +614,8 @@ def extract_prediction_events(
         text = _extract_text(message)
         if len(text) < 8:
             continue
+        if _is_sales_forward_payload(message, text):
+            continue
         direction = _find_direction(text)
         event_kind_hint = _classify_contact_event_kind(text)
         if not direction and event_kind_hint not in {"roadshow_invite", "strategy_exchange"}:
@@ -661,6 +709,42 @@ def _compute_event_score(direction: str, direction_hit: bool, excess_return: flo
     score += 25.0 if direction_hit else -25.0
     score += 25.0 * max(-1.0, min(1.0, directional_advantage / 0.15))
     return round(_clamp(score), 2)
+
+
+def _verification_strength(
+    direction: str,
+    absolute_return: float,
+    excess_return: float | None,
+    horizon_code: str,
+    event_kind: str,
+) -> dict[str, Any]:
+    relative = excess_return if excess_return is not None else absolute_return
+    signed_absolute = absolute_return if direction == "bullish" else -absolute_return
+    signed_excess = relative if direction == "bullish" else -relative
+    if event_kind == "risk_alert":
+        signed_absolute = -absolute_return
+        signed_excess = -relative
+    strong_threshold = {"1m": 0.03, "3m": 0.06, "1y": 0.1}.get(horizon_code, 0.06)
+    weak_threshold = {"1m": -0.02, "3m": -0.04, "1y": -0.08}.get(horizon_code, -0.04)
+    if signed_excess >= strong_threshold:
+        grade = "strong_confirmed"
+        label = "强印证"
+    elif signed_excess >= 0:
+        grade = "confirmed"
+        label = "方向印证"
+    elif signed_excess <= weak_threshold:
+        grade = "disproved"
+        label = "明显证伪"
+    else:
+        grade = "weak"
+        label = "弱印证"
+    return {
+        "verification_grade": grade,
+        "verification_label": label,
+        "signed_absolute_return": round(signed_absolute, 6),
+        "signed_excess_return": round(signed_excess, 6),
+        "threshold": strong_threshold,
+    }
 
 
 def _classify_contact_event_kind(text: str) -> str:
@@ -859,7 +943,12 @@ def evaluate_prediction_event(
             excess_return = float(absolute_return - benchmark_return)
         direction = str(event.get("direction") or "bullish")
         direction_hit = absolute_return >= 0 if direction == "bullish" else absolute_return <= 0
-        meta = {"benchmark_return": round(benchmark_return, 6) if benchmark_return is not None else None}
+        event_kind = str(event.get("event_kind") or "")
+        meta = {
+            "benchmark_return": round(benchmark_return, 6) if benchmark_return is not None else None,
+            "verification_method": "asset_vs_benchmark" if benchmark_return is not None else "absolute_direction",
+        }
+        meta.update(_verification_strength(direction, absolute_return, excess_return, horizon_code, event_kind))
         if event_kind == "risk_alert":
             direction_hit = bool((absolute_return <= 0) or ((max_drawdown or 0.0) <= -0.15))
             meta["risk_rule"] = "drawdown_or_negative_return"
@@ -1106,10 +1195,24 @@ def extract_prediction_events_to_db(
             "sender_name": row.sender_name,
             "timestamp": row.timestamp,
             "content_text": row.content_text,
-            "derived": row.derived,
-        }
+                "derived": row.derived,
+                "sender_name": row.sender_name,
+            }
         for row in rows
     ]
+    contact_payloads = {
+        str(contact.id): {
+            "name": contact.name,
+            "alias": contact.alias,
+            "labels": contact.labels,
+        }
+        for contact in db.execute(select(Contact).where(Contact.id.in_(list(focus_ids)))).scalars().all()
+        if contact.id
+    }
+    for message in messages:
+        identity = contact_payloads.get(str(message.get("sender_id") or ""))
+        if identity:
+            message.update(identity)
     extracted = extract_prediction_events(
         messages,
         focus_contact_ids=focus_ids,
@@ -1356,7 +1459,9 @@ def evaluate_prediction_events_to_db(
             row.direction_hit = item.get("direction_hit")
             row.event_score = item.get("event_score")
             row.evaluated_at = item.get("evaluated_at")
-            row.meta = item.get("meta")
+            meta = dict(item.get("meta") or {})
+            meta["market_provider_order"] = market_cfg.get("provider_preference")
+            row.meta = meta
             db.add(row)
             eval_map[key] = row
         db.add(event)
@@ -1748,15 +1853,57 @@ def build_contact_scorecard(db: Session, contact_id: str, *, limit: int = 50) ->
     bullish_count = sum(1 for ev in all_events if str(ev.direction or "") == "bullish")
     bearish_count = sum(1 for ev in all_events if str(ev.direction or "") == "bearish")
     market_curve = None
-    primary_asset = next(
-        (
-            item
-            for item in asset_summary
-            if str(item.get("asset_code") or "").strip() and str(item.get("asset_type") or "").strip()
-        ),
-        None,
-    )
-    if primary_asset:
+    market_curves: list[dict[str, Any]] = []
+    curve_assets = [
+        item
+        for item in asset_summary
+        if str(item.get("asset_code") or "").strip() and str(item.get("asset_type") or "").strip()
+    ][:4]
+    market_config = None
+    if curve_assets:
+        try:
+            market_config = load_market_data_config(db)
+        except Exception:
+            market_config = None
+
+    def _build_curve_anchor_points(anchor_events: list[ContactPredictionEvent]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for ev in anchor_events:
+            if not ev.source_time:
+                continue
+            source_date = ev.source_time.date().isoformat()
+            direction = str(ev.direction or "neutral")
+            key = (source_date, direction)
+            row = grouped.setdefault(
+                key,
+                {
+                    "date": source_date,
+                    "source_time": ev.source_time.isoformat(),
+                    "direction": direction,
+                    "count": 0,
+                    "labels": [],
+                },
+            )
+            row["count"] += 1
+            label_text = str(ev.normalized_text or ev.raw_text or "").strip()
+            if label_text and len(row["labels"]) < 3:
+                row["labels"].append(label_text)
+            if ev.source_time.isoformat() < str(row.get("source_time") or ""):
+                row["source_time"] = ev.source_time.isoformat()
+        direction_label = {"bullish": "看好", "bearish": "看空", "neutral": "中性"}
+        return [
+            {
+                "date": row["date"],
+                "source_time": row["source_time"],
+                "direction": row["direction"],
+                "count": row["count"],
+                "label": f"{direction_label.get(str(row['direction']), '观点')} ×{row['count']}" if int(row["count"]) > 1 else direction_label.get(str(row["direction"]), "观点"),
+                "samples": row["labels"],
+            }
+            for row in sorted(grouped.values(), key=lambda item: (str(item.get("date") or ""), str(item.get("direction") or "")))
+        ][:16]
+
+    for primary_asset in curve_assets:
         anchor_events = [
             ev
             for ev in all_events
@@ -1774,26 +1921,22 @@ def build_contact_scorecard(db: Session, contact_id: str, *, limit: int = 50) ->
                 str(primary_asset.get("asset_code") or ""),
                 curve_start,
                 curve_end,
-                config=load_market_data_config(db),
+                config=market_config,
             )
         except Exception:
             curve_items = []
         if curve_items:
-            market_curve = {
+            curve_payload = {
                 "asset_name": primary_asset.get("asset_name"),
                 "asset_code": primary_asset.get("asset_code"),
                 "asset_type": primary_asset.get("asset_type"),
                 "count": len(curve_items),
                 "items": curve_items[-180:],
-                "anchor_points": [
-                    {
-                        "source_time": ev.source_time.isoformat() if ev.source_time else None,
-                        "direction": ev.direction,
-                        "label": ev.normalized_text or ev.raw_text or "",
-                    }
-                    for ev in anchor_events[:10]
-                ],
+                "anchor_points": _build_curve_anchor_points(anchor_events),
             }
+            market_curves.append(curve_payload)
+            if market_curve is None:
+                market_curve = curve_payload
 
     compact_horizon_groups = {
         key: {
@@ -1975,6 +2118,7 @@ def build_contact_scorecard(db: Session, contact_id: str, *, limit: int = 50) ->
             "event_timeline": event_timeline,
         },
         "market_curve": market_curve,
+        "market_curves": market_curves,
         "timeline": [
             {
                 "as_of": row.as_of.isoformat() if row.as_of else None,

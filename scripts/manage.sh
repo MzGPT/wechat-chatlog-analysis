@@ -8,6 +8,8 @@ ENV_FILE="$ROOT_DIR/.env"
 PID_FILE="$ROOT_DIR/.uvicorn.pid"
 LOG_FILE="$ROOT_DIR/uvicorn.log"
 REQ_HASH_FILE="$VENV_DIR/.requirements.sha256"
+BACKUP_DIR="$ROOT_DIR/backups"
+PROD_LITE_ENV_FILE="$ROOT_DIR/.env.production-lite.example"
 
 APP_IMPORT="app.main:app"
 
@@ -85,6 +87,132 @@ maybe_ensure_venv() {
 
   ensure_venv
   calc_requirements_hash > "$REQ_HASH_FILE" 2>/dev/null || true
+}
+
+ensure_data_dirs() {
+  mkdir -p "$ROOT_DIR/data" "$ROOT_DIR/data/datasets" "$BACKUP_DIR"
+}
+
+install_prod_lite_env() {
+  ensure_data_dirs
+  if [[ -f "$ENV_FILE" ]]; then
+    warn ".env 已存在，保留当前配置。如需覆盖请先备份/删除 .env"
+    return 0
+  fi
+  if [[ -f "$PROD_LITE_ENV_FILE" ]]; then
+    cp "$PROD_LITE_ENV_FILE" "$ENV_FILE"
+    ok "已生成生产轻量配置: .env"
+  else
+    cp "$ROOT_DIR/.env.example" "$ENV_FILE"
+    warn "未找到 .env.production-lite.example，已回退使用 .env.example"
+  fi
+}
+
+prod_lite_install() {
+  ensure_data_dirs
+  install_prod_lite_env
+  if [[ "${NO_INSTALL:-}" == "1" && ! -d "$VENV_DIR" ]]; then
+    warn "跳过依赖安装 (NO_INSTALL=1)"
+  else
+    maybe_ensure_venv
+  fi
+  if [[ "${SKIP_DB_INIT:-}" == "1" ]]; then
+    warn "跳过数据库初始化 (SKIP_DB_INIT=1)"
+  else
+    "$VENV_DIR/bin/python" - <<'PYAPP'
+from app.db import init_db
+init_db()
+print('database=initialized')
+PYAPP
+  fi
+  ok "prod-lite 初始化完成"
+}
+
+backup_svc() {
+  ensure_data_dirs
+  local ts dest manifest
+  ts=$(date +%Y%m%d-%H%M%S)
+  dest="$BACKUP_DIR/backup-$ts"
+  mkdir -p "$dest"
+  [[ -f "$ENV_FILE" ]] && cp "$ENV_FILE" "$dest/.env"
+  [[ -f "$ROOT_DIR/data/app.db" ]] && cp "$ROOT_DIR/data/app.db" "$dest/app.db"
+  [[ -f "$ROOT_DIR/data/app.db-wal" ]] && cp "$ROOT_DIR/data/app.db-wal" "$dest/app.db-wal"
+  [[ -f "$ROOT_DIR/data/app.db-shm" ]] && cp "$ROOT_DIR/data/app.db-shm" "$dest/app.db-shm"
+  [[ -f "$ROOT_DIR/data/ai_config.json" ]] && cp "$ROOT_DIR/data/ai_config.json" "$dest/ai_config.json"
+  manifest="$dest/manifest.txt"
+  {
+    echo "created_at=$ts"
+    echo "root=$ROOT_DIR"
+    du -sh "$dest" 2>/dev/null || true
+    find "$dest" -maxdepth 1 -type f -print | sort
+  } > "$manifest"
+  ok "备份完成: $dest"
+}
+
+restore_svc() {
+  local src confirm
+  src=${1:-}
+  if [[ -z "$src" || ! -d "$src" ]]; then
+    err "请提供备份目录: bash scripts/manage.sh restore backups/backup-YYYYmmdd-HHMMSS"
+    return 2
+  fi
+  confirm=${CONFIRM_RESTORE:-}
+  if [[ "$confirm" != "RESTORE" ]]; then
+    err "恢复会覆盖当前 .env/data/app.db。请设置 CONFIRM_RESTORE=RESTORE 后重试。"
+    return 2
+  fi
+  stop_svc || true
+  ensure_data_dirs
+  [[ -f "$src/.env" ]] && cp "$src/.env" "$ENV_FILE"
+  [[ -f "$src/app.db" ]] && cp "$src/app.db" "$ROOT_DIR/data/app.db"
+  [[ -f "$src/app.db-wal" ]] && cp "$src/app.db-wal" "$ROOT_DIR/data/app.db-wal" || rm -f "$ROOT_DIR/data/app.db-wal"
+  [[ -f "$src/app.db-shm" ]] && cp "$src/app.db-shm" "$ROOT_DIR/data/app.db-shm" || rm -f "$ROOT_DIR/data/app.db-shm"
+  [[ -f "$src/ai_config.json" ]] && cp "$src/ai_config.json" "$ROOT_DIR/data/ai_config.json"
+  ok "恢复完成: $src"
+}
+
+diagnose_svc() {
+  export_env || true
+  local host port pid pid_on_port
+  host=${HOST:-127.0.0.1}
+  port=${PORT:-8000}
+  pid=$(read_pid)
+  pid_on_port=$(lsof -nPiTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+  if [[ -n "$pid_on_port" && "$pid_on_port" != "${pid:-}" ]]; then
+    warn "诊断发现 PID 文件陈旧，已同步为端口监听进程: $pid_on_port"
+    echo "$pid_on_port" > "$PID_FILE"
+    pid="$pid_on_port"
+  fi
+  echo "=== Dasheng Local Diagnostics ==="
+  echo "root=$ROOT_DIR"
+  echo "time=$(date -Iseconds)"
+  echo "host=$host"
+  echo "port=$port"
+  echo "pid_file=${pid:-<empty>}"
+  echo "port_listen_pid=${pid_on_port:-<none>}"
+  echo "python=$(command -v python3 || true)"
+  echo "venv_python=$([[ -x "$VENV_DIR/bin/python" ]] && echo yes || echo no)"
+  echo "disk_root=$(df -h "$ROOT_DIR" | tail -n1)"
+  echo "data_size=$(du -sh "$ROOT_DIR/data" 2>/dev/null | awk '{print $1}')"
+  echo "db_size=$(du -sh "$ROOT_DIR/data/app.db" 2>/dev/null | awk '{print $1}')"
+  if [[ -n "$pid_on_port" ]]; then
+    ps -p "$pid_on_port" -o pid,%cpu,%mem,rss,command || true
+  fi
+  local auth_args=()
+  if [[ -n "${API_TOKEN:-}" ]]; then
+    auth_args=(-H "Authorization: Bearer ${API_TOKEN}")
+  fi
+  if health_ok "$host" "$port"; then
+    echo "health=ok"
+    curl -fsS --max-time 5 "http://$host:$port/api/ready" || true
+    echo
+    curl -fsS --max-time 5 "${auth_args[@]}" "http://$host:$port/api/admin/diagnostics" || true
+    echo
+  else
+    echo "health=fail"
+  fi
+  echo "recent_log:"
+  tail -n 80 "$LOG_FILE" 2>/dev/null || true
 }
 
 export_env() {
@@ -345,31 +473,50 @@ sync_full() {
   echo
 }
 
+launchd_svc() {
+  local action
+  action=${1:-status}
+  case "$action" in
+    install|restart|status|logs|health|uninstall|remove)
+      bash "$ROOT_DIR/scripts/launchd_8000.sh" "$action"
+      ;;
+    *)
+      err "用法: bash scripts/manage.sh launchd <install|restart|status|logs|health|uninstall>"
+      return 2
+      ;;
+  esac
+}
+
 usage() {
-  cat <<USAGE
-用法: bash scripts/manage.sh <命令>
-
-命令：
-  install        创建虚拟环境并安装依赖
-  start          后台启动服务（nohup + PID 文件）
-  run            前台启动服务（阻塞，Ctrl+C 退出）
-  dev            前台启动（--reload 热重载，建议开发环境使用；可配合 NO_INSTALL=1）
-  stop           停止后台服务
-  status         查看服务状态
-  doctor         诊断状态（进程/端口/health）
-  logs [-f]      查看日志（-f 持续跟随）
-  sync           触发一次从 chatlog 拉取增量
-  emailsync [id] 同步邮箱（可选账户ID，省略则同步全部已启用账户）
-
-示例：
-  bash scripts/manage.sh install
-  bash scripts/manage.sh start
-  bash scripts/manage.sh status
-  bash scripts/manage.sh logs -f
-  bash scripts/manage.sh sync
-  bash scripts/manage.sh emailsync 1
-  bash scripts/manage.sh stop
-USAGE
+  printf '%s\n' '用法: bash scripts/manage.sh <命令>'
+  printf '%s\n' ''
+  printf '%s\n' '命令：'
+  printf '%s\n' '  install        创建虚拟环境并安装依赖'
+  printf '%s\n' '  prod-lite      初始化客户机生产轻量配置与数据库'
+  printf '%s\n' '  start          后台启动服务（nohup + PID 文件）'
+  printf '%s\n' '  run            前台启动服务（阻塞，Ctrl+C 退出）'
+  printf '%s\n' '  dev            前台启动（--reload 热重载，建议开发环境使用；可配合 NO_INSTALL=1）'
+  printf '%s\n' '  stop           停止后台服务'
+  printf '%s\n' '  status         查看服务状态'
+  printf '%s\n' '  doctor         诊断状态（进程/端口/health）'
+  printf '%s\n' '  diagnose       输出客户机完整诊断报告'
+  printf '%s\n' '  backup         备份 .env、数据库和 AI 配置'
+  printf '%s\n' '  restore <dir>  恢复备份（需 CONFIRM_RESTORE=RESTORE）'
+  printf '%s\n' '  launchd <install|restart|status|logs|health|uninstall>  管理 macOS 开机自启'
+  printf '%s\n' '  logs [-f]      查看日志（-f 持续跟随）'
+  printf '%s\n' '  sync           触发一次从 chatlog 拉取增量'
+  printf '%s\n' '  emailsync [id] 同步邮箱（可选账户ID，省略则同步全部已启用账户）'
+  printf '%s\n' ''
+  printf '%s\n' '示例：'
+  printf '%s\n' '  bash scripts/manage.sh install'
+  printf '%s\n' '  bash scripts/manage.sh prod-lite'
+  printf '%s\n' '  bash scripts/manage.sh start'
+  printf '%s\n' '  bash scripts/manage.sh status'
+  printf '%s\n' '  bash scripts/manage.sh launchd install'
+  printf '%s\n' '  bash scripts/manage.sh logs -f'
+  printf '%s\n' '  bash scripts/manage.sh sync'
+  printf '%s\n' '  bash scripts/manage.sh emailsync 1'
+  printf '%s\n' '  bash scripts/manage.sh stop'
 }
 
 doctor_svc() {
@@ -391,6 +538,7 @@ doctor_svc() {
 cmd=${1:-}
 case "$cmd" in
   install) ensure_env; ensure_venv ;;
+  prod-lite) prod_lite_install ;;
   start) start_bg ;;
   run) start_fg ;;
   dev)
@@ -405,6 +553,10 @@ case "$cmd" in
   stop) stop_svc ;;
   status) status_svc ;;
   doctor) doctor_svc ;;
+  diagnose) diagnose_svc ;;
+  backup) backup_svc ;;
+  restore) shift || true; restore_svc "${1:-}" ;;
+  launchd) shift || true; launchd_svc "${1:-status}" ;;
   logs) shift || true; logs_svc "${1:-}" ;;
   restart) stop_svc; start_bg ;;
   sync) sync_once ;;
@@ -418,12 +570,7 @@ case "$cmd" in
       echo
     else
       info "同步全部邮箱账户（逐个尝试）"
-      ids=$(curl -fsS "http://127.0.0.1:$port/api/email/accounts" | python3 - <<'PY'
-import sys, json
-data = json.load(sys.stdin)
-print(" ".join(str(i.get('id')) for i in data))
-PY
-      )
+      ids=$(curl -fsS "http://127.0.0.1:$port/api/email/accounts" | python3 -c "import sys, json; data = json.load(sys.stdin); print(' '.join(str(i.get('id')) for i in data))")
       for i in $ids; do
         curl -fsS -X POST "http://127.0.0.1:$port/api/email/accounts/$i/sync" || true
         echo

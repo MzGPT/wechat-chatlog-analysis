@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, or_, case, func
 from datetime import datetime
 from typing import Optional
+from pydantic import BaseModel
 
 from ..db import SessionLocal
 from ..models import EmailAccount, EmailMessage
@@ -19,6 +20,24 @@ router = APIRouter(prefix="/api/email", tags=["email"])
 # serialize per-account sync to avoid SQLite "database is locked" under concurrent writes
 _ACCOUNT_LOCKS: dict[int, Lock] = {}
 EMAIL_PROGRESS: dict[str, dict] = {}
+
+
+class EmailReplyRequest(BaseModel):
+    body_text: str
+    subject: str | None = None
+    cc: list[str] | None = None
+    bcc: list[str] | None = None
+
+
+def _normalize_reply_subject(subject: str | None) -> str:
+    text = str(subject or "").strip() or "邮件回复"
+    return text if text.lower().startswith("re:") else f"Re: {text}"
+
+
+def _parse_email_address(value: str | None) -> str:
+    import email.utils as _email_utils
+    name, addr = _email_utils.parseaddr(str(value or ""))
+    return (addr or str(value or "")).strip()
 
 
 def _mask_account_auth(auth: dict | None) -> dict:
@@ -154,7 +173,10 @@ def list_email_messages(
         query = query.where(
             or_(EmailMessage.subject.like(like), EmailMessage.snippet.like(like), EmailMessage.from_addr.like(like))
         )
-    total = db.execute(query.with_only_columns(func.count()).order_by(None)).scalar() or 0
+    # 不能直接对 ORM select 使用 with_only_columns(count(*))，否则在 SQLite 下可能丢失 FROM，
+    # 进而把总数错误算成 1。这里显式对子查询计数，确保过滤条件和数据查询完全对齐。
+    filtered_subquery = query.order_by(None).subquery()
+    total = db.execute(select(func.count()).select_from(filtered_subquery)).scalar() or 0
     # SQLite 不支持 NULLS LAST 语法，这里用 CASE 将 NULL 置后
     order_nulls_last = case((EmailMessage.sent_at == None, 1), else_=0)  # noqa: E711
     rows = (
@@ -344,6 +366,37 @@ def email_derive_progress(key: str):
     if not info:
         return {"status": "unknown", "done": 0, "total": 0}
     return {"status": info.get("status"), "done": info.get("done"), "total": info.get("total")}
+
+@router.post("/messages/{message_id}/reply")
+def reply_email_message(message_id: int, body: EmailReplyRequest, db: Session = Depends(get_db)):
+    row = db.get(EmailMessage, message_id)
+    if not row:
+        raise HTTPException(404, "message not found")
+    acc = db.get(EmailAccount, row.account_id)
+    if not acc:
+        raise HTTPException(404, "account not found")
+    to_addr = _parse_email_address(row.from_addr if str(row.direction or "in") == "in" else ((row.to_addrs or [""])[0] if row.to_addrs else ""))
+    if not to_addr:
+        raise HTTPException(400, "reply target is empty")
+    text = str(body.body_text or "").strip()
+    if not text:
+        raise HTTPException(400, "body_text is required")
+    try:
+        resp = smtp_send(
+            db,
+            acc,
+            [to_addr],
+            _normalize_reply_subject(body.subject or row.subject),
+            text,
+            cc=body.cc,
+            bcc=body.bcc,
+        )
+        db.commit()
+        return {"status": "ok", "to": to_addr, "account_id": acc.id, "resp": resp}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(502, f"reply error: {e}")
+
 
 @router.post("/send")
 def send_email(body: EmailSendRequest, db: Session = Depends(get_db)):

@@ -84,6 +84,34 @@ def _aggregation_retention_diagnostics(db: Session | None) -> dict[str, Any]:
     }
 
 
+def _cloud_agent_runtime_diagnostics() -> dict[str, Any]:
+    hermes_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    openclaw_home = (
+        os.environ.get("OPENCLAW_HOME")
+        or os.environ.get("LOBSTER_HOME")
+        or str(Path.home() / ".openclaw")
+    )
+    return {
+        "hermes": {
+            "home": hermes_home,
+            "available": Path(hermes_home).exists(),
+        },
+        "openclaw": {
+            "home": openclaw_home,
+            "available": Path(openclaw_home).exists(),
+        },
+        "agent_api": {
+            "enabled": bool(
+                str(getattr(settings, "AGENT_API_TOKEN", "") or "").strip()
+                or str(getattr(settings, "AGENT_API_TOKENS", "") or "").strip()
+            ),
+            "allowlist_configured": bool(str(getattr(settings, "AGENT_API_ALLOWLIST", "") or "").strip()),
+            "blocklist_configured": bool(str(getattr(settings, "AGENT_API_BLOCKLIST", "") or "").strip()),
+            "base_path": "/api/agent",
+        },
+    }
+
+
 def probe_chatlog_http(base_url: str | None = None, timeout: float | None = None) -> dict[str, Any]:
     base = str(base_url or settings.CHATLOG_HTTP_BASE or "").strip().rstrip("/")
     if not base:
@@ -259,6 +287,7 @@ def summarize_diagnostics(db: Session | None = None) -> dict[str, Any]:
         "paths": _check_writable_paths(),
         "api_keys": _summarize_ai_config(ai_config),
         "external_services": {"chatlog_http": probe_chatlog_http()},
+        "cloud_agent_runtime": _cloud_agent_runtime_diagnostics(),
         "background_runtime": get_background_runtime_snapshot(),
         "aggregation_retention": _aggregation_retention_diagnostics(db),
     }

@@ -1,105 +1,75 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
-from typing import Any, Dict, List
 from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from ..db import SessionLocal
+from ..services.market_data import (
+    fetch_market_series,
+    load_market_data_config,
+    market_provider_health,
+    normalize_asset_identity,
+    search_asset_in_text,
+)
+
 
 router = APIRouter(prefix="/api/market", tags=["market"])
 
-try:
-    import akshare as ak  # type: ignore
-    HAS_AKSHARE = True
-except Exception:
-    HAS_AKSHARE = False
 
-
-def _df_to_records(df) -> List[Dict[str, Any]]:
+def get_db():
+    db = SessionLocal()
     try:
-        # Normalize common column names
-        cols = {c.lower(): c for c in df.columns}
-        # date column candidates
-        date_col = None
-        for k in ("date", "日期", "trade_date"):
-            if k in cols:
-                date_col = cols[k]
-                break
-        # close column candidates
-        close_col = None
-        for k in ("close", "收盘", "收盘价", "close_price"):
-            if k in cols:
-                close_col = cols[k]
-                break
-        if not date_col or not close_col:
-            return []
-        out = []
-        for _, row in df.iterrows():
-            # accept datetime/date/str/int(YYYYMMDD)
-            d = row[date_col]
-            if isinstance(d, (int, float)):
-                try:
-                    s = str(int(d))
-                    if len(s) == 8:
-                        dts = f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
-                    else:
-                        dts = str(d)
-                except Exception:
-                    dts = str(d)
-            elif isinstance(d, datetime):
-                dts = d.strftime("%Y-%m-%d")
-            else:
-                dts = str(d)
-            try:
-                c = float(row[close_col])
-            except Exception:
-                continue
-            out.append({"date": dts, "close": c})
-        return out
-    except Exception:
-        return []
+        yield db
+    finally:
+        db.close()
+
+
+@router.get("/health")
+def market_health(db: Session = Depends(get_db)):
+    return market_provider_health(load_market_data_config(db))
+
+
+@router.get("/series")
+def get_market_series(
+    asset_type: str = "index",
+    symbol: str = "sh000001",
+    days: int = 60,
+    db: Session = Depends(get_db),
+):
+    history_days = max(5, min(1500, int(days)))
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=history_days + 20)
+    cfg = load_market_data_config(db)
+    normalized = normalize_asset_identity(asset_type, symbol)
+    items = fetch_market_series(asset_type, symbol, start_date, end_date, config=cfg)
+    if not items:
+        raise HTTPException(status_code=502, detail=f"未获取到 {asset_type}:{symbol} 的行情数据")
+    return {
+        "asset_type": normalized["asset_type"],
+        "symbol": symbol,
+        "normalized": normalized,
+        "count": len(items[-history_days:]),
+        "items": items[-history_days:],
+        "provider_health": market_provider_health(cfg),
+    }
+
+
+@router.get("/lookup")
+def lookup_market_asset(q: str, db: Session = Depends(get_db)):
+    query = str(q or "").strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="q too short")
+    cfg = load_market_data_config(db)
+    item = search_asset_in_text(query, cfg)
+    return {
+        "query": query,
+        "item": item,
+        "provider_health": market_provider_health(cfg),
+    }
 
 
 @router.get("/index")
-def get_index_series(symbol: str = "sh000001", days: int = 60):
-    """Fetch index daily close series using akshare if available.
-
-    - symbol: e.g., sh000001(上证综指), sh000300(沪深300), sz399006(创业板), sh000905(中证500)
-    - days: number of days to return (approximate; filters by latest N records)
-    """
-    if not HAS_AKSHARE:
-        raise HTTPException(status_code=501, detail="akshare 未安装。请在服务器安装: pip install akshare")
-
-    df = None
-    last_err = None
-    # Try a few akshare functions for robustness across versions
-    try_funcs = [
-        ("stock_zh_index_daily", {"symbol": symbol}),
-        ("stock_zh_index_daily_em", {"symbol": symbol}),
-        ("index_zh_a_hist", {"symbol": symbol, "period": "daily", "start_date": "20000101", "end_date": None, "adjust": ""}),
-    ]
-    for fname, kwargs in try_funcs:
-        try:
-            fn = getattr(ak, fname, None)
-            if not fn:
-                continue
-            res = fn(**kwargs)
-            if res is not None and len(res) > 0:
-                df = res
-                break
-        except Exception as e:  # pragma: no cover - tolerant to akshare layout
-            last_err = e
-            continue
-
-    if df is None:
-        msg = f"未能通过 akshare 获取 {symbol} 数据"
-        if last_err:
-            msg += f": {last_err}"
-        raise HTTPException(status_code=502, detail=msg)
-
-    records = _df_to_records(df)
-    if not records:
-        raise HTTPException(status_code=502, detail="akshare 数据格式无法解析")
-
-    # Keep last N days by tailing; data is usually ascending by date
-    records = records[-max(1, int(days)) :]
-    return {"symbol": symbol, "count": len(records), "items": records}
-
+def get_index_series(symbol: str = "sh000001", days: int = 60, db: Session = Depends(get_db)):
+    return get_market_series(asset_type="index", symbol=symbol, days=days, db=db)

@@ -15,8 +15,9 @@ def test_image_candidates_prioritize_medium_then_fallback():
         path="msg/attach/u/2025-08/Img/xyz",
         direct_url="",
     )
-    assert out[0] == "http://127.0.0.1:5030/data/msg/attach/u/2025-08/Img/xyz_M.dat"
-    assert "http://127.0.0.1:5030/image/abc123,msg/attach/u/2025-08/Img/xyz" in out
+    assert out[0] == "http://127.0.0.1:5030/image/abc123,msg/attach/u/2025-08/Img/xyz"
+    assert "http://127.0.0.1:5030/data/msg/attach/u/2025-08/Img/xyz_M.dat" in out
+    assert "http://127.0.0.1:5030/data/msg/attach/u/2025-08/Img/xyz_t.dat" in out
     assert out[-1] == "http://127.0.0.1:5030/data/msg/attach/u/2025-08/Img/xyz"
 
 

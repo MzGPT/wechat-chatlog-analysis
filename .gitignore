@@ -9,6 +9,9 @@
 # Database (contains credentials in gateway config)
 data/app.db
 data/app.db.*
+data/*
+!data/
+!data/ai_config.json.example
 *.db
 *.sqlite
 
@@ -24,6 +27,8 @@ venv/
 
 # Backups
 backups/
+*.bak
+*.bak-*
 
 # IDE
 .vscode/
@@ -39,3 +44,5 @@ Thumbs.db
 # Temp
 .jiebang/
 .playwright-mcp/
+.hermes/
+media-collector/.cache/

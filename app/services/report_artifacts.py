@@ -46,7 +46,7 @@ def _module_title(module: str) -> str:
         "market": "市场观点总结",
         "meetings": "会议路演信息",
     "counter": "分歧观点分析",
-        "contacts": "高评分联系人摘要",
+        "contacts": "高评分分析师摘要",
         "legacy": "原始报告结果",
     }
     return titles.get(module, module.title())

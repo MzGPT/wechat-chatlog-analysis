@@ -123,7 +123,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
         ]),
         "user": "\n".join([
             "请通读全部消息摘要并输出 JSON 对象 {\"markdown\": string}：",
-            "- markdown 顶部必须包含标题 `# 高评分联系人摘要`。",
+            "- markdown 顶部必须包含标题 `# 高评分分析师摘要`。",
             "- 仅分析提供的联系人列表中的人物，不要自行添加其他人。",
             "- 严禁使用 wxid，必须使用数据中提供的 'sender' (已解析为姓名/备注)。",
             "- 严禁自行估算评分，必须使用数据中每条消息携带的 'rating' 字段。",
@@ -205,7 +205,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
         ]),
         "user": "\n".join([
             "请输出 {\"markdown\": string}：",
-            "# 自媒体聚合摘要",
+            "# 自媒体引擎摘要",
             "- 总体基调：<一句话概括近期主线/情绪>",
             "- 热点主题：<2-4个主题词/关键词>",
             "## 重点内容",
@@ -229,7 +229,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
         ]),
         "user": "\n".join([
             "请输出 {\"markdown\": string}：",
-            "# 公众号聚合摘要",
+            "# 公众号引擎摘要",
             "- 总体概览：<一句话概括更新量/重点方向>",
             "## 主题归纳",
             "- <主题A>：<综合结论>；<关键点> (#<id> 可选)",
@@ -250,7 +250,7 @@ DEFAULT_MODULE_PROMPTS: Dict[str, Dict[str, str]] = {
         ]),
         "user": "\n".join([
             "请输出 {\"markdown\": string}：",
-            "# 纪要聚合摘要",
+            "# 纪要引擎摘要",
             "- 概览：<会议数量/主题分布/关键结论>",
             "## 关键结论",
             "- <结论1>：<依据/原话摘要> (#<id> 可选)",
@@ -278,7 +278,8 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "1. 仔细阅读每封邮件/消息的完整内容；\n"
             "2. 理解其核心意图（路演邀请？观点分享？会议通知？）；\n"
             "3. 提取关键事实（平台/会议号/会议开始时间/观点/建议/论据/关键数据），不要编造；\n"
-            "4. 用一句话概括最重要的信息（不超过50字），除概括主旨外，把出现的核心结论、观点、推荐、论据、关键数据等要点尽量囊括到这句话中。\n\n"
+            "4. 用一句话概括最重要的信息（不超过50字），除概括主旨外，把出现的核心结论、观点、推荐、论据、关键数据等要点尽量囊括到这句话中；\n"
+            "5. 额外提炼 key_points（2-4条原文要点）和 comment（一句话评论，指出价值/风险/后续动作）。\n\n"
             "注意：\n"
             "- 必须通读完整正文，不要只看标题；\n"
             "- 摘要要提炼实质内容，不要复读标题或拼凑关键词；\n"
@@ -293,7 +294,9 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "  \"platform\": string,              // 选填：会议平台，常见有'腾讯'、'进门'、'飞书'、'钉钉'、'Zoom'、'Teams'、'电话'（含'外呼'/'tel'/'phone'）\n"
             "  \"start_time\": string,            // 选填：会议开始时间，格式如 '11-23 14:30'，若文中未提及则留空\n"
             "  \"tone\": string,                  // 必填：bullish(看多)/bearish(看空)/neutral(中性)/meeting(会议)\n"
-            "  \"confidence\": float              // 必填：0.0-1.0，你对提取准确性的信心\n"
+            "  \"confidence\": float,             // 必填：0.0-1.0，你对提取准确性的信心\n"
+            "  \"key_points\": [string],          // 必填：2-4条原文要点，短句，不编造\n"
+            "  \"comment\": string                // 必填：一句话评论，指出价值/风险/后续动作\n"
             "}\n\n"
             "说明：\n"
             "- meeting_number: 只保留数字；'123-456-789'、'+86-010-8888-6666'、'400-820-5555' 等需去除非数字。\n"
@@ -310,6 +313,7 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "要求：\n"
             "- 严禁复读/引用邮件主题或标题；只看正文内容；\n"
             "- 摘要需覆盖：核心观点(简洁)、关键信息(要点)、若文中出现则包含分析师/预约人等角色信息；\n"
+            "- 额外输出 key_points（2-4条原文要点）和 comment（一句话评论，指出价值/风险/后续动作）；\n"
             "- 如为会议或路演邮件，识别会议号、平台与开始时间（同样允许 +86/400/连字符形式，归一化为纯数字）；tone 选 'meeting'；category 选 '会议'。\n"
         ),
         "user": (
@@ -323,7 +327,9 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "  \"organizer\": string,             // 选填：内部预约人/联系人姓名\n"
             "  \"tone\": string,                  // 必填：meeting/neutral/bullish/bearish 中选；会议邀请用'meeting'\n"
             "  \"confidence\": float,             // 必填：0.0-1.0\n"
-            "  \"category\": string              // 必填：会议/观点/其他 中选；当检测到会议信息时选'会议'\n"
+            "  \"category\": string,             // 必填：会议/观点/其他 中选；当检测到会议信息时选'会议'\n"
+            "  \"key_points\": [string],          // 必填：2-4条原文要点，短句，不编造\n"
+            "  \"comment\": string                // 必填：一句话评论，指出价值/风险/后续动作\n"
             "}\n\n"
             "说明：\n"
             "- meeting_number 只保留数字；如 '+86-010-8888-6666' -> '01088886666'；'400-820-5555' -> '4008205555'；\n"
@@ -339,6 +345,7 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "要求：\n"
             "- 必须先给出一个【标题】概括会议主题（放在摘要开头）。\n"
             "- 摘要主体用“要点大纲 + 分段/小标题”组织，突出逻辑链条与结构；覆盖所有重要点。\n"
+            "- 额外输出 key_points（2-5条原文要点）和 comment（一句话评论/结论，指出价值、风险或待办）。\n"
             "- 不要复述文件名/标题；不要逐句抄原文；但要尽量涵盖细节与关键事实。\n"
             "- 如出现明确的会议/路演安排信息（平台/会议号/时间），可在开头或末尾以一行简短保留。\n"
             "- 禁止编造信息；信息不足时明确写“信息有限”。\n"
@@ -349,7 +356,9 @@ DEFAULT_TOOL_PROMPTS: Dict[str, Dict[str, Any]] = {
             "{\n"
             "  \"id\": string,\n"
             "  \"summary\": string,     // 必填，<=500字；必须以'ai: '开头；结构示例：ai: 【标题】...\\n要点：\\n- ...\\n- ...\\n结论：...\\n待办：...\n"
-            "  \"tone\": string         // 可选：positive/negative/neutral\n"
+            "  \"tone\": string,        // 可选：positive/negative/neutral\n"
+            "  \"key_points\": [string], // 必填：2-5条原文要点，短句，不编造\n"
+            "  \"comment\": string       // 必填：一句话评论/结论，指出价值、风险或待办\n"
             "}\n\n"
             "数据：{{messages_json}}"
         ),
@@ -535,18 +544,19 @@ def _to_route_map(raw: Any, default_map: Dict[str, List[str]], valid_ids: set[st
 
 
 def _default_model_router(conf: Dict[str, Any]) -> Dict[str, Any]:
-    main_model = str(conf.get("model") or "Qwen/Qwen3-30B-A3B").strip()
+    main_model = str(conf.get("main_model") or conf.get("model") or "Qwen/Qwen3.5-4B").strip()
     mid_model = str(conf.get("tool_model_messages") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
     tool_msg_model = str(conf.get("tool_model_messages") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
     tool_email_model = str(conf.get("tool_model_emails") or conf.get("tool_model") or "Qwen/Qwen3-8B").strip()
-    main_channels = [{"id": "main-1", "name": "主通道-1", "model": main_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""}]
+    main_channels = [{"id": "main-1", "name": "main-1", "model": main_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""}]
     mid_channels = [{"id": "mid-1", "name": "中模型-1", "model": mid_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""}]
     tool_channels = [
-        {"id": "tool-msg", "name": "小模型-微信", "model": tool_msg_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
-        {"id": "tool-email", "name": "小模型-邮件", "model": tool_email_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
+        {"id": "tool-msg", "name": "tool-msg", "model": tool_msg_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
+        {"id": "tool-email", "name": "tool-email", "model": tool_email_model, "weight": 1, "enabled": True, "api_url": "", "api_key": ""},
     ]
     main_route_defaults = {
         "default": ["main-1"],
+        "onepage": ["main-1"],
         "market": ["main-1"],
         "meetings": ["main-1"],
         "counter": ["main-1"],
@@ -652,7 +662,8 @@ def load_ai_config() -> Dict[str, Any]:
         conf = {
             "api_key": settings.SILICONFLOW_API_KEY or "",
             "api_url": settings.SILICONFLOW_API_URL or "https://api.siliconflow.cn/v1",
-            "model": settings.SILICONFLOW_MODEL or "Qwen/Qwen3-30B-A3B",
+            "model": settings.SILICONFLOW_MODEL or "Qwen/Qwen3.5-4B",
+            "main_model": conf.get("main_model") or "Qwen/Qwen3-30B-A3B",
             "tool_model": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
             "tool_model_messages": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
             "tool_model_emails": settings.SILICONFLOW_TOOL_MODEL or "Qwen/Qwen3-8B",
@@ -664,7 +675,8 @@ def load_ai_config() -> Dict[str, Any]:
     else:
         conf.setdefault("api_key", settings.SILICONFLOW_API_KEY or conf.get("api_key", ""))
         conf.setdefault("api_url", settings.SILICONFLOW_API_URL or conf.get("api_url", "https://api.siliconflow.cn/v1"))
-        conf.setdefault("model", settings.SILICONFLOW_MODEL or conf.get("model", "Qwen/Qwen3-30B-A3B"))
+        conf.setdefault("model", settings.SILICONFLOW_MODEL or conf.get("model", "Qwen/Qwen3.5-4B"))
+        conf.setdefault("main_model", conf.get("main_model") or "Qwen/Qwen3-30B-A3B")
         conf.setdefault("tool_model", settings.SILICONFLOW_TOOL_MODEL or conf.get("tool_model", "Qwen/Qwen3-8B"))
         conf.setdefault("tool_model_messages", conf.get("tool_model_messages") or conf.get("tool_model", "Qwen/Qwen3-8B"))
         conf.setdefault("tool_model_emails", conf.get("tool_model_emails") or conf.get("tool_model", "Qwen/Qwen3-8B"))
@@ -815,6 +827,8 @@ _MODEL_ROUTER_LOCK = threading.Lock()
 _MODEL_ROUTER_COUNTERS: Dict[str, int] = {}
 _MODEL_ROUTER_STATS: Dict[str, Dict[str, Any]] = {}
 _MODEL_ROUTER_LAST_PERSIST_AT: float = 0.0
+_BAD_API_KEYS_UNTIL: Dict[str, float] = {}
+_BAD_API_KEY_COOLDOWN_SEC = 20 * 60
 
 
 def _now_ts() -> float:
@@ -837,6 +851,28 @@ def _safe_domain(url: str) -> str:
         return (urlparse(url).netloc or "").lower()
     except Exception:
         return ""
+
+
+def _mark_bad_api_key(api_key: str) -> None:
+    key = str(api_key or "").strip()
+    if not key:
+        return
+    with _MODEL_ROUTER_LOCK:
+        _BAD_API_KEYS_UNTIL[key] = _now_ts() + float(_BAD_API_KEY_COOLDOWN_SEC)
+
+
+def _is_bad_api_key(api_key: str) -> bool:
+    key = str(api_key or "").strip()
+    if not key:
+        return False
+    now = _now_ts()
+    with _MODEL_ROUTER_LOCK:
+        until = float(_BAD_API_KEYS_UNTIL.get(key) or 0.0)
+        if until <= now:
+            if key in _BAD_API_KEYS_UNTIL:
+                _BAD_API_KEYS_UNTIL.pop(key, None)
+            return False
+        return True
 
 
 _THINK_BLOCK_RE = re.compile(r"<\s*(think|reasoning)[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
@@ -1003,13 +1039,30 @@ def _channel_latency_factor(channel_id: str, latency_ref_ms: int) -> float:
     st = _get_channel_runtime(channel_id)
     ema = st.get("ema_latency_ms")
     if ema is None:
-        return 0.9
+        return 1.0
     try:
         lat = max(1.0, float(ema))
     except Exception:
-        return 0.9
+        return 1.0
     ref = max(300.0, float(latency_ref_ms))
-    return 1.0 / (1.0 + (lat / ref))
+    # 平滑惩罚：低延迟接近 1，高延迟逐步降权，但不把慢通道直接打死。
+    return max(0.35, min(1.15, ref / (ref + max(0.0, lat - ref) * 0.75)))
+
+
+def _channel_health_factor(channel_id: str) -> float:
+    st = _get_channel_runtime(channel_id)
+    calls = float(st.get("calls") or 0.0)
+    succ = float(st.get("success") or 0.0)
+    fail = float(st.get("failure") or 0.0)
+    cfail = int(st.get("consecutive_failures") or 0)
+    if calls <= 0:
+        return 1.0
+    # 贝叶斯平滑，避免 1 次成功/失败造成剧烈抖动。
+    success_rate = (succ + 2.0) / (calls + 4.0)
+    failure_rate = (fail + 1.0) / (calls + 4.0)
+    consecutive_penalty = 0.72 ** max(0, cfail)
+    # 连续失败/高失败率必须能压过人工高权重，否则坏通道会一直抢占流量。
+    return max(0.01, min(1.25, success_rate * (1.0 - 0.55 * failure_rate) * consecutive_penalty))
 
 
 def _channel_concurrency_factor(channel: dict) -> float:
@@ -1078,14 +1131,11 @@ def _dynamic_rank_channels(channels: List[dict], *, route_key: str, conf: Dict[s
         if not cid:
             continue
         base_weight = float(_clamp_int(ch.get("weight"), 1, 32, 1))
-        succ_factor = _channel_success_rate(cid)
+        health_factor = _channel_health_factor(cid)
         lat_factor = _channel_latency_factor(cid, latency_ref_ms)
         conc_factor = _channel_concurrency_factor(ch)
-        st = _get_channel_runtime(cid)
-        cfail = int(st.get("consecutive_failures") or 0)
-        fail_penalty = max(0.2, 0.82 ** max(0, cfail))
         jitter = random.uniform(0.0, 0.01)
-        score = base_weight * succ_factor * lat_factor * conc_factor * fail_penalty + jitter
+        score = base_weight * health_factor * lat_factor * conc_factor + jitter
         if _is_channel_in_cooldown(cid):
             cooled.append((score, ch))
         else:
@@ -1173,10 +1223,19 @@ def _to_target_dict(base_api_url: str, base_api_key: str, base_model: str, chose
     target["channel_id"] = str(chosen.get("id") or "").strip() or None
     if str(chosen.get("model") or "").strip():
         target["model"] = str(chosen.get("model") or "").strip()
-    if str(chosen.get("api_url") or "").strip():
-        target["api_url"] = str(chosen.get("api_url") or "").strip()
-    if str(chosen.get("api_key") or "").strip():
-        target["api_key"] = str(chosen.get("api_key") or "").strip()
+    chosen_api_url = str(chosen.get("api_url") or "").strip()
+    if chosen_api_url:
+        target["api_url"] = chosen_api_url
+    chosen_api_key = str(chosen.get("api_key") or "").strip()
+    if chosen_api_key:
+        target["api_key"] = chosen_api_key
+    elif chosen_api_url:
+        # Avoid misusing base provider key on a different provider domain:
+        # if channel changed api_url but left api_key empty, require explicit key.
+        base_domain = _safe_domain(base_api_url)
+        chosen_domain = _safe_domain(chosen_api_url)
+        if base_domain and chosen_domain and base_domain != chosen_domain:
+            target["api_key"] = ""
     return target
 
 
@@ -1199,6 +1258,61 @@ def resolve_chat_targets(
     default_target = _to_target_dict(base_api_url, base_api_key, default_model, None)
 
     router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+    # WeChat/message摘要要求“持续刷新”优先于“多路由试错”。
+    # 对 messages 链路默认只保留稳定通道池，避免被已知慢/空响应/JSON异常通道拖住几分钟。
+    if route_kind == "tool" and str(route_key or "").strip().lower() == "messages":
+        stable_only = conf.get("tool_messages_stable_only")
+        if stable_only is None:
+            stable_only = True
+        if bool(stable_only):
+            if isinstance(router, dict) and bool(router.get("enabled")):
+                preferred_ids = conf.get("tool_messages_stable_channels")
+                if isinstance(preferred_ids, str):
+                    preferred_ids = [x.strip() for x in preferred_ids.split(",") if x.strip()]
+                if not isinstance(preferred_ids, list) or not preferred_ids:
+                    preferred_ids = ["tool-sf-qwen8b", "tool-sf-glm9b"]
+                channels = router.get("tool_channels") if isinstance(router.get("tool_channels"), list) else []
+                route_map = router.get("tool_route_channels") if isinstance(router.get("tool_route_channels"), dict) else {}
+                route_ids = route_map.get("messages") or route_map.get("default") or []
+                if isinstance(route_ids, str):
+                    route_ids = [x.strip() for x in route_ids.split(",") if x.strip()]
+                if not isinstance(route_ids, list):
+                    route_ids = []
+                enabled_by_id = {
+                    str(c.get("id") or "").strip(): c
+                    for c in channels
+                    if isinstance(c, dict) and c.get("enabled") and str(c.get("model") or "").strip()
+                }
+                ordered_ids: list[str] = []
+                for cid in [str(x).strip() for x in route_ids if str(x).strip()]:
+                    if cid in preferred_ids and cid in enabled_by_id and cid not in ordered_ids:
+                        ordered_ids.append(cid)
+                for cid in [str(x).strip() for x in preferred_ids if str(x).strip()]:
+                    if cid in enabled_by_id and cid not in ordered_ids:
+                        ordered_ids.append(cid)
+                # 如果稳定硅基通道鉴权失败，允许显式配置了独立 api_key 的工具通道兜底；
+                # 不把无 key 的其它外部通道加入，避免复用错误的基础 key。
+                for cid, channel in enabled_by_id.items():
+                    if cid in ordered_ids:
+                        continue
+                    if str(channel.get("api_key") or "").strip():
+                        ordered_ids.append(cid)
+                stable_targets: list[Dict[str, Any]] = []
+                seen: set[tuple[str | None, str, str]] = set()
+                for cid in ordered_ids:
+                    t = _to_target_dict(base_api_url, base_api_key, default_model, enabled_by_id.get(cid))
+                    key = (t.get("channel_id"), str(t.get("api_url") or ""), str(t.get("model") or ""))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    stable_targets.append(t)
+                base_key = (None, str(default_target.get("api_url") or ""), str(default_target.get("model") or ""))
+                if base_key not in seen:
+                    stable_targets.append(default_target)
+                if stable_targets:
+                    return stable_targets
+            return [default_target]
+
     if not router or not bool(router.get("enabled")):
         return [default_target]
 
@@ -1284,13 +1398,19 @@ def reset_router_runtime_stats(*, channel_id: str | None = None) -> None:
     _persist_router_metrics(force=True)
 
 
-def _post_with_backoff(url: str, headers: dict, payload: dict, *, timeout: int = 180) -> requests.Response:
+def _post_with_backoff(
+    url: str,
+    headers: dict,
+    payload: dict,
+    *,
+    timeout: int = 180,
+    attempts: int = 5,
+    backoff: float = 0.6,
+) -> requests.Response:
     """POST with basic exponential backoff on 429/5xx.
 
     This reduces flakiness under provider TPM/RPM limits while preserving caller simplicity.
     """
-    attempts = 5
-    backoff = 0.6
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -1333,7 +1453,8 @@ def siliconflow_chat(
     force_json: bool = False,
     route_kind: str = "main",
     route_key: str | None = None,
-) -> str:
+    return_metadata: bool = False,
+) -> str | Dict[str, Any]:
     """Call SiliconFlow once; auto‑retry with gentle backoff on rate limits.
     If it still fails, caller should handle local fallback.
     """
@@ -1352,7 +1473,7 @@ def siliconflow_chat(
     for idx, target in enumerate(targets):
         api_key = str(target.get("api_key") or "").strip()
         api_url = str(target.get("api_url") or "https://api.siliconflow.cn/v1").strip()
-        model = str(target.get("model") or conf.get("model") or "Qwen/Qwen3-30B-A3B").strip()
+        model = str(target.get("model") or conf.get("model") or "Qwen/Qwen3.5-4B").strip()
         channel_id = str(target.get("channel_id") or "").strip() or "base"
         channel_dict: dict | None = None
         if channel_id != "base":
@@ -1374,6 +1495,9 @@ def siliconflow_chat(
 
         if not api_key:
             errors.append(f"[{idx+1}/{len(targets)} {channel_id}] missing_api_key")
+            continue
+        if _is_bad_api_key(api_key):
+            errors.append(f"[{idx+1}/{len(targets)} {channel_id}] bad_api_key_cached")
             continue
 
         url = api_url.rstrip("/") + "/chat/completions"
@@ -1398,11 +1522,26 @@ def siliconflow_chat(
             _router_mark_inflight(channel_id, +1)
         try:
             with _LLM_SEMAPHORE:
+                retry_attempts = 5
+                retry_backoff = 0.6
                 try:
-                    http_timeout = int(conf.get("http_timeout") or 90)
+                    if route_kind == "tool" and str(route_key or "").strip().lower() == "messages":
+                        http_timeout = int(conf.get("tool_messages_timeout") or 25)
+                    else:
+                        http_timeout = int(conf.get("http_timeout") or 90)
                 except Exception:
-                    http_timeout = 90
-                resp = _post_with_backoff(url, headers, payload, timeout=http_timeout)
+                    http_timeout = 25 if route_kind == "tool" and str(route_key or "").strip().lower() == "messages" else 90
+                if route_kind == "tool" and str(route_key or "").strip().lower() == "messages":
+                    retry_attempts = int(conf.get("tool_messages_retry_attempts") or 1)
+                    retry_backoff = float(conf.get("tool_messages_retry_backoff") or 0.35)
+                resp = _post_with_backoff(
+                    url,
+                    headers,
+                    payload,
+                    timeout=http_timeout,
+                    attempts=max(1, retry_attempts),
+                    backoff=max(0.05, retry_backoff),
+                )
             resp.raise_for_status()
             data = resp.json()
             raw_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -1421,6 +1560,18 @@ def siliconflow_chat(
                     latency_ms=latency_ms,
                     reason="ok",
                 )
+                if return_metadata:
+                    return {
+                        "text": content,
+                        "execution": {
+                            "route_kind": route_kind,
+                            "route_key": str(route_key or "default"),
+                            "final_model": model,
+                            "provider": _safe_domain(api_url),
+                            "channel_id": channel_id or None,
+                            "latency_ms": round(float(latency_ms), 1),
+                        },
+                    }
                 return content
             latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
             if channel_dict is not None:
@@ -1444,6 +1595,29 @@ def siliconflow_chat(
             errors.append(f"[{idx+1}/{len(targets)} {channel_id}] empty_content model={model}")
         except Exception as exc:
             latency_ms = max(1.0, (time.perf_counter() - attempt_start) * 1000.0)
+            # Fast-fail cache: if key is unauthorized/disabled once, skip same key for a while.
+            try:
+                auth_error = False
+                if isinstance(exc, requests.HTTPError):
+                    resp = getattr(exc, "response", None)
+                    sc = int(resp.status_code) if resp is not None else 0
+                    body = ""
+                    try:
+                        body = str(resp.text or "")[:240].lower() if resp is not None else ""
+                    except Exception:
+                        body = ""
+                    if sc in (401, 403):
+                        auth_error = True
+                    elif any(k in body for k in ("invalid api key", "api key is disabled", "unauthorized")):
+                        auth_error = True
+                else:
+                    low = str(exc).lower()
+                    if "invalid api key" in low or "api key is disabled" in low or "unauthorized" in low:
+                        auth_error = True
+                if auth_error:
+                    _mark_bad_api_key(api_key)
+            except Exception:
+                pass
             if channel_dict is not None:
                 _router_mark_result(
                     channel_dict,
@@ -1500,7 +1674,7 @@ def siliconflow_chat_stream(messages: list, temperature: float = 0.7, model_over
     if not api_key:
         raise ValueError("SiliconFlow API key not configured")
     
-    model = model_override or conf.get("model") or "Qwen/Qwen3-8B"
+    model = model_override or conf.get("model") or "Qwen/Qwen3.5-4B"
     
     url = "https://api.siliconflow.cn/v1/chat/completions"
     headers = {

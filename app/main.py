@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, Response, JSONResponse
 from .db import init_db
-from .background import install_background
-from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, minutes, tools, media, mp_rss, tasks, recorder, wechat8061, admin, langbot, invitations, agent_api
+from .background import start_background_loops
+from .routers import health, messages, chats, contacts, ai, send, hooks, configs, sync, reports, compat, market, email, extensions, news, folo, minutes, tools, media, mp_rss, tasks, recorder, wechat8061, admin, invitations, agent_api, contact_scoring, wechat_gateway, collector_api
 from .routers import news as newsfeed
 from .db import SessionLocal
 from .models import Message
 from .config import settings
 import orjson
 import os
+
+
+def _api_token_auth_enabled() -> bool:
+    return bool(_configured_api_tokens())
 
 
 def _configured_api_tokens() -> set[str]:
@@ -31,7 +37,7 @@ def _extract_api_token(request: Request) -> str:
 def _is_api_auth_exempt_path(path: str) -> bool:
     if not path.startswith("/api"):
         return True
-    if path in {"/api/health", "/api/ready"}:
+    if path in {"/api/health", "/api/ready", "/api/access/verify", "/api/wechat-gateway/callback"}:
         return True
     if path.startswith("/api/agent"):
         return True
@@ -59,9 +65,15 @@ def _cors_options() -> dict | None:
     }
 
 
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    await start_background_loops(app)
+    yield
+
+
 def create_app() -> FastAPI:
     init_db()
-    app = FastAPI(title="WeChat Chatlog Analysis API")
+    app = FastAPI(title="WeChat Chatlog Analysis API", lifespan=app_lifespan)
 
     cors = _cors_options()
     if cors:
@@ -72,7 +84,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def require_api_token(request: Request, call_next):
         configured = _configured_api_tokens()
-        if configured and not _is_api_auth_exempt_path(request.url.path):
+        if _api_token_auth_enabled() and configured and not _is_api_auth_exempt_path(request.url.path):
             provided = _extract_api_token(request)
             if provided not in configured:
                 return JSONResponse({"detail": "unauthorized"}, status_code=401)
@@ -82,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(messages.router)
     app.include_router(chats.router)
     app.include_router(contacts.router)
+    app.include_router(contact_scoring.router)
     app.include_router(ai.router)
     app.include_router(send.router)
     app.include_router(hooks.router)
@@ -102,9 +115,10 @@ def create_app() -> FastAPI:
     app.include_router(tasks.router)
     app.include_router(recorder.router)
     app.include_router(wechat8061.router)
+    app.include_router(wechat_gateway.router)
     app.include_router(admin.router)
-    app.include_router(langbot.router)
     app.include_router(agent_api.router)
+    app.include_router(collector_api.router)
     # News feed aggregation (API-only, no frontend)
     app.include_router(newsfeed.router)
     app.include_router(market.router)
@@ -131,7 +145,6 @@ def create_app() -> FastAPI:
         # Deprecated permanently to avoid confusion with unified static UI
         return Response("Legacy UI removed", status_code=404)
 
-    install_background(app)
     return app
 
 

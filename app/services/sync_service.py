@@ -121,6 +121,10 @@ def _build_chatlog_media_url(msg_type: Any, contents: dict[str, Any] | None, *, 
     except Exception:
         mt_num = None
 
+    direct_image = str(c.get("cdnthumburl") or c.get("thumbUrl") or c.get("thumb_url") or c.get("image_url") or c.get("imageUrl") or "").strip()
+    if direct_image:
+        return direct_image
+
     md5 = str(c.get("md5") or c.get("imageId") or c.get("image_id") or c.get("mediaId") or c.get("id") or "").strip()
     path_raw = (
         c.get("path")

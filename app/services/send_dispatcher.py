@@ -318,6 +318,9 @@ def _part_url(part: dict[str, Any]) -> str:
 
 def _dispatch_wechatapi_parts(client: WechatApiClient, target: str, parts: list[dict[str, Any]], attachments: list[dict[str, Any]], rendered_text: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    rich_supported = all(hasattr(client, name) for name in ("send_link", "send_image", "send_file"))
+    if not rich_supported:
+        return [{"type": "text_fallback", "resp": client.send_text(to_wxid=target, text=rendered_text)}] if rendered_text else []
     for part in parts:
         p_type = str(part.get("type") or "text").strip().lower()
         if p_type == "text":
@@ -396,11 +399,12 @@ def dispatch_send_item(item: Any, request: Request | None = None) -> dict[str, A
             part_results = _dispatch_wechatapi_parts(client, target, parts, attachments, rendered_text)
             resp = {"status": "ok", "results": part_results}
             record_outbound_message(db, target=target, text=rendered_text, provider_result=resp)
+            used_text_fallback = any(str(r.get("type") or "") == "text_fallback" for r in part_results)
             return {
                 "ok": True,
                 "target": target,
                 "provider": provider,
-                "mode": "rich" if _has_rich_media(parts, attachments) or any(str(p.get("type") or "") == "link" for p in parts) else "text",
+                "mode": "text" if used_text_fallback else ("rich" if _has_rich_media(parts, attachments) or any(str(p.get("type") or "") == "link" for p in parts) else "text"),
                 "rendered_text": rendered_text,
                 "resp": resp,
             }

@@ -73,6 +73,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     create_fts_objects()
     ensure_email_message_columns()
+    ensure_contact_scoring_columns()
 
 
 def create_fts_objects():
@@ -136,3 +137,33 @@ def ensure_email_message_columns():
                 conn.execute(text("ALTER TABLE email_messages ADD COLUMN derived JSON"))
         except Exception:
             pass
+
+
+def ensure_contact_scoring_columns():
+    """Best-effort schema backfill for contact scoring tables on SQLite deployments."""
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+    with engine.begin() as conn:
+        event_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(contact_prediction_events)"))}
+        for name, ddl in (
+            ("topic_key", "ALTER TABLE contact_prediction_events ADD COLUMN topic_key VARCHAR(255)"),
+            ("event_kind", "ALTER TABLE contact_prediction_events ADD COLUMN event_kind VARCHAR(32)"),
+            ("is_actionable", "ALTER TABLE contact_prediction_events ADD COLUMN is_actionable BOOLEAN"),
+            ("signal_strength", "ALTER TABLE contact_prediction_events ADD COLUMN signal_strength FLOAT"),
+            ("source_type", "ALTER TABLE contact_prediction_events ADD COLUMN source_type VARCHAR(32)"),
+            ("event_cluster_id", "ALTER TABLE contact_prediction_events ADD COLUMN event_cluster_id VARCHAR(128)"),
+        ):
+            if name not in event_columns:
+                conn.execute(text(ddl))
+
+        snapshot_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(contact_score_snapshots)"))}
+        for name, ddl in (
+            ("accuracy_score", "ALTER TABLE contact_score_snapshots ADD COLUMN accuracy_score FLOAT"),
+            ("service_value_score", "ALTER TABLE contact_score_snapshots ADD COLUMN service_value_score FLOAT"),
+            ("direction_accuracy_score", "ALTER TABLE contact_score_snapshots ADD COLUMN direction_accuracy_score FLOAT"),
+            ("excess_return_score", "ALTER TABLE contact_score_snapshots ADD COLUMN excess_return_score FLOAT"),
+            ("risk_alert_score", "ALTER TABLE contact_score_snapshots ADD COLUMN risk_alert_score FLOAT"),
+            ("consistency_score", "ALTER TABLE contact_score_snapshots ADD COLUMN consistency_score FLOAT"),
+        ):
+            if name not in snapshot_columns:
+                conn.execute(text(ddl))

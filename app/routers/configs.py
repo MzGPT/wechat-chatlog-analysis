@@ -7,7 +7,13 @@ from ..models import SyncState
 import json
 from ..config import settings
 import requests
-import os
+from ..services.mp_rss_store import DEFAULT_MP_UPSTREAM_URL
+from ..services.market_data import (
+    load_market_data_config,
+    market_provider_health,
+    sanitize_market_data_config_for_ui,
+    save_market_data_config,
+)
 
 
 router = APIRouter(prefix="/api", tags=["config"])
@@ -214,7 +220,11 @@ def set_media_config(payload: dict, db: Session = Depends(_get_db)):
 
 @router.get("/config/mp")
 def get_mp_config(db: Session = Depends(_get_db)):
-    return _get_json_obj(db, "mp_config")
+    cfg = _get_json_obj(db, "mp_config")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if not str(cfg.get("upstream_base_url") or "").strip():
+        cfg = {**cfg, "upstream_base_url": DEFAULT_MP_UPSTREAM_URL}
+    return cfg
 
 
 @router.post("/config/mp")
@@ -243,14 +253,7 @@ def set_minutes_config(payload: dict, db: Session = Depends(_get_db)):
 @router.get("/config/extensions")
 def get_extensions_config(db: Session = Depends(_get_db)):
     cfg = _get_json_obj(db, "extensions_config")
-    cfg = cfg if isinstance(cfg, dict) else {}
-    # Convenience: surface a sensible default when user hasn't configured a log dir yet.
-    if not (str(cfg.get("langbot_log_dir") or "").strip()):
-        for candidate in ("../LangBot/docker/data/logs", "../LangBot/data/logs"):
-            if os.path.isdir(candidate):
-                cfg = {**cfg, "langbot_log_dir": candidate}
-                break
-    return cfg
+    return cfg if isinstance(cfg, dict) else {}
 
 
 @router.post("/config/extensions")
@@ -268,6 +271,72 @@ def set_extensions_config(payload: dict, db: Session = Depends(_get_db)):
     _set_json_obj(db, "extensions_config", existing)
     db.commit()
     return {"status": "ok"}
+
+
+# --------- Market data configuration (persisted in SyncState) ---------
+
+@router.get("/config/market-data")
+def get_market_data_config(db: Session = Depends(_get_db)):
+    cfg = load_market_data_config(db)
+    return {
+        **sanitize_market_data_config_for_ui(cfg),
+        "health": market_provider_health(cfg),
+    }
+
+
+@router.post("/config/market-data")
+def set_market_data_config(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    cfg = save_market_data_config(db, payload)
+    return {
+        "status": "ok",
+        "config": sanitize_market_data_config_for_ui(cfg),
+        "health": market_provider_health(cfg),
+    }
+
+
+@router.get("/config/market-data/test")
+def test_market_data_config(db: Session = Depends(_get_db)):
+    cfg = load_market_data_config(db)
+    return market_provider_health(cfg)
+
+
+# --------- Email sync schedule (persisted in SyncState) ---------
+
+def _normalize_email_sync_times(values) -> list[str]:
+    if not isinstance(values, list):
+        values = []
+    cleaned: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        parts = text.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except Exception:
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            cleaned.append(f"{hour:02d}:{minute:02d}")
+    return list(dict.fromkeys(cleaned)) or ["06:00", "21:00"]
+
+
+@router.get("/config/email-sync-schedule")
+def get_email_sync_schedule(db: Session = Depends(_get_db)):
+    obj = _get_json_obj(db, "email_sync_schedule")
+    return {"times": _normalize_email_sync_times(obj.get("times") if isinstance(obj, dict) else [])}
+
+
+@router.post("/config/email-sync-schedule")
+def set_email_sync_schedule(payload: dict, db: Session = Depends(_get_db)):
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    times = _normalize_email_sync_times(payload.get("times"))
+    _set_json_obj(db, "email_sync_schedule", {"times": times})
+    db.commit()
+    return {"status": "ok", "times": times}
 
 
 # --------- Email default account (persisted in SyncState) ---------

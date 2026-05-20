@@ -9,6 +9,19 @@ from ..config import settings
 import json
 from ..schemas import ContactOut, ContactsLookupRequest
 from ..services.chatlog_contact_book import resolve_contact_db, iter_chatlog_contacts
+from ..services.contact_scoring import (
+    build_contact_score_summaries,
+    build_contact_scorecard,
+    is_sales_contact_payload,
+    is_focus_contact,
+    resolve_auto_rating,
+    resolve_contact_watch,
+    resolve_contact_stats,
+    resolve_manual_rating,
+    set_contact_focus,
+    set_contact_watch,
+    summarize_contact_score,
+)
 
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
@@ -37,14 +50,31 @@ def list_contacts(
     items = db.execute(query).scalars().all()
     if response is not None:
         response.headers["X-Total-Count"] = str(int(total))
+    score_summaries = build_contact_score_summaries(db, [str(item.id) for item in items])
     out: list[ContactOut] = []
     for i in items:
+        stats = resolve_contact_stats(i)
+        is_sales = is_sales_contact_payload({
+            "name": i.name,
+            "alias": i.alias,
+            "labels": i.labels,
+        })
         payload = {
             "id": i.id,
             "name": i.name,
             "alias": i.alias,
             "rating": i.rating,
             "labels": i.labels if include_labels else None,
+            "manual_rating": resolve_manual_rating(i),
+            "auto_rating": resolve_auto_rating(i),
+            "sample_size": int(stats.get("sample_size", 0) or 0),
+            "hit_rate_overall": float(stats.get("hit_rate_overall", 0.0) or 0.0),
+            "last_scored_at": stats.get("last_scored_at"),
+            "focus": is_focus_contact(i),
+            "watch": resolve_contact_watch(i),
+            "score_summary": score_summaries.get(str(i.id)),
+            "role": "sales" if is_sales else "research",
+            "is_sales": is_sales,
         }
         out.append(ContactOut.model_validate(payload))
     return out
@@ -93,10 +123,61 @@ def set_rating(contact_id: str, delta: int, db: Session = Depends(get_db)):
     c = db.get(Contact, contact_id)
     if not c:
         raise HTTPException(404, "contact not found")
-    c.rating = max(0, min(100, (c.rating or 50) + delta))
+    stats = resolve_contact_stats(c)
+    manual_rating = max(0, min(100, int(round(resolve_manual_rating(c) + delta))))
+    auto_rating = resolve_auto_rating(c)
+    final_rating = manual_rating if auto_rating is None else round(manual_rating * 0.3 + float(auto_rating) * 0.7)
+    stats["manual_rating"] = manual_rating
+    stats["final_rating"] = final_rating
+    if auto_rating is not None:
+        stats["auto_rating"] = float(auto_rating)
+    c.stats = stats
+    c.rating = max(0, min(100, int(round(final_rating))))
     db.add(c)
     db.commit()
     return {"id": c.id, "rating": c.rating}
+
+
+@router.post("/{contact_id}/focus")
+def toggle_contact_focus(contact_id: str, enabled: bool = True, db: Session = Depends(get_db)):
+    c = db.get(Contact, contact_id)
+    if not c:
+        raise HTTPException(404, "contact not found")
+    row = set_contact_focus(db, contact_id, enabled)
+    return {"contact_id": row.contact_id, "enabled": row.enabled}
+
+
+@router.post("/{contact_id}/watch")
+def toggle_contact_watch(
+    contact_id: str,
+    enabled: bool = True,
+    reason: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    c = db.get(Contact, contact_id)
+    if not c:
+        raise HTTPException(404, "contact not found")
+    try:
+        payload = set_contact_watch(db, contact_id, enabled, reason=reason)
+    except ValueError:
+        raise HTTPException(404, "contact not found")
+    return {"contact_id": contact_id, **payload}
+
+
+@router.get("/{contact_id}/scorecard")
+def get_contact_scorecard(contact_id: str, db: Session = Depends(get_db)):
+    payload = build_contact_scorecard(db, contact_id)
+    if not payload:
+        raise HTTPException(404, "contact not found")
+    return payload
+
+
+@router.get("/{contact_id}/predictions")
+def list_contact_predictions(contact_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    payload = build_contact_scorecard(db, contact_id, limit=limit)
+    if not payload:
+        raise HTTPException(404, "contact not found")
+    return {"contact_id": contact_id, "items": payload["predictions"]}
 
 
 @router.delete("/{contact_id}")
@@ -162,7 +243,7 @@ def sync_contact_book(limit: int | None = None, insert_missing: bool = True, db:
                 alias=rec.remark or None,
                 rating=50,
                 labels=({"tags": rec.label_names, "source": "chatlog_contact_db"} if rec.label_names else None),
-                stats=None,
+                stats={"manual_rating": 50, "final_rating": 50, "auto_focus": False},
             )
             db.add(c)
             existing[cid] = c
@@ -183,6 +264,9 @@ def sync_contact_book(limit: int | None = None, insert_missing: bool = True, db:
                 c.labels = next_labels
                 changed = True
                 updated_labels += 1
+        if not c.stats:
+            c.stats = {"manual_rating": c.rating or 50, "final_rating": c.rating or 50}
+            changed = True
         if changed:
             db.add(c)
             updated += 1

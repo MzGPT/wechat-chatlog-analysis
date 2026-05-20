@@ -20,6 +20,8 @@ from ..models import (
     SyncState,
     Task,
 )
+from ..services.aggregation_retention import prune_aggregation_data
+from ..services.deployment_status import summarize_diagnostics
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -31,6 +33,22 @@ def _get_db():
         yield db
     finally:
         db.close()
+
+
+@router.post("/aggregation-retention/prune")
+def prune_aggregation_retention(payload: dict | None = None, db: Session = Depends(_get_db)):
+    payload = payload or {}
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid payload")
+    days = payload.get("retention_days", 90)
+    result = prune_aggregation_data(db, retention_days=days)
+    db.commit()
+    return result
+
+
+@router.get("/diagnostics")
+def diagnostics(db: Session = Depends(_get_db)):
+    return {"status": "ok", "diagnostics": summarize_diagnostics(db)}
 
 
 def _parse_dt(v: Any) -> datetime | None:
@@ -188,4 +206,3 @@ def cleanup(payload: dict, db: Session = Depends(_get_db)):
     if not dry:
         db.commit()
     return out
-

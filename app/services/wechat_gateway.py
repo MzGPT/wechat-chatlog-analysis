@@ -593,17 +593,19 @@ def record_subsession_turn(
 
 
 def _message_has_prefix(text: str, prefixes: list[str]) -> bool:
-    body = str(text or "").strip()
+    body = str(text or "").strip().lower()
     if not prefixes:
         return True
-    return any(body.startswith(prefix) for prefix in prefixes if str(prefix or "").strip())
+    return any(body.startswith(str(prefix or "").strip().lower()) for prefix in prefixes if str(prefix or "").strip())
 
 
 def _strip_matching_prefix(text: str, prefixes: list[str]) -> str:
     body = str(text or "").strip()
+    body_lower = body.lower()
     for prefix in prefixes:
         pref = str(prefix or "").strip()
-        if pref and body.startswith(pref):
+        pref_lower = pref.lower()
+        if pref and body_lower.startswith(pref_lower):
             return body[len(pref):].strip()
     return body
 
@@ -704,18 +706,22 @@ def _coerce_message_time(value: Any) -> datetime | None:
 def _has_human_manual_reply_since(db: Session, chat_id: str, threshold: datetime) -> bool:
     recent_rows = (
         db.query(Message)
-        .filter(Message.chat_id == chat_id, Message.direction == "out", Message.timestamp.is_not(None), Message.timestamp >= threshold)
+        .filter(Message.chat_id == chat_id, Message.direction == "out", Message.timestamp.is_not(None))
         .order_by(Message.timestamp.desc(), Message.id.desc())
         .limit(50)
         .all()
     )
     for row in recent_rows:
+        if row.timestamp and row.timestamp < threshold:
+            continue
         meta = row.meta if isinstance(row.meta, dict) else {}
         if meta.get("auto_reply"):
             continue
         if str(meta.get("source") or "").strip() == "wechat_gateway":
             msg_type = str(meta.get("msg_type") or "").strip()
             if msg_type == "51":
+                continue
+            if not (meta.get("human_manual") or meta.get("manual")):
                 continue
         return True
     return False
@@ -724,7 +730,7 @@ def _has_human_manual_reply_since(db: Session, chat_id: str, threshold: datetime
 def _recent_human_reply_exists(db: Session, chat_id: str, seconds: int, *, message_time: Any = None, wait_for_window: bool = False) -> bool:
     if seconds <= 0:
         return False
-    baseline = _coerce_message_time(message_time) or datetime.now()
+    baseline = _coerce_message_time(message_time) or datetime.utcnow()
     threshold = baseline - timedelta(seconds=seconds)
     if _has_human_manual_reply_since(db, chat_id, threshold):
         return True
@@ -846,6 +852,8 @@ def _resolve_display_name(db: Session, wxid: str | None, fallback: str | None = 
             if contact:
                 alias = str(contact.alias or "").strip()
                 name = str(contact.name or "").strip()
+                if name and name != candidate:
+                    return name
                 if alias and alias != candidate:
                     return alias
                 if name:
@@ -879,9 +887,17 @@ def ingest_callback_event(db: Session, payload: dict[str, Any]) -> dict[str, Any
     if not app_id or not new_msg_id:
         return {"ok": False, "duplicate": False, "stored": False, "reason": "missing_appid_or_newmsgid"}
 
-    dedupe = db.get(SyncState, _dedupe_key(app_id, new_msg_id))
+    dedupe_key = _dedupe_key(app_id, new_msg_id)
+    dedupe = db.get(SyncState, dedupe_key)
     if dedupe:
-        return {"ok": True, "duplicate": True, "stored": False, "message_id": dedupe.value}
+        try:
+            existing_id = int(str(dedupe.value or "0"))
+            if existing_id and db.get(Message, existing_id):
+                return {"ok": True, "duplicate": True, "stored": False, "message_id": dedupe.value}
+            db.delete(dedupe)
+            db.flush()
+        except Exception:
+            return {"ok": True, "duplicate": True, "stored": False, "message_id": dedupe.value}
 
     conf = load_config(db)
     from_user = _string_field(data.get("FromUserName"))
@@ -906,7 +922,7 @@ def ingest_callback_event(db: Session, payload: dict[str, Any]) -> dict[str, Any
         sender_id = appmsg_fields.get("sourceusername") or sender_id
     pipeline = evaluate_inbound_message(conf, chat_id=chat_id, sender_id=sender_id, text=display_text)
     if pipeline.get("action") == "drop":
-        dedupe = SyncState(key=_dedupe_key(app_id, new_msg_id), value="dropped")
+        dedupe = SyncState(key=dedupe_key, value="dropped")
         db.add(dedupe)
         db.commit()
         return {"ok": True, "duplicate": False, "stored": False, "dropped": True, "pipeline": pipeline}
@@ -921,8 +937,8 @@ def ingest_callback_event(db: Session, payload: dict[str, Any]) -> dict[str, Any
             "mode": subsession.mode,
         }
 
-    _ensure_chat(db, chat_id, title=chat_id, timestamp=timestamp)
-    _ensure_contact(db, sender_id, name=appmsg_fields.get("sourcedisplayname") or sender_id)
+    _ensure_chat(db, chat_id, title=None, timestamp=timestamp)
+    _ensure_contact(db, sender_id, name=appmsg_fields.get("sourcedisplayname") or None)
     sender_display_name = _resolve_display_name(db, sender_id, fallback=sender_id)
     talker_display_name = _resolve_display_name(db, chat_id, fallback=chat_id)
     message = Message(
@@ -961,7 +977,7 @@ def ingest_callback_event(db: Session, payload: dict[str, Any]) -> dict[str, Any
         content_text=display_text,
         meta={"source": "wechat_gateway", "event_type": event_type, "contents": appmsg_fields},
     )
-    db.add(SyncState(key=_dedupe_key(app_id, new_msg_id), value=str(message.id)))
+    db.add(SyncState(key=dedupe_key, value=str(message.id)))
     db.commit()
     db.refresh(message)
     return {"ok": True, "duplicate": False, "stored": True, "message_id": message.id, "pipeline": pipeline, "subsession_id": subsession.id if subsession else None}
@@ -1077,13 +1093,35 @@ def ingest_agent_wechat_event(db: Session, payload: dict[str, Any]) -> dict[str,
     return {"ok": True, "stored": True, "duplicate": False, "message_id": message.id, "pipeline": pipeline}
 
 
+def _extract_provider_result_data(result: dict[str, Any]) -> dict[str, Any]:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if data:
+        return data
+    results = result.get("results") if isinstance(result.get("results"), list) else []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        resp = item.get("resp") if isinstance(item.get("resp"), dict) else {}
+        nested = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        if nested:
+            return nested
+    return {}
+
+
 def record_outbound_message(db: Session, *, target: str, text: str, provider_result: dict[str, Any] | None = None) -> Message:
     result = provider_result if isinstance(provider_result, dict) else {}
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    data = _extract_provider_result_data(result)
     timestamp = datetime.now()
-    _ensure_chat(db, target, title=target, timestamp=timestamp)
-    _ensure_contact(db, target, name=target)
-    talker_display_name = _resolve_display_name(db, target, fallback=target)
+    existing_chat = db.get(Chat, target)
+    existing_contact = db.get(Contact, target)
+    _ensure_chat(db, target, title=None, timestamp=timestamp)
+    _ensure_contact(db, target, name=None)
+    if existing_chat and str(existing_chat.title or '').strip():
+        talker_display_name = str(existing_chat.title).strip()
+    elif existing_contact and (str(existing_contact.alias or '').strip() or str(existing_contact.name or '').strip()):
+        talker_display_name = _resolve_display_name(db, target, fallback=target)
+    else:
+        talker_display_name = target
     subsession = resolve_gateway_subsession(db, conf=load_config(db), chat_id=target, sender_id=None)
     subsession_meta = None
     if subsession:

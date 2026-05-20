@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy import text as _sql_text
 from typing import List, Any
 from collections import OrderedDict
+from datetime import datetime, timedelta
 from ..db import SessionLocal
 from ..models import Message, Task, Report, ReportArtifact, SyncState, Contact
 from ..schemas import AIReplyRequest, TaskOut
@@ -21,12 +22,21 @@ from ..services.llm_client import (
     DEFAULT_MODULE_PROMPTS,
     DEFAULT_TOOL_PROMPTS,
 )
+from ..services import llm_client as llm_client_service
 from ..services.ai_tools import extract_message_features, build_ai_input_messages
 from ..services.report_artifacts import build_artifact_payloads
 from ..services.snapshot_service import upsert_snapshot
-from ..services.langbot_gateway_client import LangBotGatewayClient
+from ..services.reply_generation import generate_local_reply
 import os
+
+# 媒体采集器数据源 — 运行时按需加载
+try:
+    from ..services.media_collector_store import list_all_items as _list_collector_items
+except Exception:
+    _list_collector_items = None
+
 import time
+import threading
 from urllib.parse import urlparse
 
 
@@ -79,6 +89,9 @@ router = APIRouter(prefix="/api/ai", tags=["ai"])
 # 进程内 LRU 缓存：按 (snapshot_id, module, prompt_hash, temperature) 缓存模块产出
 SUMMARY_CACHE_MAX = int(os.getenv("SUMMARY_CACHE_MAX", "64"))
 SUMMARY_CACHE: "OrderedDict[tuple[object, str, str, float], str]" = OrderedDict()
+SUMMARY_PENDING_TIMEOUT_SECONDS = max(60, int(os.getenv("SUMMARY_PENDING_TIMEOUT_SECONDS", "1800")))
+SUMMARY_RUN_LOCK = threading.Lock()
+SUMMARY_RUN_STATE: dict[str, Any] = {"task_id": None, "started_at": 0.0}
 
 
 def _sanitize_secret_value(value: Any) -> tuple[Any, bool]:
@@ -130,6 +143,178 @@ def _summary_cache_set(key: tuple, value: str) -> None:
                 break
     except Exception:
         pass
+
+
+def _empty_summary_report(modules: list[str] | None = None, text: str = "") -> dict[str, str]:
+    field_map = {
+        "market": "market_markdown",
+        "meetings": "meetings_markdown",
+        "counter": "counter_markdown",
+        "contacts": "top_contacts_markdown",
+        "newswatch": "newswatch_markdown",
+        "socialwatch": "socialwatch_markdown",
+        "mediawatch": "mediawatch_markdown",
+        "mpwatch": "mpwatch_markdown",
+        "minuteswatch": "minuteswatch_markdown",
+    }
+    report = {
+        "market_markdown": "",
+        "meetings_markdown": "",
+        "counter_markdown": "",
+        "top_contacts_markdown": "",
+        "market_html": "",
+        "meetings_html": "",
+        "counter_html": "",
+        "top_contacts_html": "",
+        "newswatch_markdown": "",
+        "socialwatch_markdown": "",
+        "mediawatch_markdown": "",
+        "mpwatch_markdown": "",
+        "minuteswatch_markdown": "",
+    }
+    for module in modules or []:
+        field = field_map.get(module)
+        if field:
+            report[field] = text
+    return report
+
+
+def _load_latest_summary_report(db: Session) -> dict[str, Any] | None:
+    try:
+        latest = db.scalars(select(Report).where(Report.status == "done").order_by(Report.id.desc()).limit(1)).first()
+        if latest and latest.result_body:
+            parsed = json.loads(latest.result_body)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _mark_stale_summary_tasks(
+    db: Session,
+    *,
+    timeout_seconds: int | None = None,
+    now: datetime | None = None,
+) -> list[int]:
+    timeout = max(60, int(timeout_seconds or SUMMARY_PENDING_TIMEOUT_SECONDS))
+    current = now or datetime.utcnow()
+    cutoff = current - timedelta(seconds=timeout)
+    stale_ids: list[int] = []
+    try:
+        rows = db.scalars(select(Task).where(Task.type == "summary", Task.status == "pending")).all()
+    except Exception:
+        return stale_ids
+
+    for row in rows:
+        created_at = row.created_at or current
+        if created_at > cutoff:
+            continue
+        row.status = "failed"
+        row.updated_at = current
+        result = row.result if isinstance(row.result, dict) else {}
+        row.result = {
+            **result,
+            "status": "error",
+            "error": "stale_summary_task_timeout",
+            "detail": f"summary task exceeded {timeout} seconds and was recycled",
+            "task_id": row.id,
+        }
+        db.add(row)
+        stale_ids.append(int(row.id))
+
+    if stale_ids:
+        _commit_with_retry(db, objects=rows)
+    return stale_ids
+
+
+def _latest_pending_summary_task(db: Session) -> Task | None:
+    try:
+        return db.scalars(
+            select(Task).where(Task.type == "summary", Task.status == "pending").order_by(Task.id.desc()).limit(1)
+        ).first()
+    except Exception:
+        return None
+
+
+def _build_summary_busy_result(db: Session, *, modules: list[str], active_task: Task | None = None) -> dict[str, Any]:
+    cached_report = _load_latest_summary_report(db) or _empty_summary_report(modules)
+    active_id = int(getattr(active_task, "id", 0) or 0) or SUMMARY_RUN_STATE.get("task_id")
+    started_at = float(SUMMARY_RUN_STATE.get("started_at") or 0.0)
+    elapsed = max(0, int(time.time() - started_at)) if started_at else None
+    return {
+        "status": "ok",
+        "report": cached_report,
+        "modules": modules,
+        "meta": {
+            "busy": True,
+            "active_task_id": active_id,
+            "elapsed_seconds": elapsed,
+            "message": "已有一项 AI 总结正在运行，已回退到最近一次可用结果。",
+        },
+    }
+
+
+def _persist_task_status(task_id: int, *, status: str, result: dict[str, Any] | None) -> dict[str, Any] | None:
+    try:
+        db = SessionLocal()
+        try:
+            task = db.get(Task, int(task_id))
+            if not task:
+                return None
+            task.status = status
+            task.result = result
+            task.updated_at = datetime.utcnow()
+            db.add(task)
+            _commit_with_retry(db, objects=[task])
+            db.refresh(task)
+            return {"id": int(task.id), "type": str(task.type), "status": str(task.status), "result": task.result}
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def _chat_with_retry(chat_fn, *, max_retries: int = 3, backoff: float = 1.0) -> str | dict:
+    """Wrap siliconflow_chat with exponential-backoff retry; returns {\"__error__\": ...} on all failures."""
+    errors: list[str] = []
+    for attempt in range(max_retries):
+        try:
+            return chat_fn()
+        except Exception as exc:
+            errors.append(f"attempt_{attempt + 1}: {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(backoff * (2 ** attempt))
+    return {"__error__": "; ".join(errors)}
+
+
+def _build_snap_version(snap_id: str, module_key: str, cache_db: Session | None) -> str:
+    """Append snapshot message_count + updated_at to snap_id so cache key is version-aware.
+    This ensures new messages automatically invalidate old cache for non-external modules.
+    External modules (mediawatch/mpwatch/minuteswatch) handle versioning via source_rev separately.
+    """
+    if module_key in {"mediawatch", "mpwatch", "minuteswatch"}:
+        return snap_id  # versioned via source_rev, caller handles this
+    try:
+        from ..models import AnalysisSnapshot
+        if cache_db is not None:
+            snap = cache_db.get(AnalysisSnapshot, snap_id)
+        else:
+            snap = None
+        if snap is None:
+            from ..db import SessionLocal as _SL
+            dbx = _SL()
+            try:
+                snap = dbx.get(AnalysisSnapshot, snap_id)
+            finally:
+                dbx.close()
+        if snap is not None:
+            ts = int(snap.updated_at.timestamp()) if snap.updated_at else 0
+            return f"{snap_id}:v{snap.message_count}:{ts}"
+    except Exception:
+        pass
+    return snap_id
+
 
 
 def _strip_llm_thoughts(text: str) -> str:
@@ -283,81 +468,7 @@ def suggest_replies(body: AIReplyRequest, db: Session = Depends(get_db)):
 @router.post("/reply-local")
 def reply_local(payload: dict, db: Session = Depends(get_db)) -> dict:
     """Generate a single reply locally using SiliconFlow + tool prompt keys (reply_*)."""
-    if not isinstance(payload, dict):
-        raise HTTPException(400, "invalid payload")
-    message_id = payload.get("message_id")
-    message_text = str(payload.get("message_text") or "").strip()
-    operation_type = str(payload.get("operation_type") or "答").strip() or "答"
-    prompt_key = str(payload.get("prompt_key") or "").strip()
-    sender_name = str(payload.get("sender_name") or "").strip()
-    talker_name = str(payload.get("talker_name") or "").strip()
-
-    if not message_text and message_id is not None:
-        try:
-            mid = int(message_id)
-            m = db.get(Message, mid)
-            if m:
-                message_text = str(m.content_text or "").strip()
-                sender_name = sender_name or str(m.sender_name or m.sender_id or "").strip()
-                talker_name = talker_name or str(m.talker_name or m.chat_id or "").strip()
-        except Exception:
-            pass
-
-    if not message_text:
-        raise HTTPException(400, "message_text required")
-
-    conf = load_ai_config()
-    if not conf.get("api_key"):
-        raise HTTPException(400, "SILICONFLOW_API_KEY not configured")
-
-    # Allow choosing different reply prompts (extensible shortcuts in settings)
-    tool_prompts = conf.get("tool_prompts") or {}
-    if not prompt_key:
-        # Default mapping: split built-in "约/问/答" into three independent prompts.
-        if operation_type == "约":
-            prompt_key = "reply_yue"
-        elif operation_type == "问":
-            prompt_key = "reply_wen"
-        else:
-            prompt_key = "reply_da"
-
-    prompt_conf = tool_prompts.get(prompt_key) or DEFAULT_TOOL_PROMPTS.get(prompt_key)
-    if not isinstance(prompt_conf, dict):
-        raise HTTPException(400, f"unknown prompt_key: {prompt_key}")
-    system_prompt = str(prompt_conf.get("system") or "").strip()
-    user_template = str(prompt_conf.get("user") or "").strip()
-    if not system_prompt or not user_template:
-        # fallback to legacy default
-        legacy = tool_prompts.get("reply_generation") or DEFAULT_TOOL_PROMPTS.get("reply_generation") or {}
-        system_prompt = system_prompt or str(legacy.get("system") or "").strip()
-        user_template = user_template or str(legacy.get("user") or "").strip()
-    if not system_prompt or not user_template:
-        raise HTTPException(400, f"prompt_key not configured: {prompt_key}")
-
-    ctx = {
-        "operation_type": operation_type,
-        "sender_name": sender_name,
-        "talker_name": talker_name,
-        "message_text": message_text,
-    }
-    user_prompt = _render_template(user_template, ctx)
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-    model = conf.get("tool_model_messages") or conf.get("tool_model") or conf.get("model") or "Qwen/Qwen3-8B"
-    try:
-        text = siliconflow_chat(
-            messages,
-            temperature=0.2,
-            model_override=model,
-            force_json=False,
-            route_kind="tool",
-            route_key="reply",
-        )
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}
-    reply = (text or "").strip()
-    if reply.startswith("```"):
-        reply = reply.strip("`").strip()
-    return {"status": "ok", "reply": reply}
+    return generate_local_reply(db, payload if isinstance(payload, dict) else {})
 
 
 @router.post("/mass-generate")
@@ -476,6 +587,18 @@ def summary(payload: dict, db: Session = Depends(get_db)):
 
     options = {**options, "modules": modules, "temperature": temperature, "concurrency": concurrency, "force_snapshot": force_snapshot}
 
+    _mark_stale_summary_tasks(db)
+    lock_acquired = SUMMARY_RUN_LOCK.acquire(blocking=False)
+    if not lock_acquired:
+        active_task = _latest_pending_summary_task(db)
+        busy_result = _build_summary_busy_result(db, modules=modules, active_task=active_task)
+        return TaskOut(
+            id=int(getattr(active_task, "id", 0) or 0),
+            type="summary",
+            status="pending",
+            result=busy_result,
+        )
+
     ctx = {
         "request_id": "summary-task",
         "scope": {"message_ids": message_ids, "filters": filters},
@@ -485,11 +608,15 @@ def summary(payload: dict, db: Session = Depends(get_db)):
     }
 
     task = Task(type="summary", payload=ctx, status="pending")
-    db.add(task)
-    _commit_with_retry(db, objects=[task])
-    db.refresh(task)
-
+    response_status = "failed"
+    response_result: dict[str, Any] | None = None
     try:
+        db.add(task)
+        _commit_with_retry(db, objects=[task])
+        db.refresh(task)
+        SUMMARY_RUN_STATE["task_id"] = int(task.id)
+        SUMMARY_RUN_STATE["started_at"] = time.time()
+
         external_modules = {"mediawatch", "mpwatch", "minuteswatch"}
         external_only = bool(modules) and set(modules).issubset(external_modules)
 
@@ -655,8 +782,8 @@ def summary(payload: dict, db: Session = Depends(get_db)):
                 rep.artifacts.append(ReportArtifact(**art_payload))
             db.add(rep)
 
-        task.status = "done" if status == "ok" else "failed"
-        task.result = {
+        response_status = "done" if status == "ok" else "failed"
+        response_result = {
             "status": status,
             "snapshot_id": summary_payload.get("snapshot_id"),
             "report": summary_result,
@@ -670,20 +797,34 @@ def summary(payload: dict, db: Session = Depends(get_db)):
             },
         }
         if artifact_payloads:
-            task.result["artifacts"] = artifact_payloads
-
-        db.add(task)
-        _commit_with_retry(db, objects=[task])
-        db.refresh(task)
+            response_result["artifacts"] = artifact_payloads
+        try:
+            tracked_objects: list[Any] = []
+            if status == "ok":
+                tracked_objects.append(rep)
+            _commit_with_retry(db, objects=tracked_objects)
+        except Exception as persist_exc:
+            warnings = response_result.setdefault("warnings", [])
+            if isinstance(warnings, list):
+                warnings.append(f"report_persist_warning: {persist_exc}")
     except Exception as e:
         db.rollback()
-        task.status = "failed"
-        task.result = {"error": str(e)}
-        db.add(task)
-        _commit_with_retry(db, objects=[task])
-        db.refresh(task)
+        response_status = "failed"
+        response_result = {"status": "error", "error": str(e)}
+    finally:
+        persisted = _persist_task_status(int(getattr(task, "id", 0) or 0), status=response_status, result=response_result)
+        SUMMARY_RUN_STATE["task_id"] = None
+        SUMMARY_RUN_STATE["started_at"] = 0.0
+        SUMMARY_RUN_LOCK.release()
 
-    return TaskOut(id=task.id, type=task.type, status=task.status, result=task.result)
+    if persisted:
+        return TaskOut(**persisted)
+    return TaskOut(
+        id=int(getattr(task, "id", 0) or 0),
+        type="summary",
+        status=response_status,
+        result=response_result,
+    )
 
 
 @router.get("/config")
@@ -693,8 +834,8 @@ def get_ai_config():
     analysis_defaults = conf.get("analysis_defaults") or {}
     ui_prefs = conf.get("ui_prefs") or {}
     send_provider = str(conf.get("send_provider") or "").strip()
-    if send_provider not in {"langbot_gateway", "wechatpad_direct"}:
-        send_provider = "langbot_gateway" if str(conf.get("langbot_gateway_bot_uuid") or "").strip() else "wechatpad_direct"
+    if send_provider not in {"wechatpad_direct", "wechatapi_gateway"}:
+        send_provider = "wechatapi_gateway"
     allow_code_digits = conf.get("mass_name_allow_code_digits")
     allow_code_digits = True if allow_code_digits is None else bool(allow_code_digits)
     return {
@@ -714,11 +855,8 @@ def get_ai_config():
         "wechatpad_sync_enabled": bool(conf.get("wechatpad_sync_enabled") or False),
         "wechatpad_sync_poll_seconds": int(conf.get("wechatpad_sync_poll_seconds") or 30),
         "wechatpad_sync_ws_heartbeat_seconds": int(conf.get("wechatpad_sync_ws_heartbeat_seconds") or 30),
-        # Send (LangBot send-gateway) config
+        # Send (wechat gateway / direct fallback) config
         "send_provider": send_provider,
-        "langbot_gateway_base": conf.get("langbot_gateway_base") or "",
-        "langbot_gateway_bot_uuid": conf.get("langbot_gateway_bot_uuid") or "",
-        "langbot_gateway_has_token": bool(conf.get("langbot_gateway_auth_token") or ""),
         # Mass send config (persisted)
         "mass_send_targets": conf.get("mass_send_targets") or [],
         "mass_send_template": conf.get("mass_send_template") or "",
@@ -734,6 +872,10 @@ def get_ai_config():
         "tool_prompts": conf.get("tool_prompts", {}),
         "default_tool_prompts": DEFAULT_TOOL_PROMPTS,
         "model_router": _sanitize_model_router_for_ui(conf.get("model_router") or {}),
+        "onepage_temperature": conf.get("onepage_temperature", 0.35),
+        "onepage_template_style": conf.get("onepage_template_style") or "executive_blue",
+        "onepage_prompt": _get_onepage_config(conf).get("prompt"),
+        "default_onepage_prompt": _default_onepage_prompt(),
         "analysis_defaults": {
             # 默认包含新闻舆情模块（默认必出）
             "modules": analysis_defaults.get("modules") or ["market", "meetings", "counter", "contacts", "newswatch", "mediawatch", "mpwatch", "minuteswatch"],
@@ -750,8 +892,42 @@ def get_ai_config():
 
 @router.post("/config")
 def set_ai_config(conf: dict):
+    def _merge_router_channel_secrets(existing_router: dict, incoming_router: dict) -> dict:
+        merged_router = dict(incoming_router or {})
+        for field in ("main_channels", "mid_channels", "tool_channels"):
+            incoming_channels = merged_router.get(field)
+            if not isinstance(incoming_channels, list):
+                continue
+            existing_channels = existing_router.get(field) if isinstance(existing_router, dict) else []
+            existing_by_id: dict[str, dict] = {}
+            if isinstance(existing_channels, list):
+                for item in existing_channels:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = str(item.get("id") or "").strip()
+                    if cid:
+                        existing_by_id[cid] = item
+
+            patched: list[dict] = []
+            for item in incoming_channels:
+                if not isinstance(item, dict):
+                    continue
+                row = dict(item)
+                cid = str(row.get("id") or "").strip()
+                key_text = str(row.get("api_key") or "").strip()
+                keep_existing = bool(row.get("has_api_key")) and not key_text
+                if keep_existing and cid:
+                    old = existing_by_id.get(cid) or {}
+                    old_key = str(old.get("api_key") or "").strip()
+                    if old_key:
+                        row["api_key"] = old_key
+                row.pop("has_api_key", None)
+                patched.append(row)
+            merged_router[field] = patched
+        return merged_router
+
     merged = load_ai_config()
-    for key in ("api_key", "api_url", "model", "tool_model", "tool_model_messages", "tool_model_emails"):
+    for key in ("api_key", "api_url", "model", "main_model", "tool_model", "tool_model_messages", "tool_model_emails", "onepage_template_style"):
         if key in conf and conf[key] is not None:
             merged[key] = conf[key]
     # Allow frontend to configure WeChatPadPro endpoint without editing .env
@@ -786,33 +962,11 @@ def set_ai_config(conf: dict):
         except Exception:
             pass
 
-    # Send provider (LangBot gateway vs direct)
+    # Send provider (gateway vs direct fallback)
     if "send_provider" in conf and conf["send_provider"] is not None:
         v = str(conf.get("send_provider") or "").strip()
-        if v in {"langbot_gateway", "wechatpad_direct"}:
+        if v in {"wechatpad_direct", "wechatapi_gateway"}:
             merged["send_provider"] = v
-    if "langbot_gateway_base" in conf and conf["langbot_gateway_base"] is not None:
-        merged["langbot_gateway_base"] = str(conf.get("langbot_gateway_base") or "").strip().rstrip("/")
-    if "langbot_gateway_bot_uuid" in conf and conf["langbot_gateway_bot_uuid"] is not None:
-        raw = str(conf.get("langbot_gateway_bot_uuid") or "").strip()
-        if raw:
-            try:
-                base = str(merged.get("langbot_gateway_base") or "").strip().rstrip("/") or None
-                token = str(merged.get("langbot_gateway_auth_token") or "").strip() or None
-                client = LangBotGatewayClient(base=base, bot_uuid=raw, auth_token=token)
-                raw = client.canonicalize_bot_uuid(raw)
-            except Exception:
-                pass
-        merged["langbot_gateway_bot_uuid"] = raw
-    if "langbot_gateway_auth_token" in conf and conf["langbot_gateway_auth_token"] is not None:
-        raw = str(conf.get("langbot_gateway_auth_token") or "")
-        # Allow clearing with empty string. If the UI sends a masked placeholder, keep existing.
-        if not raw.strip():
-            merged["langbot_gateway_auth_token"] = ""
-        elif raw.strip().startswith("***"):
-            pass
-        else:
-            merged["langbot_gateway_auth_token"] = raw.strip()
 
     # Mass send config
     if "mass_send_targets" in conf and conf["mass_send_targets"] is not None:
@@ -913,6 +1067,22 @@ def set_ai_config(conf: dict):
         up.update({k: v for k, v in conf["ui_prefs"].items()})
         merged["ui_prefs"] = up
 
+    if "onepage_temperature" in conf:
+        try:
+            t = float(conf.get("onepage_temperature") or 0.35)
+            merged["onepage_temperature"] = 0.0 if t < 0 else (1.0 if t > 1 else t)
+        except Exception:
+            pass
+    if "onepage_prompt" in conf and isinstance(conf["onepage_prompt"], dict):
+        current = merged.get("onepage_prompt") if isinstance(merged.get("onepage_prompt"), dict) else {}
+        updated = dict(current)
+        incoming = conf["onepage_prompt"]
+        if isinstance(incoming.get("system"), str):
+            updated["system"] = incoming.get("system")
+        if isinstance(incoming.get("user"), str):
+            updated["user"] = incoming.get("user")
+        merged["onepage_prompt"] = updated
+
     if "module_prompts" in conf and isinstance(conf["module_prompts"], dict):
         stored = merged.get("module_prompts", {})
         incoming = conf["module_prompts"]
@@ -968,6 +1138,7 @@ def set_ai_config(conf: dict):
         merged["tool_prompts"] = stored_tool
     if "model_router" in conf and isinstance(conf["model_router"], dict):
         current_router = merged.get("model_router") if isinstance(merged.get("model_router"), dict) else {}
+        incoming_router = _merge_router_channel_secrets(current_router, conf["model_router"])
         updated_router = dict(current_router)
         for field in (
             "enabled",
@@ -984,8 +1155,8 @@ def set_ai_config(conf: dict):
             "mid_route_channels",
             "tool_route_channels",
         ):
-            if field in conf["model_router"]:
-                updated_router[field] = conf["model_router"][field]
+            if field in incoming_router:
+                updated_router[field] = incoming_router[field]
         merged["model_router"] = updated_router
     save_ai_config(merged)
     return {"status": "ok"}
@@ -1119,7 +1290,7 @@ def _run_summary_local(payload: dict) -> dict:
             use_llm_external_modules = bool((req_opts or {}).get("use_llm_external_modules", False))
         except Exception:
             use_llm_external_modules = False
-        # 强化“高评分联系人”提示词：禁止模型自行打分，评分来自系统
+        # 强化"高评分联系人"提示词：禁止模型自行打分，评分来自系统
         try:
             cp = module_prompts.get('contacts') or {}
             if isinstance(cp, dict):
@@ -1132,7 +1303,7 @@ def _run_summary_local(payload: dict) -> dict:
                 if '评分来自系统' not in user_p:
                     cp['user'] = (
                         '请输出 JSON 对象 {"markdown": string}：\n'
-                        '# 高评分联系人摘要\n'
+                        '# 高评分分析师摘要\n'
                         '（评分≥60，按评分降序排列）\n\n'
                         '## <姓名或别名> (评分 <x.x>)\n'
                         '- 核心观点：<一句话概括> #<id>\n'
@@ -1168,7 +1339,7 @@ def _run_summary_local(payload: dict) -> dict:
             except Exception:
                 pass
 
-        # 使用消息的“摘要列（derived.summary）”作为大模型输入上下文，避免传入完整正文，节省 token
+        # 使用消息的"摘要列（derived.summary）"作为大模型输入上下文，避免传入完整正文，节省 token
         enriched_messages = []
         for m in msgs[:2000]:
             # 从derived中提取summary字段
@@ -1226,7 +1397,7 @@ def _run_summary_local(payload: dict) -> dict:
 
         sorted_messages = sorted(enriched_messages, key=_sort_key, reverse=True)
 
-        # —— 按模块预过滤，降低无关噪声并保证“遍历所有消息后再总结”的语义 ——
+        # —— 按模块预过滤，降低无关噪声并保证"遍历所有消息后再总结"的语义 ——
         meeting_terms = ("会议", "路演", "电话会", "报名", "通知", "腾讯会议", "进门财经", "Zoom", "Teams")
         market_terms = ("认为", "观点", "策略", "看多", "看空", "判断", "建议", "风险", "目标价", "估值", "行业", "公司", "基本面", "宏观", "政策")
 
@@ -1370,7 +1541,7 @@ def _run_summary_local(payload: dict) -> dict:
                 continue
             detail = contacts_raw.get(cid) or {}
             display = detail.get("name") or detail.get("alias") or cid
-            # 跳过仅有 wxid_ 而无真实姓名/别名的联系人，避免在“高评分联系人”模块展示微信ID
+            # 跳过仅有 wxid_ 而无真实姓名/别名的联系人，避免在"高评分联系人"模块展示微信ID
             if (not (detail.get("name") or detail.get("alias"))) and str(display).startswith("wxid_"):
                 continue
             ordered_msgs = sorted(contact_msgs, key=lambda x: _iso(x.get("time")), reverse=True)
@@ -1433,13 +1604,52 @@ def _run_summary_local(payload: dict) -> dict:
             "market": "市场观点总结",
             "meetings": "会议路演信息",
             "counter": "分歧观点分析",
-            "contacts": "高评分联系人摘要",
+            "contacts": "高评分分析师摘要",
             "newswatch": "新闻舆情监测",
             "socialwatch": "自媒体舆情监测",
-            "mediawatch": "自媒体聚合摘要",
-            "mpwatch": "公众号聚合摘要",
-            "minuteswatch": "会议聚合摘要",
+            "mediawatch": "自媒体引擎摘要",
+            "mpwatch": "公众号引擎摘要",
+            "minuteswatch": "会议引擎摘要",
         }
+
+        def _looks_cross_module_output(module_key: str, text: str) -> bool:
+            raw = str(text or "").strip()
+            if not raw:
+                return False
+            if raw.lstrip().startswith("<"):
+                return False
+
+            expected = str(module_titles.get(module_key) or "").strip()
+            if not expected:
+                return False
+
+            def _norm(v: str) -> str:
+                return re.sub(r"\s+", "", str(v or "")).strip()
+
+            first_line = ""
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                stripped = re.sub(r"^[#>\-\*\d\.\)\s]+", "", stripped).strip()
+                if stripped:
+                    first_line = stripped
+                    break
+            if not first_line:
+                return False
+
+            first_norm = _norm(first_line)
+            expected_norm = _norm(expected)
+            if expected_norm and expected_norm in first_norm:
+                return False
+
+            for other_key, title in module_titles.items():
+                if other_key == module_key:
+                    continue
+                title_norm = _norm(title)
+                if title_norm and title_norm in first_norm:
+                    return True
+            return False
 
         html_result_map = {
             "market": "market_html",
@@ -1535,7 +1745,7 @@ def _run_summary_local(payload: dict) -> dict:
 
         def _render_external_module_md(module_key: str, rows: list[dict]) -> str:
             if module_key == "mediawatch":
-                lines: list[str] = ["# 自媒体聚合摘要"]
+                lines: list[str] = ["# 自媒体引擎摘要"]
                 if not rows:
                     lines.append("暂无数据。")
                     return "\n".join(lines)
@@ -1576,7 +1786,7 @@ def _run_summary_local(payload: dict) -> dict:
                 return "\n".join(lines)
 
             if module_key == "mpwatch":
-                lines = ["# 公众号聚合摘要"]
+                lines = ["# 公众号引擎摘要"]
                 if not rows:
                     lines.append("暂无数据。")
                     return "\n".join(lines)
@@ -1609,7 +1819,7 @@ def _run_summary_local(payload: dict) -> dict:
                 return "\n".join(lines)
 
             if module_key == "minuteswatch":
-                lines = ["# 会议聚合摘要"]
+                lines = ["# 会议引擎摘要"]
                 if not rows:
                     lines.append("暂无数据。")
                     return "\n".join(lines)
@@ -1704,7 +1914,7 @@ def _run_summary_local(payload: dict) -> dict:
             system_prompt = prompt_conf.get("system") or defaults.get("system") or ""
             user_template = prompt_conf.get("user") or defaults.get("user") or ""
             module_payload = base_payload.copy()
-            # 为不同模块选择更相关的子集，既覆盖“全部消息”，又避免无关噪声
+            # 为不同模块选择更相关的子集，既覆盖"全部消息"，又避免无关噪声
             if module_key == "meetings":
                 source = [m for m in sorted_messages if _is_meeting(m)] or sorted_messages
                 module_payload["messages"] = _compact(source, prefer_meetings=True, limit=250)
@@ -1730,13 +1940,10 @@ def _run_summary_local(payload: dict) -> dict:
             elif module_key == "newswatch":
                 # 舆情分析读取直接新闻源，而非聊天消息
                 try:
-                    from ..services.news_client import direct_from_sources_json, normalize_items, _load_source_whitelist
-                    direct = direct_from_sources_json(limit=120)
-                    # 使用来源白名单优先过滤；若白名单非空，则不再二次按关键词过滤 finance_only
-                    wl = _load_source_whitelist()
-                    fo = False if wl else True
-                    norm = normalize_items({"success": True, "data": direct.get("items", [])}, finance_only=fo, whitelist=wl)
-                    raw_items = norm.get("items") or []
+                    from ..services.news_engine import engine_payload
+                    news_payload = engine_payload(limit=120)
+                    raw_items = news_payload.get("items") or []
+                    module_payload["trend_analysis"] = news_payload.get("analysis") or {}
                     # 仅保留近72小时内的新闻，优先覆盖最新的重要事件
                     from time import time as _time
                     now_ms = int(_time() * 1000)
@@ -1757,14 +1964,44 @@ def _run_summary_local(payload: dict) -> dict:
                 except Exception:
                     module_payload["messages"] = []
             elif module_key == "mediawatch":
-                # 自媒体聚合：读取 Media 项目落盘 JSON（data/results/*.json），优先使用 summary/transcript
+                # 自媒体引擎：读取 media-collector 落盘 JSON + MediaCrawlerPro 兼容
                 try:
-                    from ..services.media_store import list_media_items
-                    data = list_media_items(limit=200)
-                    items = data.get("items") or []
-                    rev = max((int(it.get("source_mtime") or 0) for it in items), default=0)
+                    from ..services.media_store import list_media_items as list_legacy
+
+                    all_items = []
+                    
+                    # 优先读取 media-collector 新数据
+                    if _list_collector_items:
+                        try:
+                            cdata = _list_collector_items(limit=200)
+                            all_items.extend(cdata.get("items") or [])
+                        except Exception as e:
+                            import logging
+                            logging.getLogger("ai").warning(f"media-collector load failed: {e}")
+
+                    # 补充旧 MediaCrawlerPro 数据
+                    try:
+                        ldata = list_media_items(limit=80)
+                        all_items.extend(ldata.get("items") or [])
+                    except Exception:
+                        pass
+
+                    # 合并去重
+                    seen_urls = set()
+                    unique = []
+                    for it in all_items:
+                        url = it.get("url", "")
+                        if url and url in seen_urls:
+                            continue
+                        if url:
+                            seen_urls.add(url)
+                        unique.append(it)
+
+                    unique.sort(key=lambda x: x.get("source_mtime", 0), reverse=True)
+
+                    rev = max((int(it.get("source_mtime") or 0) for it in unique), default=0)
                     msgs = []
-                    for it in items[:120]:
+                    for it in unique[:120]:
                         msgs.append(
                             {
                                 "channel": "media",
@@ -1772,28 +2009,71 @@ def _run_summary_local(payload: dict) -> dict:
                                 "time": it.get("time"),
                                 "sender": it.get("author") or "",
                                 "sender_name": it.get("author") or "",
-                                "talker_name": it.get("platform") or "",
-                                "type": "media",
-                                "content": it.get("summary") or it.get("title") or "",
-                                "content_text": it.get("summary") or it.get("title") or "",
-                                "meta": {"url": it.get("url") or "", "title": it.get("title") or "", "stats": it.get("stats") or {}},
+                                "talker_name": f"{it.get('platform','')} {it.get('keyword','')}".strip(),
+                                "type": it.get("source_type", "media"),
+                                "content": it.get("title") or "",
+                                "content_text": it.get("title") or "",
+                                "meta": {
+                                    "url": it.get("url") or "",
+                                    "title": it.get("title") or "",
+                                    "heat": it.get("heat") or 0,
+                                    "stats": it.get("stats") or {},
+                                    "source": it.get("source_type", "hot"),
+                                    "keyword": it.get("keyword", ""),
+                                },
                             }
                         )
                     module_payload["messages"] = msgs
-                    module_payload["meta"] = {**(module_payload.get("meta") or {}), "source_rev": rev}
-                except Exception:
+                    module_payload["meta"] = {
+                        **(module_payload.get("meta") or {}),
+                        "source_rev": rev,
+                    }
+                except Exception as e:
+                    import logging
+                    logging.getLogger("ai").error(f"mediawatch payload build error: {e}")
                     module_payload["messages"] = []
             elif module_key == "mpwatch":
-                # 公众号聚合：读取 we-mp-rss 的 sqlite（articles + feeds + insights）
+                # 公众号引擎：读取 we-mp-rss 的 sqlite（articles + feeds + insights）
                 try:
                     from ..services.mp_rss_store import list_mp_articles, _default_we_mp_rss_db
-                    res = list_mp_articles(limit=200, offset=0, q=None)
+
+                    mp_cfg: dict[str, Any] = {}
+                    try:
+                        row = None
+                        if isinstance(cache_db, Session):
+                            row = cache_db.get(SyncState, "mp_config")
+                        if row is None:
+                            from ..db import SessionLocal as _SL
+                            dbx = _SL()
+                            try:
+                                row = dbx.get(SyncState, "mp_config")
+                            finally:
+                                dbx.close()
+                        if row and row.value:
+                            parsed = json.loads(row.value)
+                            if isinstance(parsed, dict):
+                                mp_cfg = parsed
+                    except Exception:
+                        mp_cfg = {}
+
+                    res = list_mp_articles(
+                        limit=120,
+                        offset=0,
+                        q=None,
+                        db_path=str(mp_cfg.get("db_path") or "").strip() or None,
+                        upstream_base_url=str(mp_cfg.get("upstream_base_url") or mp_cfg.get("base_url") or "").strip() or None,
+                        upstream_auth_token=str(mp_cfg.get("upstream_auth_token") or mp_cfg.get("auth_token") or "").strip() or None,
+                    )
                     items = res.get("items") or []
                     # cache rev = db mtime
                     rev = 0
                     try:
-                        dbp = _default_we_mp_rss_db()
-                        rev = int(dbp.stat().st_mtime) if dbp and dbp.exists() else 0
+                        src = res.get("source") if isinstance(res, dict) else None
+                        if isinstance(src, dict):
+                            rev = int(src.get("mtime") or 0)
+                        if not rev:
+                            dbp = _default_we_mp_rss_db()
+                            rev = int(dbp.stat().st_mtime) if dbp and dbp.exists() else 0
                     except Exception:
                         rev = 0
                     msgs = []
@@ -1817,7 +2097,7 @@ def _run_summary_local(payload: dict) -> dict:
                 except Exception:
                     module_payload["messages"] = []
             elif module_key == "minuteswatch":
-                # 会议聚合：读取当前项目本地 minutes（data/minutes + data/recordings）
+                # 会议引擎：读取当前项目本地 minutes（data/minutes + data/recordings）
                 try:
                     from ..routers.minutes import list_minutes as _list_minutes
 
@@ -1904,6 +2184,7 @@ def _run_summary_local(payload: dict) -> dict:
                         chunks.append(chunk)
 
                     partial_markdowns: list[str] = []
+                    partial_errors: list[str] = []
                     for idx, ch in enumerate(chunks[:6]):  # 最多6片，避免长时间调用
                         cp = module_payload.copy()
                         cp["messages"] = ch
@@ -1916,17 +2197,21 @@ def _run_summary_local(payload: dict) -> dict:
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_content},
                         ]
-                        try:
-                            part = siliconflow_chat(
-                                messages_payload,
+                        raw = _chat_with_retry(
+                            lambda _mp=_messages_payload: siliconflow_chat(
+                                _mp,
                                 temperature=temperature,
                                 route_kind="main",
                                 route_key=module_key,
-                            )
-                        except Exception:
-                            part = ""
-                        if part:
-                            partial_markdowns.append(_strip_llm_thoughts(part))
+                            ),
+                        )
+                        if isinstance(raw, dict) and "__error__" in raw:
+                            partial_errors.append(f"chunk_{idx}: {raw['__error__']}")
+                        elif raw:
+                            partial_markdowns.append(_strip_llm_thoughts(raw))
+
+                    if partial_errors:
+                        result["_partial_errors"] = result.get("_partial_errors", []) + partial_errors
 
                     if partial_markdowns:
                         # 合并阶段：将多段 markdown 汇总为最终 markdown
@@ -1979,21 +2264,24 @@ def _run_summary_local(payload: dict) -> dict:
 
             # ===== 增量缓存命中检查 =====
             try:
-                snap_id = payload.get("snapshot_id")
-                # 对外部聚合模块：把数据源版本纳入缓存 key，避免“数据更新但命中旧缓存”
+                raw_snap_id = payload.get("snapshot_id")
+                # 对外部引擎模块：把数据源版本纳入缓存 key，避免"数据更新但命中旧缓存"
                 try:
                     rev = (module_payload.get("meta") or {}).get("source_rev")
                     if module_key in {"mediawatch", "mpwatch", "minuteswatch"} and rev:
-                        snap_id = f"{snap_id}:{module_key}:{int(rev)}"
+                        snap_id = f"{raw_snap_id}:{module_key}:{int(rev)}"
+                    else:
+                        # 纳入 snapshot.message_count + updated_at，使缓存感知消息增量
+                        snap_id = _build_snap_version(raw_snap_id, module_key, cache_db)
                 except Exception:
-                    pass
+                    snap_id = raw_snap_id
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 cached = _summary_cache_get(cache_key)
                 if not cached:
                     # 持久化缓存：SyncState("summary_cache:<...>")
                     db_key = f"summary_cache:{snap_id}:{module_key}:{ph}:{float(temperature):.2f}"
-                cached = _persistent_cache_get(db_key)
+                    cached = _persistent_cache_get(db_key)
                 if cached:
                     _summary_cache_set(cache_key, cached)
                 if cached:
@@ -2016,12 +2304,21 @@ def _run_summary_local(payload: dict) -> dict:
             ]
 
             try:
-                output_text = siliconflow_chat(
-                    messages_payload,
-                    temperature=temperature,
-                    route_kind="main",
-                    route_key=module_key,
+                # 模块级重试：网络抖动 / 模型限流时最多重试 3 次，记录所有失败原因
+                raw_output = _chat_with_retry(
+                    lambda: siliconflow_chat(
+                        messages_payload,
+                        temperature=temperature,
+                        route_kind="main",
+                        route_key=module_key,
+                    )
                 )
+                if isinstance(raw_output, dict) and "__error__" in raw_output:
+                    # 记录错误但不中断，其他模块继续执行；前端可通过 _module_errors 感知
+                    result[f"_{module_key}_error"] = raw_output["__error__"]
+                    result[result_key] = ""
+                    continue
+                output_text = raw_output  # type: ignore[assignment]
             except Exception as exc:  # pragma: no cover
                 result[result_key] = ""
                 # 不中断，让后续使用本地兜底生成
@@ -2059,16 +2356,26 @@ def _run_summary_local(payload: dict) -> dict:
                 if hk and text_out and text_out.lstrip().startswith("<"):
                     result[hk] = text_out
 
+            if _looks_cross_module_output(module_key, result.get(result_key) or ""):
+                result[f"_{module_key}_error"] = "cross_module_output_mismatch"
+                result[result_key] = ""
+                hk = html_result_map.get(module_key)
+                if hk:
+                    result[hk] = ""
+                continue
+
             _ensure_heading(module_key, result_key, html_result_map.get(module_key))
-            # 写入缓存
+            # 写入缓存（使用与命中检查一致的 versioned snap_id）
             try:
-                snap_id = payload.get("snapshot_id")
+                raw_snap_id = payload.get("snapshot_id")
                 try:
                     rev = (module_payload.get("meta") or {}).get("source_rev")
                     if module_key in {"mediawatch", "mpwatch", "minuteswatch"} and rev:
-                        snap_id = f"{snap_id}:{module_key}:{int(rev)}"
+                        snap_id = f"{raw_snap_id}:{module_key}:{int(rev)}"
+                    else:
+                        snap_id = _build_snap_version(raw_snap_id, module_key, cache_db)
                 except Exception:
-                    pass
+                    snap_id = raw_snap_id
                 ph = sha1(((system_prompt or '') + '\n' + (user_template or '')).encode('utf-8', 'ignore')).hexdigest()[:12]
                 cache_key = (snap_id, module_key, ph, float(temperature))
                 _summary_cache_set(cache_key, result[result_key])
@@ -2234,11 +2541,11 @@ def _run_summary_local(payload: dict) -> dict:
             return dt.strftime("%m-%d %H:%M")
 
         def _extract_time_from_text(text: str) -> str | None:
-            """从正文中提取“会议时间”，而不是消息发送时间。
+            """从正文中提取"会议时间"，而不是消息发送时间。
 
             支持模式：
             - 9-24 19:30 / 09-24 19:30 / 9月24日 19:30 / 9/24 19:30
-            - “今晚/今天/明天 xx:xx” 等，仅时间时默认使用当天日期。
+            - "今晚/今天/明天 xx:xx" 等，仅时间时默认使用当天日期。
             """
             import re as _re
             t = (text or "").strip()
@@ -2393,7 +2700,7 @@ def _run_summary_local(payload: dict) -> dict:
         def _build_contacts_md() -> str:
             lines = []
             if not high_contacts:
-                lines.append("- 近3天暂无评分≥60分且活跃的联系人")
+                lines.append("- 近3天暂无评分≥60分且活跃的分析师")
                 return "\n".join(lines)
             for idx, c in enumerate(high_contacts[:20], 1):
                 sender = c.get("name") or c.get("alias") or c.get("sender") or c.get("cid")
@@ -2409,7 +2716,7 @@ def _run_summary_local(payload: dict) -> dict:
                     })
                 if not msg_entries:
                     continue
-                lines.append(f"【联系人{idx}】{sender}（评分 {rating:.1f}）")
+                lines.append(f"【分析师{idx}】{sender}（评分 {rating:.1f}）")
                 primary = msg_entries[0]
                 badge = f" (#{primary['id']})" if primary.get("id") else ""
                 lines.append(f"- 核心观点：{primary['text']}{badge}")
@@ -2482,7 +2789,7 @@ def _run_summary_local(payload: dict) -> dict:
 
         def _build_contacts_html() -> str:
             if not high_contacts:
-                return "<p>近3天暂无评分≥60分且活跃的联系人。</p>"
+                return "<p>近3天暂无评分≥60分且活跃的分析师。</p>"
             cards: list[str] = []
             for idx, c in enumerate(high_contacts[:20], 1):
                 sender = c.get("name") or c.get("alias") or c.get("sender") or c.get("cid")
@@ -2498,7 +2805,7 @@ def _run_summary_local(payload: dict) -> dict:
                 if not msg_rows:
                     continue
                 cards.append(
-                    f"<section class=\"contact-card\"><div class=\"section-label\">【联系人{idx}】{html.escape(sender)}（评分 {rating:.1f}）</div><ul>{''.join(msg_rows)}</ul></section>"
+                    f"<section class=\"contact-card\"><div class=\"section-label\">【分析师{idx}】{html.escape(sender)}（评分 {rating:.1f}）</div><ul>{''.join(msg_rows)}</ul></section>"
                 )
             return "".join(cards)
 
@@ -2545,13 +2852,13 @@ def _run_summary_local(payload: dict) -> dict:
             result["top_contacts_markdown"] = _build_contacts_md()
             result["top_contacts_html"] = _build_contacts_html()
 
-        # Newswatch 本地兜底：当大模型返回为空时，使用直接聚合构造基础舆情摘要
+        # Newswatch 本地兜底：当大模型返回为空时，使用直接汇总构造基础舆情摘要
         if "newswatch" in module_filter and not result.get("newswatch_markdown"):
             try:
-                from ..services.news_client import direct_from_sources_json, normalize_items
-                d = direct_from_sources_json(limit=60)
-                norm = normalize_items({"success": True, "data": d.get("items", [])}, finance_only=True)
-                items = norm.get("items") or []
+                from ..services.news_engine import engine_payload
+                news_payload = engine_payload(limit=60)
+                items = news_payload.get("items") or []
+                analysis = news_payload.get("analysis") or {}
                 if items:
                     cat_counter = Counter((it.get("category") or "其他") for it in items)
                     src_counter = Counter((it.get("source_name") or it.get("source_id") or "未知") for it in items)
@@ -2574,7 +2881,7 @@ def _run_summary_local(payload: dict) -> dict:
                         return _short(t, 120)
 
                     lines: list[str] = [
-                        f"数据概览：共 {len(items)} 条，来源 {len(src_counter)} 家；类别分布：宏观 {cat_counter.get('宏观', 0)}、行业 {cat_counter.get('行业', 0)}、个股 {cat_counter.get('个股', 0)} 条。"
+                        f"数据概览：内置新闻引擎共监测 {len(items)} 条，来源 {len(src_counter)} 家；热度速度 {analysis.get('velocity', 0)}%，情绪净值 {analysis.get('sentiment_score', 0)}。"
                     ]
                     pos = tone_counter.get("positive", 0)
                     neg = tone_counter.get("negative", 0)
@@ -2587,13 +2894,22 @@ def _run_summary_local(payload: dict) -> dict:
                         lines.append(
                             f"【新闻主题{idx}】{theme}（{len(arr)}条，主要来自 {', '.join(srcs)}）：{_clean_title(sample.get('title') or '')}"
                         )
-                    lines.append("【关注动作】结合舆情热点，梳理对交易/仓位的影响，并追踪政策或数据验证节点；对负面舆情较集中的议题，安排快速核实或舆论监测，防范扩散风险。")
+                    if analysis.get('prediction'):
+                        lines.append(f"趋势预测：{analysis.get('prediction')}")
+                    lines.append("【关注动作】把新闻主题输入 AI 推理链路，结合情绪净值、热度速度与机会/风险信号，判断其对交易、仓位和客户沟通优先级的影响。")
                     result["newswatch_markdown"] = "\n".join(lines)
             except Exception:
                 pass
 
         active_modules = [m for m in module_map.keys() if m in module_filter]
-        return {"status": "ok", "result": result, "modules": active_modules, "temperature": temperature, "meta": base_payload.get("meta") or {}}
+        return {
+            "status": "ok",
+            "result": result,
+            "modules": active_modules,
+            "temperature": temperature,
+            "meta": base_payload.get("meta") or {},
+            "_partial_errors": result.get("_partial_errors") or [],
+        }
     except Exception as exc:  # pragma: no cover
         safe = html.escape(str(exc))
         err_markdown = f"**summary-local error:** {safe}"
@@ -2609,6 +2925,58 @@ def _run_summary_local(payload: dict) -> dict:
         }
         return {"status": "error", "result": empty, "modules": [m for m in module_filter], "temperature": temperature}
 
+
+
+@router.post("/onepage")
+def generate_onepage(payload: dict) -> dict:
+    conf = load_ai_config()
+    cfg = _get_onepage_config(conf)
+    sections = payload.get("sections") if isinstance(payload, dict) else []
+    if not isinstance(sections, list):
+        sections = []
+    period = str((payload or {}).get("period") or "最近").strip()
+    template_style = str((payload or {}).get("template_style") or cfg.get("template_style") or "executive_blue").strip()
+    safe_sections = []
+    for item in sections[:12]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("module") or "模块").strip()[:80]
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        safe_sections.append({"module": str(item.get("module") or ""), "title": title, "text": text[:6000]})
+    if not safe_sections:
+        raise HTTPException(400, "empty sections")
+    import json as _json
+    system_prompt = str(cfg["prompt"].get("system") or _default_onepage_prompt()["system"])
+    user_tpl = str(cfg["prompt"].get("user") or _default_onepage_prompt()["user"])
+    sections_json = _json.dumps(safe_sections, ensure_ascii=False, indent=2)
+    user_prompt = (user_tpl
+        .replace("{period}", period)
+        .replace("{template_style}", template_style)
+        .replace("{sections_json}", sections_json))
+    try:
+        output = siliconflow_chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            temperature=float(conf.get("onepage_temperature") if conf.get("onepage_temperature") is not None else 0.35),
+            model_override=None,
+            route_kind="main",
+            route_key="onepage",
+        )
+        raw = str(output or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        parsed = _json.loads(raw[start:end+1] if start >= 0 and end > start else raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("onepage result is not object")
+        parsed.setdefault("sections", [])
+        return {"status": "ok", "result": parsed, "model": cfg.get("model"), "template_style": template_style}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "fallback": True}
 
 @router.post("/summary-local")
 def summary_local(payload: dict):
@@ -2653,6 +3021,42 @@ def _markdown_to_html(markdown_text: str) -> str:
 
     close_list()
     return "\n".join(html_parts)
+
+
+def _default_onepage_prompt() -> dict[str, str]:
+    return {
+        "system": (
+            "你是一名资深投研产品经理、财经信息架构师和信息图设计导演。"
+            "你的任务不是拼接材料，而是把多个情报模块二次提炼为可直接用于一页通海报的结构化报告。"
+            "必须中文输出，强调结论、证据、趋势、分歧、风险和行动。"
+        ),
+        "user": (
+            "请基于以下 AI 分析模块内容，生成一份一页通结构化 JSON。\n"
+            "要求：\n"
+            "1. 严格输出 JSON，不要 Markdown，不要代码块。\n"
+            "2. 固定 7 个章节：核心结论、市场主线、新闻趋势、会议路演、分歧与风险、自媒体脉冲、公众号深读。\n"
+            "3. 每章包含 title、subtitle、bullets(3-5条)、metrics(2-4个键值)、chart_hint。\n"
+            "4. 增加 hero_title、hero_subtitle、key_takeaway、heat_score(0-100)、sentiment。\n"
+            "5. chart_hint 要描述适合生成的信息图：如趋势线、矩阵、漏斗、热力图、时间轴、风险表。\n"
+            "6. 不要照抄原文，合并重复信息，保留可行动判断。\n"
+            "7. 如果某模块为空，用其他模块推断，不要输出空章节。\n\n"
+            "模板风格：{template_style}\n"
+            "统计周期：{period}\n"
+            "模块材料 JSON：\n{sections_json}"
+        ),
+    }
+
+def _get_onepage_config(conf: dict[str, Any]) -> dict[str, Any]:
+    prompt = conf.get("onepage_prompt") if isinstance(conf.get("onepage_prompt"), dict) else {}
+    defaults = _default_onepage_prompt()
+    return {
+        "template_style": str(conf.get("onepage_template_style") or "executive_blue").strip(),
+        "prompt": {
+            "system": str(prompt.get("system") or defaults["system"]),
+            "user": str(prompt.get("user") or defaults["user"]),
+        },
+    }
+
 @router.get("/test-main")
 def test_main_model():
     conf = load_ai_config()
@@ -2687,6 +3091,134 @@ def test_tool_model():
         return {"status": "ok", "output": out, "config": info}
     except Exception as e:
         return {"status": "error", "error": str(e), "config": info}
+
+
+def _test_router_channel_connectivity(channel: dict[str, Any], lane: str, conf: dict[str, Any]) -> dict[str, Any]:
+    started = time.perf_counter()
+    cid = str(channel.get("id") or "").strip() or f"{lane}-unknown"
+    model = str(channel.get("model") or "").strip()
+    api_url = str(channel.get("api_url") or conf.get("api_url") or "https://api.siliconflow.cn/v1").strip()
+    api_key = str(channel.get("api_key") or "").strip() or str(conf.get("api_key") or "").strip()
+    has_key = bool(api_key or channel.get("has_api_key"))
+    base = {
+        "lane": lane,
+        "channel_id": cid,
+        "name": str(channel.get("name") or cid),
+        "model": model,
+        "api_url": api_url,
+        "enabled": channel.get("enabled") is not False,
+        "has_api_key": has_key,
+    }
+    if channel.get("enabled") is False:
+        return {
+            **base,
+            "status": "disabled",
+            "ok": False,
+            "latency_ms": 0,
+            "output": "",
+            "error": "channel disabled",
+        }
+    if not model:
+        return {
+            **base,
+            "status": "error",
+            "ok": False,
+            "latency_ms": 0,
+            "output": "",
+            "error": "missing model",
+        }
+    if not api_key:
+        return {
+            **base,
+            "status": "error",
+            "ok": False,
+            "latency_ms": 0,
+            "output": "",
+            "error": "missing api key",
+        }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if "openrouter.ai" in api_url:
+        headers.setdefault("HTTP-Referer", "https://localhost")
+        headers.setdefault("X-Title", "Dr.Lemon Information Aggregation AI")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一个测试助手，回答四个字：连接成功。"},
+            {"role": "user", "content": "请输出“连接成功”四个字"},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "stream": False,
+    }
+    if lane == "tool":
+        payload["response_format"] = {"type": "json_object"}
+    try:
+        http_timeout = int(conf.get("http_timeout") or 20)
+    except Exception:
+        http_timeout = 20
+    try:
+        resp = llm_client_service._post_with_backoff(  # type: ignore[attr-defined]
+            api_url.rstrip("/") + "/chat/completions",
+            headers,
+            payload,
+            timeout=http_timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = llm_client_service._normalize_llm_content(  # type: ignore[attr-defined]
+            data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        )
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+        return {
+            **base,
+            "status": "ok",
+            "ok": True,
+            "latency_ms": latency_ms,
+            "output": str(content or "")[:120],
+            "error": "",
+        }
+    except Exception as exc:
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+        return {
+            **base,
+            "status": "error",
+            "ok": False,
+            "latency_ms": latency_ms,
+            "output": "",
+            "error": str(exc)[:240],
+        }
+
+
+@router.get("/test-all-models")
+def test_all_router_models():
+    conf = load_ai_config()
+    router = conf.get("model_router") if isinstance(conf.get("model_router"), dict) else {}
+    lanes = {
+        "main": [c for c in (router.get("main_channels") if isinstance(router.get("main_channels"), list) else []) if isinstance(c, dict)],
+        "mid": [c for c in (router.get("mid_channels") if isinstance(router.get("mid_channels"), list) else []) if isinstance(c, dict)],
+        "tool": [c for c in (router.get("tool_channels") if isinstance(router.get("tool_channels"), list) else []) if isinstance(c, dict)],
+    }
+    out: dict[str, list[dict[str, Any]]] = {"main": [], "mid": [], "tool": []}
+    total = ok = disabled = 0
+    for lane, channels in lanes.items():
+        for channel in channels:
+            row = _test_router_channel_connectivity(channel, lane, conf)
+            out[lane].append(row)
+            total += 1
+            if row["status"] == "ok":
+                ok += 1
+            elif row["status"] == "disabled":
+                disabled += 1
+    return {
+        "status": "ok",
+        "summary": {
+            "total": total,
+            "ok": ok,
+            "error": max(0, total - ok - disabled),
+            "disabled": disabled,
+        },
+        "lanes": out,
+    }
 
 
 @router.get("/router-stats")

@@ -1,0 +1,186 @@
+{
+  "status": "ok",
+  "base_url": "http://127.0.0.1:8000",
+  "duration_seconds": 4.37,
+  "thresholds": {
+    "max_rss_mb": 250.0
+  },
+  "process": {
+    "pid": 1408,
+    "rss_mb": 173.3
+  },
+  "health_samples": [
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    },
+    {
+      "status": "ok",
+      "chatlog_http_base": "http://127.0.0.1:5030",
+      "chatlog_dir": "/Users/lichengyin/Documents/chatlog/leecyno1_84c7"
+    }
+  ],
+  "ready": {
+    "status": "ok",
+    "healthy": true,
+    "error_code": null,
+    "checks": [
+      {
+        "name": "database",
+        "status": "ok",
+        "error_code": null,
+        "message": null,
+        "latency_ms": null
+      },
+      {
+        "name": "sqlite_fts",
+        "status": "ok",
+        "error_code": null,
+        "message": null,
+        "latency_ms": null
+      },
+      {
+        "name": "disk_space",
+        "status": "ok",
+        "error_code": null,
+        "message": "free_mb=418149.5",
+        "latency_ms": null
+      },
+      {
+        "name": "writable_paths",
+        "status": "ok",
+        "error_code": null,
+        "message": "checked=3",
+        "latency_ms": null
+      },
+      {
+        "name": "external_config",
+        "status": "ok",
+        "error_code": null,
+        "message": "enabled_channels=9",
+        "latency_ms": null
+      },
+      {
+        "name": "llm_config",
+        "status": "ok",
+        "error_code": null,
+        "message": "api_key=configured",
+        "latency_ms": null
+      },
+      {
+        "name": "chatlog_http",
+        "status": "ok",
+        "error_code": null,
+        "message": "status=200",
+        "latency_ms": null
+      },
+      {
+        "name": "background_loops",
+        "status": "ok",
+        "error_code": null,
+        "message": "enabled=4",
+        "latency_ms": null
+      },
+      {
+        "name": "summary_queue",
+        "status": "ok",
+        "error_code": null,
+        "message": "pending_summary=0",
+        "latency_ms": null
+      }
+    ],
+    "timestamp": "2026-05-04T12:51:56.009070+00:00"
+  },
+  "errors": []
+}
