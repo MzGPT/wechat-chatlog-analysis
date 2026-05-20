@@ -14,6 +14,7 @@ from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime, getaddresses
 import imaplib
+import os
 import smtplib
 import ssl
 from typing import Iterable, List, Optional
@@ -22,6 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import EmailAccount, EmailMessage
+from .email_features import persist_email_features, persist_email_fallback
+import threading
 
 
 def _decode(s: str | bytes | None) -> str | None:
@@ -52,6 +55,10 @@ def _addr_list(raw: str | None) -> list[str] | None:
         return [raw]
 
 
+EMAIL_CONNECT_TIMEOUT_SECONDS = max(3, int(os.getenv("EMAIL_CONNECT_TIMEOUT_SECONDS", "8")))
+EMAIL_POP3_TIMEOUT_SECONDS = max(3, int(os.getenv("EMAIL_POP3_TIMEOUT_SECONDS", "8")))
+
+
 @dataclass
 class FetchOptions:
     folder: str = "INBOX"
@@ -71,17 +78,31 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
     opts = opts or FetchOptions()
     context = ssl.create_default_context()
     new_count = 0
+    new_rows: List[EmailMessage] = []
 
     if account.imap_ssl:
-        M = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=context)
+        M = imaplib.IMAP4_SSL(account.imap_host, account.imap_port, ssl_context=context, timeout=EMAIL_CONNECT_TIMEOUT_SECONDS)
     else:
-        M = imaplib.IMAP4(account.imap_host, account.imap_port)
+        M = imaplib.IMAP4(account.imap_host, account.imap_port, timeout=EMAIL_CONNECT_TIMEOUT_SECONDS)
 
     try:
         username = (account.auth or {}).get("username") or account.email_address
         password = (account.auth or {}).get("password") or ""
         M.login(username, password)
-        M.select(opts.folder)
+        # ensure a selectable mailbox is selected; fallback to INBOX
+        try:
+            typ, _ = M.select(opts.folder)
+            if typ != "OK":
+                typ, _ = M.select("INBOX")
+                if typ != "OK":
+                    raise RuntimeError("IMAP select mailbox failed")
+        except Exception:
+            # force close and re-raise to trigger POP3 fallback upstream
+            try:
+                M.logout()
+            except Exception:
+                pass
+            raise
 
         criteria = "UNSEEN" if opts.unseen_only else "ALL"
         typ, data = M.search(None, criteria)
@@ -170,6 +191,7 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
 
             db.add(row)
             db.flush()
+            new_rows.append(row)
             new_count += 1
 
     finally:
@@ -177,6 +199,93 @@ def imap_fetch(db: Session, account: EmailAccount, opts: FetchOptions | None = N
             M.logout()
         except Exception:
             pass
+
+    # First persist local fallback summaries for instant UI (for any new rows)
+    overlay_ids: list[int] = []
+    if new_rows:
+        try:
+            persist_email_fallback(db, new_rows, force=True, commit=True)
+        except Exception as feature_err:
+            print(f"[email_engine] persist fallback failed: {feature_err}")
+        overlay_ids.extend([r.id for r in new_rows if getattr(r, 'id', None) is not None])
+
+    # Always schedule a small overlay window for recent messages that still lack tool results,
+    # so clicking "同步" 可以修复之前遗漏的邮件（增量覆盖）。允许在“功能设置”中关闭或调整窗口大小。
+    try:
+        # Read runtime switches from SyncState
+        from ..models import SyncState
+        ai_switch = db.get(SyncState, "ai_runtime")
+        import json as _json
+        cfg = {}
+        try:
+            if ai_switch and ai_switch.value:
+                cfg = _json.loads(ai_switch.value) or {}
+        except Exception:
+            cfg = {}
+        enable_overlay = bool((cfg or {}).get("enable_email_tool_overlay", True))
+        win = int((cfg or {}).get("email_overlay_window", 120))
+        cap = int((cfg or {}).get("email_overlay_cap", 160))
+        if win <= 0 or cap <= 0:
+            enable_overlay = False
+        if not enable_overlay:
+            overlay_ids = overlay_ids  # no-op; skip building recent window
+            raise RuntimeError("overlay_disabled")
+        from sqlalchemy import desc as _desc
+        recent = (
+            db.execute(
+                select(EmailMessage)
+                .where(EmailMessage.account_id == account.id)
+                .order_by(_desc(EmailMessage.sent_at), _desc(EmailMessage.id))
+                .limit(max(20, min(1000, win)))
+            )
+            .scalars()
+            .all()
+        )
+        for em in recent:
+            d = em.derived if isinstance(em.derived, dict) else {}
+            if str(d.get('summary_origin') or '').lower() != 'tool':
+                if getattr(em, 'id', None) is not None:
+                    overlay_ids.append(int(em.id))
+        # de-dup and cap to a safe size to avoid bursts
+        seen: set[int] = set()
+        capped: list[int] = []
+        for i in overlay_ids:
+            if i not in seen:
+                seen.add(i)
+                capped.append(i)
+            if len(capped) >= max(20, min(2000, cap)):
+                break
+        overlay_ids = capped
+    except Exception:
+        pass
+
+    if overlay_ids:
+        def _run_ai_overlay(ids: list[int]):
+            sess = None
+            try:
+                from ..db import SessionLocal as _SessionLocal
+                sess = _SessionLocal()
+                rows = sess.execute(select(EmailMessage).where(EmailMessage.id.in_(ids))).scalars().all()
+                # force=False：仅对缺失/非tool 的项进行覆盖；已是 tool 的将被跳过
+                persist_email_features(sess, rows, force=False, commit=True)
+            except Exception as e:
+                print(f"[email_engine] async ai overlay failed: {e}")
+            finally:
+                try:
+                    if sess:
+                        sess.close()
+                except Exception:
+                    pass
+        try:
+            t = threading.Thread(target=_run_ai_overlay, args=(overlay_ids,), daemon=True)
+            t.start()
+        except Exception:
+            # fallback to sync if thread creation fails
+            try:
+                rows = db.execute(select(EmailMessage).where(EmailMessage.id.in_(overlay_ids))).scalars().all()
+                persist_email_features(db, rows, force=False, commit=True)
+            except Exception as feature_err:
+                print(f"[email_engine] persist features failed: {feature_err}")
 
     return new_count
 
@@ -230,6 +339,17 @@ def smtp_send(db: Session, account: EmailAccount, to: list[str], subject: str, b
     )
     db.add(row)
     db.flush()
+    try:
+        # immediate fallback, then async overlay
+        persist_email_fallback(db, [row], force=True, commit=True)
+        try:
+            t = threading.Thread(target=lambda: persist_email_features(db, [row], force=True, commit=True), daemon=True)
+            t.start()
+        except Exception:
+            # if thread fails, do sync
+            persist_email_features(db, [row], force=True, commit=True)
+    except Exception as feature_err:
+        print(f"[email_engine] persist features failed: {feature_err}")
 
     return {"status": "ok", "message_id": row.id}
 
@@ -253,18 +373,28 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
             ('outlook.office365.com', 995),
         ]
     if not candidates:
-        candidates = [(base_host or 'pop-mail.outlook.com', 995)]
+        cands: list[tuple[str,int]] = []
+        if base_host.startswith('imap.'):
+            cands.append((base_host.replace('imap.', 'pop.', 1), 995))
+        # also try plain pop.<domain> if not already covered
+        if base_host and not base_host.startswith('pop.'):
+            domain = base_host.split('imap.',1)[-1] if base_host.startswith('imap.') else base_host
+            cands.append((f'pop.{domain}', 995))
+        # final fallback to original host (might be actual pop)
+        cands.append((base_host or 'pop-mail.outlook.com', 995))
+        candidates = cands
 
     username = (account.auth or {}).get("username") or account.email_address
     password = (account.auth or {}).get("password") or ""
 
     new_count = 0
     server = None
+    new_rows: List[EmailMessage] = []
     try:
         last_err: Exception | None = None
         for host, port in candidates:
             try:
-                server = poplib.POP3_SSL(host, port, timeout=30)
+                server = poplib.POP3_SSL(host, port, timeout=EMAIL_POP3_TIMEOUT_SECONDS)
                 server.user(username)
                 server.pass_(password)
                 break
@@ -335,7 +465,14 @@ def pop3_fetch(db: Session, account: EmailAccount, limit: int = 50) -> int:
                 body_text=None,
             )
             db.add(row)
+            db.flush()
+            new_rows.append(row)
             new_count += 1
+        if new_rows:
+            try:
+                persist_email_features(db, new_rows, force=True, commit=True)
+            except Exception as feature_err:
+                print(f"[email_engine] persist features failed: {feature_err}")
         return new_count
     finally:
         try:

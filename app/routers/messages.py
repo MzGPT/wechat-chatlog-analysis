@@ -4,22 +4,638 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import select, func, text, or_
 from sqlalchemy.orm import Session
 from typing import Optional
+import threading
 from ..db import session_scope, SessionLocal
 from ..models import Message, Interaction, InteractionExt
 from ..schemas import PaginatedMessages, MessageOut, UpDownVoteResult, TagUpdateIn, MessageDeriveRequest
-from ..services.ai_tools import ensure_message_features
+from ..services.ai_tools import ensure_message_features, populate_fallback_derived
+from ..services.sync_service import _build_chatlog_media_url
 from ..services.llm_client import load_ai_config
-from ..services.message_filters import filter_effective_messages
-from starlette.responses import Response
+from ..services.message_filters import filter_effective_messages, WECHAT_NOISE_SENDER_IDS, WECHAT_NOISE_CHAT_IDS
+from starlette.responses import Response, RedirectResponse
 from typing import Dict, Any, List
-import csv, io, html
+import csv, io, html, json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+import requests
 
 
 router = APIRouter(prefix="/api/messages", tags=["messages"])
 
 # simple in-memory progress for derive tasks
 PROGRESS: Dict[str, Dict[str, Any]] = {}
+_PROGRESS_LOCK = threading.RLock()
+_DERIVE_JOBS: Dict[str, threading.Thread] = {}
+
+_DROP_META_KEYS = {
+    # common heavy fields we never need in list responses
+    "raw",
+    "xml",
+    "xmlstr",
+    "xml_str",
+    "payload",
+    "buffer",
+    "bytes",
+    "base64",
+    "data_base64",
+    "thumb_base64",
+    "content",
+    "content_text",
+    "full_text",
+}
+
+
+def _compose_message_display_summary(d: dict | None) -> str:
+    if not isinstance(d, dict):
+        return ""
+    try:
+        raw_num = str(d.get("meeting_number") or "").strip()
+        num = re.sub(r"\D", "", raw_num)
+        if len(num) < 9 or len(num) > 13:
+            num = ""
+        plat = str(d.get("platform") or d.get("meeting_platform") or "").strip()
+        raw_sum = str(d.get("summary") or "").strip()
+        key = re.sub(r"^\s*(ai:|fallback:)\s*", "", raw_sum, flags=re.IGNORECASE).strip() if raw_sum else ""
+        if not key:
+            key = str(d.get("key_info") or d.get("main_point") or d.get("summary_full") or "").strip()
+            key = re.sub(r"^\s*(ai:|fallback:)\s*", "", key, flags=re.IGNORECASE).strip()
+        if plat:
+            key = re.sub(rf"^\s*{re.escape(plat)}\s*[:：|]?\s*", "", key).strip()
+        if num:
+            key = re.sub(rf"^\s*(会议号[:：]?\s*)?{re.escape(num)}\s*[:：|]?\s*", "", key).strip()
+            key = re.sub(rf"\s*(会议号[:：]?\s*)?{re.escape(num)}\s*$", "", key).strip()
+        if plat:
+            key = re.sub(rf"^\s*{re.escape(plat)}\s*[:：|]?\s*", "", key).strip()
+        left = " ".join([x for x in (num, plat) if x])
+        if key:
+            return f"{left} | {key}" if left else key
+        return left
+    except Exception:
+        return ""
+
+
+def _normalize_media_host(host: str | None) -> str:
+    v = (host or "").strip()
+    if not v:
+        v = "http://127.0.0.1:5030"
+    if not v.startswith(("http://", "https://")):
+        v = "http://" + v
+    return v.rstrip("/")
+
+
+def _encode_rel_path(path: str | None) -> str:
+    p = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not p:
+        return ""
+    return "/".join(quote(seg, safe="") for seg in p.split("/") if seg)
+
+
+def _build_image_candidates(*, host: str | None, md5: str | None, path: str | None, direct_url: str | None) -> List[str]:
+    base = _normalize_media_host(host)
+    key = (md5 or "").strip()
+    rel = _encode_rel_path(path)
+    out: List[str] = []
+    if direct_url:
+        out.append(direct_url.strip())
+    # chatlog 的 /image 端点会按 md5+路径解密并自动回退到可用缩略图；
+    # 直接 /data 原图在本地缺失时常见 404，所以放在解密端点之后。
+    if key and rel:
+        out.append(f"{base}/image/{quote(key, safe='')},{rel}")
+    if key:
+        out.append(f"{base}/image/{quote(key, safe='')}")
+    if rel:
+        out.append(f"{base}/data/{rel}_M.dat")
+        out.append(f"{base}/data/{rel}.dat")
+        out.append(f"{base}/data/{rel}_t.dat")
+        out.append(f"{base}/data/{rel}")
+    # dedupe preserving order
+    seen = set()
+    uniq: List[str] = []
+    for u in out:
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+    return uniq
+
+
+def _coerce_json_field(v: Any) -> Any:
+    """Coerce possibly-stringified JSON fields (meta/derived/tags) to python objects."""
+    if v is None:
+        return None
+    if isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return v
+    return v
+
+
+
+def _extract_wechat_appmsg(content: Any) -> dict[str, str]:
+    text_value = str(content or "").strip()
+    if not text_value or "<appmsg" not in text_value.lower():
+        return {}
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text_value)
+    except Exception:
+        return {}
+
+    def find_text(*paths: str) -> str:
+        for path in paths:
+            try:
+                value = root.findtext(path)
+            except Exception:
+                value = None
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    return {
+        "title": find_text(".//appmsg/title", ".//title"),
+        "desc": find_text(".//appmsg/des", ".//appmsg/description", ".//des"),
+        "url": find_text(".//appmsg/url", ".//url"),
+        "sourceusername": find_text(".//appmsg/sourceusername", ".//sourceusername"),
+        "sourcedisplayname": find_text(".//appmsg/sourcedisplayname", ".//sourcedisplayname"),
+        "thumburl": find_text(".//appmsg/thumburl", ".//thumburl", ".//weappinfo/weappiconurl"),
+    }
+
+
+def _is_wechat_mp_message(sender_id: Any, chat_id: Any, meta: Any = None) -> bool:
+    ids = [str(sender_id or "").strip(), str(chat_id or "").strip()]
+    meta_obj = _coerce_json_field(meta) if meta is not None else None
+    if isinstance(meta_obj, dict):
+        contents = meta_obj.get("contents") if isinstance(meta_obj.get("contents"), dict) else {}
+        ids.extend([
+            str(contents.get("sourceusername") or "").strip(),
+            str(contents.get("userName") or "").strip(),
+            str(contents.get("username") or "").strip(),
+        ])
+    return any(value.startswith("gh_") for value in ids if value)
+
+def _normalize_message_type_value(msg_type: Any) -> Any:
+    mapping = {
+        0: 'text',
+        1: 'text',
+        3: 'image',
+        34: 'voice',
+        43: 'video',
+        47: 'emoji',
+        48: 'location',
+        49: 'link',
+        10000: 'system',
+        10002: 'system',
+    }
+    if msg_type is None:
+        return None
+    text_value = str(msg_type).strip()
+    if not text_value:
+        return None
+    lowered = text_value.lower()
+    if lowered in {'text', 'image', 'voice', 'video', 'emoji', 'location', 'link', 'file', 'system', 'app', 'other'}:
+        if lowered == 'app':
+            return 'link'
+        return lowered
+    try:
+        return mapping.get(int(text_value), text_value)
+    except Exception:
+        return text_value
+
+
+
+def _normalize_wechat_gateway_message_fields(sender_id: Any, sender_name: Any, chat_id: Any, talker_name: Any, msg_type: Any, content_text: Any, media_url: Any, meta: Any, db: Session | None = None) -> dict[str, Any]:
+    meta_obj = _coerce_json_field(meta) if meta is not None else None
+    meta_obj = meta_obj if isinstance(meta_obj, dict) else {}
+    out_sender_name = sender_name or meta_obj.get('sender_name') or meta_obj.get('sender')
+    out_talker_name = talker_name or meta_obj.get('talker_name') or meta_obj.get('chat_name') or meta_obj.get('room_name')
+    out_type = _normalize_message_type_value(msg_type)
+    out_media_url = media_url
+    out_meta = dict(meta_obj) if isinstance(meta_obj, dict) else {}
+    contents = out_meta.get('contents') if isinstance(out_meta.get('contents'), dict) else {}
+
+    if str(out_meta.get('source') or '').strip() == 'wechat_gateway':
+        raw = out_meta.get('raw') if isinstance(out_meta.get('raw'), dict) else {}
+        data = raw.get('Data') if isinstance(raw.get('Data'), dict) else {}
+        raw_content = str(data.get('Content') or content_text or '').strip()
+        if raw_content.startswith('<'):
+            appmsg = _extract_wechat_appmsg(raw_content)
+            if appmsg:
+                extracted = dict(contents)
+                for key, val in appmsg.items():
+                    if val:
+                        extracted[key] = val
+                out_meta['contents'] = extracted
+                contents = extracted
+                out_type = 'link'
+                if appmsg.get('title'):
+                    out_meta['display_title'] = appmsg.get('title')
+            try:
+                import xml.etree.ElementTree as ET
+                root = ET.fromstring(raw_content)
+                img = root.find('img')
+                if img is not None:
+                    extracted = dict(contents)
+                    for key in ('cdnthumburl', 'md5', 'aeskey', 'cdnmidimgurl'):
+                        val = str(img.attrib.get(key) or '').strip()
+                        if val:
+                            extracted[key] = val
+                    out_meta['contents'] = extracted
+                    contents = extracted
+                    out_type = 'image'
+                    out_media_url = out_media_url or _build_chatlog_media_url('image', extracted)
+            except Exception:
+                pass
+
+        sender_id_text = str(sender_id or '').strip()
+        sender_name_text = str(out_sender_name or '').strip()
+        talker_id_text = str(chat_id or '').strip()
+        talker_name_text = str(out_talker_name or '').strip()
+        lookup_db = db
+        if sender_id_text and sender_name_text == sender_id_text and lookup_db is not None:
+            try:
+                row = lookup_db.execute(text('select alias, name from contacts where id = :id'), {'id': sender_id_text}).fetchone()
+                if row:
+                    alias = str(row[0] or '').strip()
+                    name = str(row[1] or '').strip()
+                    out_sender_name = alias or name or out_sender_name
+            except Exception:
+                pass
+        if talker_id_text and talker_name_text == talker_id_text and lookup_db is not None:
+            try:
+                row = lookup_db.execute(text('select title from chats where id = :id'), {'id': talker_id_text}).fetchone()
+                if row:
+                    title = str(row[0] or '').strip()
+                    out_talker_name = title or out_talker_name
+            except Exception:
+                pass
+
+    return {
+        'sender_name': out_sender_name,
+        'talker_name': out_talker_name,
+        'type': out_type,
+        'media_url': out_media_url,
+        'meta': out_meta,
+    }
+
+
+def _truncate_text(s: Any, max_chars: int) -> str | None:
+    if s is None:
+        return None
+    txt = str(s)
+    if max_chars <= 0:
+        return txt
+    if len(txt) <= max_chars:
+        return txt
+    return txt[: max_chars - 1] + "…"
+
+
+def _prune_meta(obj: Any, *, depth: int, max_depth: int, max_items: int, max_str: int) -> Any:
+    """Best-effort prune of meta payload to avoid huge JSON responses crashing the UI."""
+    if obj is None:
+        return None
+    if depth >= max_depth:
+        if isinstance(obj, str):
+            return obj[:max_str]
+        if isinstance(obj, (dict, list)):
+            return None
+        if isinstance(obj, (int, float, bool)):
+            return obj
+        return None
+    if isinstance(obj, str):
+        return obj if len(obj) <= max_str else obj[: max_str - 1] + "…"
+    if isinstance(obj, (int, float, bool)):
+        return obj
+    if isinstance(obj, list):
+        return [
+            _prune_meta(x, depth=depth + 1, max_depth=max_depth, max_items=max_items, max_str=max_str)
+            for x in obj[:max_items]
+        ]
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in list(obj.items())[:max_items]:
+            kk = str(k)
+            if kk.strip().lower() in _DROP_META_KEYS:
+                continue
+            out[kk] = _prune_meta(v, depth=depth + 1, max_depth=max_depth, max_items=max_items, max_str=max_str)
+        return out
+    return None
+
+
+def _sanitize_meta_for_list(meta: Any, *, max_depth: int = 4, max_items: int = 80, max_str: int = 600) -> dict | None:
+    m = _coerce_json_field(meta)
+    if not isinstance(m, dict):
+        return None
+    return _prune_meta(m, depth=0, max_depth=max_depth, max_items=max_items, max_str=max_str)
+
+
+def _derive_readback_item(msg_id: Any, derived: Any) -> dict | None:
+    try:
+        rid = int(msg_id)
+    except Exception:
+        return None
+    derv = _coerce_json_field(derived)
+    if not isinstance(derv, dict):
+        derv = {}
+    summary = derv.get("summary")
+    has_ai = isinstance(summary, str) and summary.lower().strip().startswith("ai:")
+    return {
+        "id": rid,
+        "summary_origin": derv.get("summary_origin"),
+        "has_ai": bool(has_ai),
+    }
+
+
+def _merge_memory_readback(readback: list[dict], messages: list[Message]) -> list[dict]:
+    by_id = {int(item["id"]): dict(item) for item in readback if isinstance(item, dict) and item.get("id") is not None}
+    for msg in messages:
+        item = _derive_readback_item(getattr(msg, "id", None), getattr(msg, "derived", None))
+        if not item:
+            continue
+        current = by_id.get(item["id"])
+        if not current or (not current.get("summary_origin") and item.get("summary_origin")):
+            by_id[item["id"]] = item
+    return list(by_id.values())
+
+
+def _set_progress(key: str, **updates: Any) -> None:
+    with _PROGRESS_LOCK:
+        current = dict(PROGRESS.get(key) or {})
+        current.update(updates)
+        PROGRESS[key] = current
+
+
+def _prepare_derive_request(body: MessageDeriveRequest) -> tuple[MessageDeriveRequest, bool]:
+    try:
+        conf = load_ai_config()
+        dd = conf.get("derive_defaults") or {}
+    except Exception:
+        dd = {}
+    payload = body.model_dump()
+    if payload.get("batch_size") is None:
+        payload["batch_size"] = int(dd.get("batch_size", 20))
+    if payload.get("concurrency") is None:
+        payload["concurrency"] = int(dd.get("concurrency", 8))
+    if payload.get("temperature") is None:
+        payload["temperature"] = float(dd.get("temperature", 0.1))
+    if payload.get("force") is None:
+        payload["force"] = bool(dd.get("force", False))
+    prepared = MessageDeriveRequest(**payload)
+    effective_force = bool(prepared.force)
+    return prepared, effective_force
+
+
+def _resolve_message_ids(db: Session, body: MessageDeriveRequest) -> list[int]:
+    query = select(Message.id)
+    if body.message_ids:
+        query = query.where(Message.id.in_(body.message_ids))
+    else:
+        period = (body.period or "").lower()
+        period_mapping = {
+            "1day": 1,
+            "3days": 3,
+            "1week": 7,
+            "1month": 30,
+        }
+        days = period_mapping.get(period)
+        if days:
+            since = datetime.utcnow() - timedelta(days=days)
+            query = query.where(Message.timestamp >= since)
+        if body.limit:
+            query = query.order_by(Message.timestamp.desc()).limit(max(1, body.limit))
+        elif not days:
+            query = query.order_by(Message.timestamp.desc()).limit(500)
+        else:
+            query = query.order_by(Message.timestamp.desc())
+    rows = db.execute(query).all()
+    out: list[int] = []
+    for row in rows:
+        try:
+            out.append(int(row[0]))
+        except Exception:
+            continue
+    return out
+
+
+def _derive_messages_internal(
+    db: Session,
+    messages: List[Message],
+    body: MessageDeriveRequest,
+    *,
+    effective_force: bool,
+    progress_key: str | None = None,
+) -> dict[str, Any]:
+    def _fatal_tool_error_list(items: list[str]) -> bool:
+        if not items:
+            return False
+        fatal_tokens = (
+            "missing_api_key",
+            "bad_api_key_cached",
+            "invalid api key",
+            "api key is disabled",
+            "unauthorized",
+            "401 client error",
+            "403 client error",
+        )
+        matched = 0
+        for it in items:
+            low = str(it or "").lower()
+            if any(tok in low for tok in fatal_tokens):
+                matched += 1
+        return matched == len(items)
+
+    if not messages:
+        if progress_key:
+            _set_progress(progress_key, status="done", total=0, done=0, updated=0, errors=[], debug=[])
+            return {"status": "ok", "updated": 0, "progress_key": progress_key}
+        return {"status": "ok", "updated": 0}
+
+    if progress_key:
+        bs = max(1, int(body.batch_size or 20))
+        idx = 0
+        errs: list[str] = []
+        debs: list[dict] = []
+        total_updated = 0
+        tool_disabled_for_run = False
+        id_list = [int(getattr(m, "id")) for m in messages if getattr(m, "id", None) is not None]
+        _set_progress(progress_key, status="running", total=len(messages), done=0, updated=0, errors=[], debug=[])
+        while idx < len(messages):
+            chunk = messages[idx : idx + bs]
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            try:
+                populate_fallback_derived(db, chunk, force=effective_force)
+            except Exception as exc:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                errs.append(f"fallback_chunk_failed[{idx}:{idx+len(chunk)}]: {str(exc)[:180]}")
+            if tool_disabled_for_run:
+                res = {"updated": 0, "errors": [], "debug": [], "applied": []}
+            else:
+                try:
+                    res = ensure_message_features(
+                        db,
+                        chunk,
+                        force=effective_force,
+                        batch_size=bs,
+                        concurrency=body.concurrency,
+                        temperature=body.temperature,
+                    )
+                except Exception as exc:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    errs.append(f"tool_chunk_failed[{idx}:{idx+len(chunk)}]: {str(exc)[:180]}")
+                    res = {"updated": 0, "errors": [], "debug": [], "applied": []}
+            try:
+                total_updated += int(res.get("updated", 0))
+                e = res.get("errors") or []
+                if isinstance(e, list):
+                    errs.extend([str(x) for x in e])
+                    if _fatal_tool_error_list([str(x) for x in e]):
+                        tool_disabled_for_run = True
+                d = res.get("debug") or []
+                if isinstance(d, list):
+                    debs.extend(d)
+                a = res.get("applied") or []
+                if isinstance(a, list):
+                    debs.extend([{**x, "applied": True} for x in a])
+            except Exception:
+                pass
+            idx += bs
+            _set_progress(
+                progress_key,
+                status="running",
+                done=min(len(messages), idx),
+                total=len(messages),
+                updated=total_updated,
+                errors=errs[:50],
+                debug=debs[:50],
+            )
+        readback: list[dict] = []
+        try:
+            if id_list:
+                rows = db.execute(select(Message.id, Message.derived).where(Message.id.in_(id_list))).all()
+                for rid, derv in rows:
+                    item = _derive_readback_item(rid, derv)
+                    if item:
+                        readback.append(item)
+        except Exception:
+            pass
+        readback = _merge_memory_readback(readback, messages)
+        _set_progress(
+            progress_key,
+            status="done",
+            done=len(messages),
+            total=len(messages),
+            updated=total_updated,
+            errors=errs[:50],
+            debug=debs[:50],
+            debug_readback=readback[:50],
+        )
+        return {
+            "status": "ok",
+            "updated": total_updated,
+            "errors": errs[:50],
+            "debug": debs[:50],
+            "debug_readback": readback[:50],
+            "progress_key": progress_key,
+        }
+
+    id_list = [int(getattr(m, "id")) for m in messages if getattr(m, "id", None) is not None]
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    try:
+        populate_fallback_derived(db, messages, force=effective_force)
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        fallback_err = f"fallback_failed: {str(exc)[:180]}"
+    else:
+        fallback_err = ""
+    try:
+        res = ensure_message_features(
+            db,
+            messages,
+            force=effective_force,
+            batch_size=body.batch_size,
+            concurrency=body.concurrency,
+            temperature=body.temperature,
+        )
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        res = {"updated": 0, "errors": [f"tool_failed: {str(exc)[:180]}"], "debug": [], "applied": []}
+    if fallback_err:
+        try:
+            res_errors = res.get("errors") if isinstance(res, dict) else None
+            if not isinstance(res_errors, list):
+                res_errors = []
+            res_errors.insert(0, fallback_err)
+            res["errors"] = res_errors
+        except Exception:
+            pass
+    try:
+        updated = int(res.get("updated", len(messages)))
+    except Exception:
+        updated = len(messages)
+    readback: list[dict] = []
+    try:
+        if id_list:
+            rows = db.execute(select(Message.id, Message.derived).where(Message.id.in_(id_list))).all()
+            for rid, derv in rows:
+                item = _derive_readback_item(rid, derv)
+                if item:
+                    readback.append(item)
+    except Exception:
+        pass
+    readback = _merge_memory_readback(readback, messages)
+    deb = (res.get("debug") or [])
+    appd = (res.get("applied") or [])
+    debug_combined = []
+    if isinstance(deb, list):
+        debug_combined.extend(deb)
+    if isinstance(appd, list):
+        debug_combined.extend([{**x, "applied": True} for x in appd])
+    return {"status": "ok", "updated": updated, "errors": (res.get("errors") or [])[:50], "debug": debug_combined[:50], "debug_readback": readback[:50]}
+
+
+def _run_derive_job(progress_key: str, body_payload: dict[str, Any], message_ids: list[int]) -> None:
+    db = SessionLocal()
+    try:
+        body = MessageDeriveRequest(**body_payload)
+        effective_force = bool(body.force)
+        if not message_ids:
+            _set_progress(progress_key, status="done", total=0, done=0, updated=0, errors=[], debug=[])
+            return
+        messages = db.execute(select(Message).where(Message.id.in_(message_ids)).order_by(Message.timestamp.desc())).scalars().all()
+        _derive_messages_internal(db, messages, body, effective_force=effective_force, progress_key=progress_key)
+    except Exception as exc:
+        _set_progress(progress_key, status="error", error=str(exc), errors=[str(exc)[:400]])
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        with _PROGRESS_LOCK:
+            _DERIVE_JOBS.pop(progress_key, None)
 
 
 def get_db():
@@ -29,6 +645,29 @@ def get_db():
     finally:
         # ensure proper close even if generator exits early
         db.close()
+
+
+@router.get("/media/image")
+def resolve_image_media(
+    md5: str | None = Query(default=None),
+    path: str | None = Query(default=None),
+    host: str | None = Query(default=None),
+    url: str | None = Query(default=None, description="optional direct media url"),
+):
+    candidates = _build_image_candidates(host=host, md5=md5, path=path, direct_url=url)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="missing md5/path/url")
+
+    for c in candidates:
+        try:
+            # GET (not HEAD): chatlog 会在这里做解密并返回正确 content-type/302。
+            resp = requests.get(c, allow_redirects=False, timeout=4)
+            if resp.status_code in (200, 301, 302):
+                return RedirectResponse(url=c, status_code=302)
+        except Exception:
+            continue
+
+    return RedirectResponse(url=candidates[0], status_code=302)
 
 
 @router.get("", response_model=PaginatedMessages)
@@ -42,6 +681,10 @@ def list_messages(
     time_to: Optional[str] = None,
     page: int = 1,
     size: int = 50,
+    fast: bool = Query(default=False, description="Skip expensive total count; total will be len(items)."),
+    include_meta: bool = Query(default=True, description="Include meta payload (pruned) for list rendering."),
+    include_mp_messages: bool = Query(default=False, description="Include WeChat official-account gh_ messages in WeChat list."),
+    content_max_chars: int = Query(default=4000, ge=0, le=20000, description="Truncate content_text to avoid huge payloads."),
     db: Session = Depends(get_db),
 ):
     page = max(1, page)
@@ -87,6 +730,11 @@ def list_messages(
             clauses.append("(m.direction = 'in' OR m.direction IS NULL OR m.direction = '')")
         elif direction == "out":
             clauses.append("m.direction = 'out'")
+        if not include_mp_messages:
+            clauses.append("(coalesce(m.chat_id, '') NOT LIKE 'gh_%' AND coalesce(m.sender_id, '') NOT LIKE 'gh_%')")
+            clauses.append("(m.sender_id NOT IN ('weixin', 'filehelper') OR m.sender_id IS NULL)")
+            clauses.append("(m.chat_id NOT IN ('filehelper') OR m.chat_id IS NULL)")
+            clauses.append("(m.type != 'system' OR m.type IS NULL)")
 
         dt_from = _parse_dt(time_from)
         dt_to = _parse_dt(time_to)
@@ -111,19 +759,64 @@ def list_messages(
         derived_map: dict[int, dict | None] = {}
         # 为了保证列表接口快速稳定，这里不触发小模型派生；
         # 派生由前端在进入页面或点击“拉取”时调用 /api/messages/derive 完成
-        total = db.execute(count_sql, {k: v for k, v in params.items() if k != "limit" and k != "offset"}).scalar() or 0
+        total = (
+            len(items)
+            if fast
+            else (db.execute(count_sql, {k: v for k, v in params.items() if k != "limit" and k != "offset"}).scalar() or 0)
+        )
         data = []
         for row in items:
             rd = dict(row)
             msg_id = rd.get("id")
             if msg_id in derived_map:
                 rd["derived"] = derived_map[msg_id]
+            
+            # Fix JSON field parsing for FTS queries
+            # FTS queries return JSON fields as strings, need to parse them
+            try:
+                if isinstance(rd.get("meta"), str):
+                    rd["meta"] = json.loads(rd["meta"]) if rd["meta"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["meta"] = None
+                
+            try:
+                if isinstance(rd.get("derived"), str):
+                    rd["derived"] = json.loads(rd["derived"]) if rd["derived"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["derived"] = None
+                
+            try:
+                if isinstance(rd.get("tags"), str):
+                    rd["tags"] = json.loads(rd["tags"]) if rd["tags"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["tags"] = None
+
+            # Prune meta/content for stability (FTS path returns mapping rows).
+            if not include_meta:
+                rd["meta"] = None
+            else:
+                rd["meta"] = _sanitize_meta_for_list(rd.get("meta"))
+            rd["content_text"] = _truncate_text(rd.get("content_text"), content_max_chars)
+            
             # include raw meta to allow frontend to render link/image badges
             if rd.get("meta") is None and hasattr(row, 'meta'):
                 try:
                     rd["meta"] = row["meta"]
                 except Exception:
                     pass
+            # 兼容旧前端：回填 key_info/key_info_origin
+            try:
+                d = rd.get("derived") or {}
+                if isinstance(d, dict):
+                    if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                        d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+                    if d.get("summary_origin") and not d.get("key_info_origin"):
+                        d["key_info_origin"] = d.get("summary_origin")
+                    # Compose display-only summary from meeting_number/platform/key_info
+                    d["display_summary"] = _compose_message_display_summary(d)
+                    rd["derived"] = d
+            except Exception:
+                pass
             data.append(MessageOut(**rd))
         return {"total": int(total), "items": data}
 
@@ -140,6 +833,14 @@ def list_messages(
             query = query.where(or_(Message.direction == "in", Message.direction == None, Message.direction == ""))
         else:
             query = query.where(Message.direction == direction)
+    if not include_mp_messages:
+        query = query.where(
+            (Message.chat_id == None) | (~Message.chat_id.like("gh_%")),
+            (Message.sender_id == None) | (~Message.sender_id.like("gh_%")),
+            (Message.sender_id == None) | (~Message.sender_id.in_(["weixin", "filehelper"])),
+            (Message.chat_id == None) | (~Message.chat_id.in_(["filehelper"])),
+            (Message.type == None) | (Message.type != "system"),
+        )
     def _parse_dt(v: Optional[str]) -> Optional[datetime]:
         """Parse ISO-like datetime strings from the frontend.
 
@@ -170,8 +871,8 @@ def list_messages(
     if dt_to:
         query = query.where(Message.timestamp <= dt_to)
 
-    total = db.execute(select(func.count()).select_from(query.subquery())).scalar() or 0
     items = db.execute(query.order_by(Message.timestamp.desc()).limit(size).offset((page - 1) * size)).scalars().all()
+    total = len(items) if fast else (db.execute(select(func.count()).select_from(query.subquery())).scalar() or 0)
     # 同理：列表接口不做派生，避免阻塞首屏。/derive 负责派生。
     # try:
     #     conf = load_ai_config()
@@ -180,7 +881,110 @@ def list_messages(
     # except Exception:
     #     concurrency = 8
     # ensure_message_features(db, list(items), concurrency=concurrency)
-    return {"total": int(total), "items": [MessageOut.model_validate(i) for i in items]}
+    compat_items: list[MessageOut] = []
+    for i in items:
+        normalized = _normalize_wechat_gateway_message_fields(i.sender_id, i.sender_name, i.chat_id, i.talker_name, i.type, i.content_text, i.media_url, i.meta, db=db)
+        out = MessageOut(
+            id=int(i.id),
+            chat_id=i.chat_id,
+            sender_id=i.sender_id,
+            sender_name=normalized['sender_name'],
+            talker_name=normalized['talker_name'],
+            timestamp=i.timestamp,
+            direction=i.direction,
+            type=normalized['type'],
+            content_text=_truncate_text((normalized.get('meta') or {}).get('display_title') or i.content_text, content_max_chars),
+            media_url=normalized['media_url'],
+            meta=(None if not include_meta else _sanitize_meta_for_list(normalized['meta'])),
+            tags=_coerce_json_field(i.tags),
+            derived=_coerce_json_field(i.derived),
+            importance_score=int(i.importance_score or 0),
+            upvotes=int(i.upvotes or 0),
+            downvotes=int(i.downvotes or 0),
+        )
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            d["display_summary"] = _compose_message_display_summary(d)
+            out.derived = d
+        except Exception:
+            pass
+        compat_items.append(out)
+    return {"total": int(total), "items": compat_items}
+
+
+
+@router.get("/mp", response_model=PaginatedMessages)
+def list_mp_messages(
+    page: int = 1,
+    size: int = 50,
+    time_from: Optional[str] = None,
+    time_to: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """List WeChat official account (gh_*) push messages for the 公众号 module."""
+    page = max(1, page)
+    size = max(1, min(500, size))
+
+    query = select(Message).where(
+        or_(
+            Message.sender_id.like("gh_%"),
+            Message.chat_id.like("gh_%"),
+        ),
+        or_(Message.direction == "in", Message.direction == None, Message.direction == ""),
+    )
+
+    if chat_id:
+        query = query.where(Message.chat_id == chat_id)
+
+    def _parse_dt(v):
+        if not v:
+            return None
+        try:
+            if len(v) == 10:
+                return datetime.fromisoformat(v + "T00:00:00")
+            text = v.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            return dt
+        except Exception:
+            return None
+
+    dt_from = _parse_dt(time_from)
+    dt_to = _parse_dt(time_to)
+    if dt_from:
+        query = query.where(Message.timestamp >= dt_from)
+    if dt_to:
+        query = query.where(Message.timestamp <= dt_to)
+
+    total = db.execute(select(func.count()).select_from(query.subquery())).scalar() or 0
+    items = db.execute(query.order_by(Message.timestamp.desc()).limit(size).offset((page - 1) * size)).scalars().all()
+
+    data: list[MessageOut] = []
+    for m in items:
+        out = MessageOut.model_validate(m)
+        appmsg = _extract_wechat_appmsg(m.content_text)
+        if appmsg:
+            d = dict(out.derived or {})
+            if appmsg.get("title"):
+                d["mp_title"] = str(appmsg["title"]).strip()
+            if appmsg.get("desc"):
+                d["mp_desc"] = str(appmsg["desc"]).strip()
+            if appmsg.get("url"):
+                d["mp_url"] = str(appmsg["url"]).strip()
+            if appmsg.get("sourcedisplayname"):
+                d["mp_source"] = str(appmsg["sourcedisplayname"]).strip()
+            if appmsg.get("thumburl"):
+                d["mp_thumb"] = str(appmsg["thumburl"]).strip()
+            out.derived = d
+        data.append(out)
+
+    return {"total": int(total), "items": data}
 
 
 @router.get("/effective", response_model=PaginatedMessages)
@@ -296,7 +1100,20 @@ def list_effective_messages(
     if id_map:
         orm_page = db.execute(select(Message).where(Message.id.in_(id_map))).scalars().all()
         orm_page.sort(key=lambda m: m.timestamp or datetime.min, reverse=True)
-    return {"total": int(total), "items": [MessageOut.model_validate(i) for i in orm_page]}
+    compat_items: list[MessageOut] = []
+    for i in orm_page:
+        out = MessageOut.model_validate(i)
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            out.derived = d
+        except Exception:
+            pass
+        compat_items.append(out)
+    return {"total": int(total), "items": compat_items}
 
 
 @router.post("/{message_id}/upvote", response_model=UpDownVoteResult)
@@ -413,7 +1230,29 @@ def export_messages(
             "ORDER BY m.timestamp DESC"
         )
         rows = db.execute(fts_sql, params).mappings().all()
-        items = [MessageOut(**dict(r)) for r in rows]
+        items = []
+        for r in rows:
+            rd = dict(r)
+            # Fix JSON field parsing for FTS queries
+            try:
+                if isinstance(rd.get("meta"), str):
+                    rd["meta"] = json.loads(rd["meta"]) if rd["meta"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["meta"] = None
+                
+            try:
+                if isinstance(rd.get("derived"), str):
+                    rd["derived"] = json.loads(rd["derived"]) if rd["derived"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["derived"] = None
+                
+            try:
+                if isinstance(rd.get("tags"), str):
+                    rd["tags"] = json.loads(rd["tags"]) if rd["tags"] else None
+            except (json.JSONDecodeError, TypeError):
+                rd["tags"] = None
+            
+            items.append(MessageOut(**rd))
     else:
         query = select(Message)
         if chat_id:
@@ -472,83 +1311,39 @@ def export_messages(
 
 @router.post("/derive")
 def derive_message_features(body: MessageDeriveRequest, progress_key: str | None = None, db: Session = Depends(get_db)):
-    query = select(Message)
-    if body.message_ids:
-        query = query.where(Message.id.in_(body.message_ids))
-    else:
-        period = (body.period or "").lower()
-        period_mapping = {
-            "1day": 1,
-            "3days": 3,
-            "1week": 7,
-            "1month": 30,
-        }
-        days = period_mapping.get(period)
-        if days:
-            since = datetime.utcnow() - timedelta(days=days)
-            query = query.where(Message.timestamp >= since)
-        if body.limit:
-            query = query.order_by(Message.timestamp.desc()).limit(max(1, body.limit))
-        elif not days:
-            query = query.order_by(Message.timestamp.desc()).limit(500)
-        else:
-            query = query.order_by(Message.timestamp.desc())
-
-    messages: List[Message] = db.execute(query).scalars().all()
-    if not messages:
+    body, effective_force = _prepare_derive_request(body)
+    message_ids = _resolve_message_ids(db, body)
+    if not message_ids:
         if progress_key:
-            PROGRESS[progress_key] = {"status": "done", "total": 0, "done": 0}
+            _set_progress(progress_key, status="done", total=0, done=0, updated=0, errors=[], debug=[])
             return {"status": "ok", "updated": 0, "progress_key": progress_key}
         return {"status": "ok", "updated": 0}
 
-    # fallback to configured defaults if fields not provided
-    try:
-        conf = load_ai_config()
-        dd = conf.get("derive_defaults") or {}
-    except Exception:
-        dd = {}
-    if body.batch_size is None:
-        body.batch_size = int(dd.get("batch_size", 20))
-    if body.concurrency is None:
-        body.concurrency = int(dd.get("concurrency", 8))
-    if body.temperature is None:
-        body.temperature = float(dd.get("temperature", 0.1))
-    if body.force is None:
-        body.force = bool(dd.get("force", False))
-
     if progress_key:
-        PROGRESS[progress_key] = {
-            "status": "running",
-            "total": len(messages),
-            "done": 0,
-        }
-        # process in chunks to report progress
-        bs = max(1, int(body.batch_size or 20))
-        idx = 0
-        while idx < len(messages):
-            chunk = messages[idx : idx + bs]
-            ensure_message_features(
-                db,
-                chunk,
-                force=body.force,
-                batch_size=bs,
-                concurrency=body.concurrency,
-                temperature=body.temperature,
+        with _PROGRESS_LOCK:
+            existing = _DERIVE_JOBS.get(progress_key)
+            if existing and existing.is_alive():
+                info = dict(PROGRESS.get(progress_key) or {})
+                return {
+                    "status": str(info.get("status") or "running"),
+                    "updated": int(info.get("updated") or 0),
+                    "progress_key": progress_key,
+                    "total": int(info.get("total") or len(message_ids)),
+                    "done": int(info.get("done") or 0),
+                }
+            _set_progress(progress_key, status="queued", total=len(message_ids), done=0, updated=0, errors=[], debug=[])
+            thread = threading.Thread(
+                target=_run_derive_job,
+                args=(progress_key, body.model_dump(), message_ids),
+                daemon=True,
+                name=f"msg-derive-{progress_key}",
             )
-            PROGRESS[progress_key]["done"] = min(len(messages), idx + len(chunk))
-            idx += bs
-        PROGRESS[progress_key]["status"] = "done"
-        return {"status": "ok", "updated": len(messages), "progress_key": progress_key}
+            _DERIVE_JOBS[progress_key] = thread
+            thread.start()
+        return {"status": "queued", "updated": 0, "progress_key": progress_key, "total": len(message_ids), "done": 0}
 
-    ensure_message_features(
-        db,
-        messages,
-        force=body.force,
-        batch_size=body.batch_size,
-        concurrency=body.concurrency,
-        temperature=body.temperature,
-    )
-    return {"status": "ok", "updated": len(messages)}
+    messages: List[Message] = db.execute(select(Message).where(Message.id.in_(message_ids)).order_by(Message.timestamp.desc())).scalars().all()
+    return _derive_messages_internal(db, messages, body, effective_force=effective_force, progress_key=None)
 
 
 @router.get("/derive/progress")
@@ -556,7 +1351,14 @@ def derive_progress(key: str):
     info = PROGRESS.get(key)
     if not info:
         return {"status": "unknown", "done": 0, "total": 0}
-    return {"status": info.get("status"), "done": info.get("done"), "total": info.get("total")}
+    return {
+        "status": info.get("status"),
+        "done": info.get("done"),
+        "total": info.get("total"),
+        "updated": info.get("updated", 0),
+        "errors": info.get("errors", [])[:10],
+        "error": info.get("error"),
+    }
 
 
 @router.get("/by-ids", response_model=PaginatedMessages)
@@ -570,4 +1372,19 @@ def get_messages_by_ids(ids: str, db: Session = Depends(get_db)):
     rows = db.execute(select(Message).where(Message.id.in_(id_list))).scalars().all()
     # keep same order
     rows.sort(key=lambda m: (m.timestamp or datetime.min), reverse=True)
-    return {"total": len(rows), "items": [MessageOut.model_validate(i) for i in rows]}
+
+    items: list[MessageOut] = []
+    for i in rows:
+        out = MessageOut.model_validate(i)
+        try:
+            d = dict(out.derived or {})
+            if (d.get("summary_full") or d.get("summary")) and not d.get("key_info"):
+                d["key_info"] = d.get("summary_full") or d.get("summary") or ""
+            if d.get("summary_origin") and not d.get("key_info_origin"):
+                d["key_info_origin"] = d.get("summary_origin")
+            d["display_summary"] = _compose_message_display_summary(d)
+            out.derived = d
+        except Exception:
+            pass
+        items.append(out)
+    return {"total": len(rows), "items": items}

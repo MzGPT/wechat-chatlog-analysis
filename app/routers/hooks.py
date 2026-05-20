@@ -6,6 +6,7 @@ from datetime import datetime
 from ..db import SessionLocal
 from ..models import Message, Chat, Contact
 from ..schemas import ChatlogWebhookBody
+from ..services.sync_service import _build_chatlog_media_url, _extract_contents_dict
 
 
 router = APIRouter(prefix="/hooks", tags=["hooks"])
@@ -55,8 +56,8 @@ def chatlog_webhook(body: ChatlogWebhookBody, db: Session = Depends(get_db)):
             direction="in" if not m.isSelf else "out",
             type=str(m.type),
             content_text=m.content,
-            media_url=None,
-            meta={"subType": m.subType},
+            media_url=_build_chatlog_media_url(m.type, _extract_contents_dict(m.contents)),
+            meta={"subType": m.subType, **({"contents": m.contents} if isinstance(m.contents, dict) else {})},
         )
         db.add(msg)
         new_count += 1
@@ -67,4 +68,3 @@ def chatlog_webhook(body: ChatlogWebhookBody, db: Session = Depends(get_db)):
     db.commit()
 
     return {"status": "ok", "inserted": new_count, "host": host}
-

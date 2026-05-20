@@ -91,3 +91,21 @@ CREATE INDEX IF NOT EXISTS ix_analysis_snapshots_scope_key ON analysis_snapshots
 ### 使用建议
 - 消息同步后调用 `upsert_snapshot()` 刷新对应窗口数据。
 - AI 总结 (`/api/ai/summary`) 直接读取最新快照，保证结果与消息列表一致。
+
+---
+
+## Message.derived 字段更新（2025-10-20）
+
+- 变更要点
+  - 删除 `key_info` 字段；统一使用：
+    - `summary`：可见摘要文本（带前缀 `ai:` 或 `fallback:` 便于溯源）。
+    - `summary_full`：较长摘要（用于邮件和后续扩展）。
+    - `summary_origin`：`fallback` | `tool`，标识来源；前端据此配色。
+  - 其余派生字段维持：`keywords`、`meeting_number`、`platform`、`tone`、`category`、`meeting_link` 等。
+
+- 写入策略（两段式）
+  - 兜底阶段：`populate_fallback_derived()` 即时写入 `summary` 与基本派生；
+  - 覆盖阶段：`ensure_message_features()` 仅在小模型成功时完全覆盖 `summary` 并将 `summary_origin=tool`；不做“填空式合并”。
+
+- 前端渲染建议
+  - 绑定 `derived.summary` 并根据 `summary_origin` 上色；展示层去除前缀字符串。

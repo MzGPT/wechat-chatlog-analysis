@@ -1,23 +1,48 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-.mypy_cache/
-.pytest_cache/
-.coverage
+# 0913 Platform — .gitignore
 
-# Env & virtualenv
+# Environment & secrets
 .env
-.env.*
-.venv/
+.env.production
+.env.production-lite
+*.env.local
 
-# App runtime data
-data/
+# Database (contains credentials in gateway config)
+data/app.db
+data/app.db.*
+data/*
+!data/
+!data/ai_config.json.example
+*.db
+*.sqlite
+
+# Runtime
 uvicorn.log
+*.log
 .uvicorn.pid
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
 
-# OS/editor
-.DS_Store
+# Backups
+backups/
+*.bak
+*.bak-*
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+.jiebang/
+.playwright-mcp/
+.hermes/
+media-collector/.cache/

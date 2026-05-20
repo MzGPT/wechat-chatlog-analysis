@@ -16,12 +16,26 @@ SYSTEM_PATTERNS = (
     "通过了你的朋友验证",
     "邀请\"",
     "加入群聊",
+    "进入群聊",
     "已经成为朋友",
     "群主已开启",
     "系统消息",
     "红包已领取",
     "转账已接收",
+    # WeChat XML system message patterns
+    "<sysmsg",
+    "<gamecenter",
+    "<voipinvitemsg",
+    "<voip",
+    "<MSourceNote",
 )
+
+# WeChat-specific sender/chat IDs that are noise for the main WeChat message list
+WECHAT_NOISE_SENDER_IDS = frozenset({"weixin"})
+WECHAT_NOISE_CHAT_IDS = frozenset({"filehelper"})
+
+# WeChat sender/chat ID prefixes for official accounts (公众号)
+MP_SENDER_PREFIX = "gh_"
 
 
 def is_outgoing(direction: str | None) -> bool:
@@ -46,7 +60,8 @@ def is_short_message(text: str | None) -> bool:
         return True
     chinese = sum(1 for ch in compact if "\u4e00" <= ch <= "\u9fff")
     if chinese > 0:
-        return chinese <= 15
+        # 定义：低于 15 个中文字视为短消息（垃圾）
+        return chinese < 15
     return len(compact) <= 30
 
 
@@ -66,4 +81,3 @@ def filter_effective_messages(
         if exclude_short and is_short_message(text):
             continue
         yield r
-

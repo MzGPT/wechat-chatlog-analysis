@@ -1,12 +1,27 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from ..db import SessionLocal
 from ..models import Contact, SyncState
+from ..config import settings
 import json
-from ..schemas import ContactOut
+from ..schemas import ContactOut, ContactsLookupRequest
+from ..services.chatlog_contact_book import resolve_contact_db, iter_chatlog_contacts
+from ..services.contact_scoring import (
+    build_contact_score_summaries,
+    build_contact_scorecard,
+    is_sales_contact_payload,
+    is_focus_contact,
+    resolve_auto_rating,
+    resolve_contact_watch,
+    resolve_contact_stats,
+    resolve_manual_rating,
+    set_contact_focus,
+    set_contact_watch,
+    summarize_contact_score,
+)
 
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
@@ -21,8 +36,85 @@ def get_db():
 
 
 @router.get("", response_model=list[ContactOut])
-def list_contacts(db: Session = Depends(get_db)):
-    items = db.execute(select(Contact).order_by(Contact.rating.desc())).scalars().all()
+def list_contacts(
+    limit: int | None = None,
+    offset: int = 0,
+    include_labels: bool = False,
+    response: Response = None,
+    db: Session = Depends(get_db),
+):
+    total = db.execute(select(func.count()).select_from(Contact)).scalar() or 0
+    query = select(Contact).order_by(Contact.rating.desc())
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    items = db.execute(query).scalars().all()
+    if response is not None:
+        response.headers["X-Total-Count"] = str(int(total))
+    score_summaries = build_contact_score_summaries(db, [str(item.id) for item in items])
+    out: list[ContactOut] = []
+    for i in items:
+        stats = resolve_contact_stats(i)
+        is_sales = is_sales_contact_payload({
+            "name": i.name,
+            "alias": i.alias,
+            "labels": i.labels,
+        })
+        payload = {
+            "id": i.id,
+            "name": i.name,
+            "alias": i.alias,
+            "rating": i.rating,
+            "labels": i.labels if include_labels else None,
+            "manual_rating": resolve_manual_rating(i),
+            "auto_rating": resolve_auto_rating(i),
+            "sample_size": int(stats.get("sample_size", 0) or 0),
+            "hit_rate_overall": float(stats.get("hit_rate_overall", 0.0) or 0.0),
+            "last_scored_at": stats.get("last_scored_at"),
+            "focus": is_focus_contact(i),
+            "watch": resolve_contact_watch(i),
+            "score_summary": score_summaries.get(str(i.id)),
+            "role": "sales" if is_sales else "research",
+            "is_sales": is_sales,
+        }
+        out.append(ContactOut.model_validate(payload))
+    return out
+
+
+@router.get("/ratings")
+def list_contact_ratings(db: Session = Depends(get_db)):
+    rows = db.execute(select(Contact.id, Contact.rating)).all()
+    return {str(contact_id): int(rating or 50) for contact_id, rating in rows if contact_id}
+
+
+@router.get("/labels")
+def list_contact_labels():
+    """List all WeChat contact labels (tags) from chatlog contact.db."""
+    contact_db = resolve_contact_db(settings.CHATLOG_DIR)
+    if not contact_db:
+        raise HTTPException(400, "chatlog contact.db not found (check CHATLOG_DIR)")
+    import sqlite3
+
+    con = sqlite3.connect(str(contact_db))
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute("SELECT label_id_, label_name_ FROM contact_label ORDER BY sort_order_, label_id_").fetchall()
+        items = []
+        for r in rows:
+            name = str(r["label_name_"] or "").strip()
+            if not name:
+                continue
+            items.append({"id": int(r["label_id_"]), "name": name})
+        return {"status": "ok", "items": items, "contact_db": str(contact_db)}
+    finally:
+        con.close()
+
+
+@router.post("/lookup", response_model=list[ContactOut])
+def lookup_contacts(body: ContactsLookupRequest, db: Session = Depends(get_db)):
+    ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
+    if not ids:
+        return []
+    items = db.execute(select(Contact).where(Contact.id.in_(ids))).scalars().all()
     return [ContactOut.model_validate(i) for i in items]
 
 
@@ -31,10 +123,61 @@ def set_rating(contact_id: str, delta: int, db: Session = Depends(get_db)):
     c = db.get(Contact, contact_id)
     if not c:
         raise HTTPException(404, "contact not found")
-    c.rating = max(0, min(100, (c.rating or 50) + delta))
+    stats = resolve_contact_stats(c)
+    manual_rating = max(0, min(100, int(round(resolve_manual_rating(c) + delta))))
+    auto_rating = resolve_auto_rating(c)
+    final_rating = manual_rating if auto_rating is None else round(manual_rating * 0.3 + float(auto_rating) * 0.7)
+    stats["manual_rating"] = manual_rating
+    stats["final_rating"] = final_rating
+    if auto_rating is not None:
+        stats["auto_rating"] = float(auto_rating)
+    c.stats = stats
+    c.rating = max(0, min(100, int(round(final_rating))))
     db.add(c)
     db.commit()
     return {"id": c.id, "rating": c.rating}
+
+
+@router.post("/{contact_id}/focus")
+def toggle_contact_focus(contact_id: str, enabled: bool = True, db: Session = Depends(get_db)):
+    c = db.get(Contact, contact_id)
+    if not c:
+        raise HTTPException(404, "contact not found")
+    row = set_contact_focus(db, contact_id, enabled)
+    return {"contact_id": row.contact_id, "enabled": row.enabled}
+
+
+@router.post("/{contact_id}/watch")
+def toggle_contact_watch(
+    contact_id: str,
+    enabled: bool = True,
+    reason: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    c = db.get(Contact, contact_id)
+    if not c:
+        raise HTTPException(404, "contact not found")
+    try:
+        payload = set_contact_watch(db, contact_id, enabled, reason=reason)
+    except ValueError:
+        raise HTTPException(404, "contact not found")
+    return {"contact_id": contact_id, **payload}
+
+
+@router.get("/{contact_id}/scorecard")
+def get_contact_scorecard(contact_id: str, db: Session = Depends(get_db)):
+    payload = build_contact_scorecard(db, contact_id)
+    if not payload:
+        raise HTTPException(404, "contact not found")
+    return payload
+
+
+@router.get("/{contact_id}/predictions")
+def list_contact_predictions(contact_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    payload = build_contact_scorecard(db, contact_id, limit=limit)
+    if not payload:
+        raise HTTPException(404, "contact not found")
+    return {"contact_id": contact_id, "items": payload["predictions"]}
 
 
 @router.delete("/{contact_id}")
@@ -68,3 +211,72 @@ def add_to_blacklist(contact_id: str, db: Session = Depends(get_db)):
     db.add(row)
     db.commit()
     return {"status": "ok", "blacklist_senders": arr}
+
+
+@router.post("/sync-book")
+def sync_contact_book(limit: int | None = None, insert_missing: bool = True, db: Session = Depends(get_db)):
+    """Sync contact nick/remark/labels from local chatlog contact.db into our contacts table.
+
+    This enables displaying remark names and WeChat labels (tags) in UI.
+    """
+    contact_db = resolve_contact_db(settings.CHATLOG_DIR)
+    if not contact_db:
+        raise HTTPException(400, "chatlog contact.db not found (check CHATLOG_DIR)")
+
+    existing = {c.id: c for c in db.execute(select(Contact)).scalars().all()}
+    inserted = 0
+    updated = 0
+    updated_alias = 0
+    updated_labels = 0
+
+    for rec in iter_chatlog_contacts(contact_db, limit=limit):
+        cid = rec.wxid
+        if not cid:
+            continue
+        c = existing.get(cid)
+        if not c:
+            if not insert_missing:
+                continue
+            c = Contact(
+                id=cid,
+                name=rec.nick_name or None,
+                alias=rec.remark or None,
+                rating=50,
+                labels=({"tags": rec.label_names, "source": "chatlog_contact_db"} if rec.label_names else None),
+                stats={"manual_rating": 50, "final_rating": 50, "auto_focus": False},
+            )
+            db.add(c)
+            existing[cid] = c
+            inserted += 1
+            continue
+
+        changed = False
+        if rec.nick_name and (not c.name or c.name != rec.nick_name):
+            c.name = rec.nick_name
+            changed = True
+        if rec.remark and (not c.alias or c.alias != rec.remark):
+            c.alias = rec.remark
+            changed = True
+            updated_alias += 1
+        if rec.label_names:
+            next_labels = {"tags": rec.label_names, "source": "chatlog_contact_db"}
+            if not c.labels or c.labels != next_labels:
+                c.labels = next_labels
+                changed = True
+                updated_labels += 1
+        if not c.stats:
+            c.stats = {"manual_rating": c.rating or 50, "final_rating": c.rating or 50}
+            changed = True
+        if changed:
+            db.add(c)
+            updated += 1
+
+    db.commit()
+    return {
+        "status": "ok",
+        "contact_db": str(contact_db),
+        "inserted": inserted,
+        "updated": updated,
+        "updated_alias": updated_alias,
+        "updated_labels": updated_labels,
+    }

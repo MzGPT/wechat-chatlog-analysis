@@ -38,9 +38,23 @@ class ContactOut(BaseModel):
     alias: Optional[str]
     rating: int
     labels: Optional[dict]
+    manual_rating: Optional[float] = None
+    auto_rating: Optional[float] = None
+    sample_size: Optional[int] = None
+    hit_rate_overall: Optional[float] = None
+    last_scored_at: Optional[str] = None
+    focus: Optional[bool] = None
+    watch: Optional[dict] = None
+    score_summary: Optional[dict] = None
+    role: Optional[str] = None
+    is_sales: Optional[bool] = None
 
     class Config:
         from_attributes = True
+
+
+class ContactsLookupRequest(BaseModel):
+    ids: List[str]
 
 
 class ChatOut(BaseModel):
@@ -88,11 +102,104 @@ class MessageDeriveRequest(BaseModel):
 
 class SendItem(BaseModel):
     target: str  # chat_id or talker
-    text: str
+    text: str = ""
+    target_name: Optional[str] = None
+    content_parts: Optional[List[dict]] = None
+    attachments: Optional[List[dict]] = None
+    campaign_id: Optional[int] = None
+    delivery_id: Optional[int] = None
+    template_vars: Optional[dict] = None
+    provider_override: Optional[str] = None
+    channel: Optional[str] = None
 
 
 class SendRequest(BaseModel):
     items: List[SendItem]
+
+
+class SendUploadOut(BaseModel):
+    file_id: str
+    name: str
+    mime: Optional[str] = None
+    size: int = 0
+    url: str
+    kind: Optional[str] = None
+
+
+class SendCapabilityOut(BaseModel):
+    provider: str
+    configured: bool
+    supports_text: bool = True
+    supports_link: bool = True
+    supports_image: bool = False
+    supports_file: bool = False
+    fallback_text_for_media: bool = True
+    upload_max_bytes: int = 0
+    notes: List[str] = Field(default_factory=list)
+
+
+class SendDeliveryOut(BaseModel):
+    id: int
+    campaign_id: int
+    target_id: str
+    target_name: Optional[str] = None
+    rendered_text: Optional[str] = None
+    content_parts: Optional[Any] = None
+    attachment_snapshot: Optional[Any] = None
+    provider: Optional[str] = None
+    channel: Optional[str] = None
+    status: str
+    error: Optional[str] = None
+    provider_result: Optional[dict] = None
+    sent_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SendCampaignOut(BaseModel):
+    id: int
+    title: Optional[str] = None
+    body_text: Optional[str] = None
+    content_parts: Optional[Any] = None
+    attachments: Optional[Any] = None
+    provider: Optional[str] = None
+    channel: Optional[str] = None
+    created_by: Optional[str] = None
+    status: str
+    target_count: int
+    success_count: int
+    failed_count: int
+    meta: Optional[dict] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SendCampaignDetailOut(SendCampaignOut):
+    deliveries: List[SendDeliveryOut] = Field(default_factory=list)
+
+
+class SendCampaignCreateRequest(BaseModel):
+    title: Optional[str] = None
+    body_text: Optional[str] = None
+    content_parts: Optional[List[dict]] = None
+    attachments: Optional[List[dict]] = None
+    items: List[SendItem] = Field(default_factory=list)
+    provider_override: Optional[str] = None
+    channel: Optional[str] = None
+    created_by: Optional[str] = None
+    send_now: bool = True
+    save_only: bool = False
+
+
+class SendRetryRequest(BaseModel):
+    delivery_ids: Optional[List[int]] = None
+    target_ids: Optional[List[str]] = None
 
 
 class TaskOut(BaseModel):
@@ -106,6 +213,22 @@ class Health(BaseModel):
     status: str
     chatlog_http_base: Optional[str]
     chatlog_dir: Optional[str]
+
+
+class HealthCheckItem(BaseModel):
+    name: str
+    status: str
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    latency_ms: Optional[int] = None
+
+
+class ReadyOut(BaseModel):
+    status: str
+    healthy: bool
+    error_code: Optional[str] = None
+    checks: List[HealthCheckItem] = Field(default_factory=list)
+    timestamp: Optional[str] = None
 
 
 class ChatlogWebhookMessage(BaseModel):
@@ -218,6 +341,7 @@ class EmailMessageOut(BaseModel):
     body_html: str | None = None
     flags: List[str] | None = None
     meta: dict | None = None
+    derived: dict | None = None
 
     class Config:
         from_attributes = True

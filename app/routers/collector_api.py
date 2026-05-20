@@ -1,0 +1,134 @@
+"""media-collector 管理 API — 状态查询 + 关键词配置"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/api/collector", tags=["collector"])
+
+
+class KeywordsUpdate(BaseModel):
+    keywords: list[str]
+
+
+class AuthorsUpdate(BaseModel):
+    authors: list[str]
+
+
+def _keywords_path() -> Path:
+    return (Path(__file__).resolve().parent.parent.parent / "media-collector" / "keywords.json").resolve()
+
+
+def _authors_path() -> Path:
+    return (Path(__file__).resolve().parent.parent.parent / "media-collector" / "authors.json").resolve()
+
+
+@router.get("/keywords")
+def get_keywords():
+    """获取当前关键词列表"""
+    path = _keywords_path()
+    if not path.exists():
+        return {"keywords": [], "path": str(path)}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {
+            "keywords": data.get("keywords", []),
+            "description": data.get("description", ""),
+            "updated": data.get("updated", ""),
+            "path": str(path),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/keywords")
+def update_keywords(payload: KeywordsUpdate):
+    """更新关键词列表"""
+    path = _keywords_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = {}
+        if path.exists():
+            with open(path) as f:
+                existing = json.load(f)
+        existing["keywords"] = payload.keywords
+        from datetime import date
+        existing["updated"] = str(date.today())
+        with open(path, "w") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        return {"ok": True, "path": str(path), "count": len(payload.keywords)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/authors")
+def get_authors():
+    """获取当前作者列表"""
+    path = _authors_path()
+    if not path.exists():
+        return {"authors": [], "path": str(path)}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {
+            "authors": data.get("authors", []),
+            "description": data.get("description", ""),
+            "updated": data.get("updated", ""),
+            "platform": data.get("platform", "bilibili"),
+            "path": str(path),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/authors")
+def update_authors(payload: AuthorsUpdate):
+    """更新作者列表"""
+    path = _authors_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = {}
+        if path.exists():
+            with open(path) as f:
+                existing = json.load(f)
+        existing["authors"] = payload.authors
+        from datetime import date
+        existing["updated"] = str(date.today())
+        existing.setdefault("platform", "bilibili")
+        with open(path, "w") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        return {"ok": True, "path": str(path), "count": len(payload.authors)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/status")
+def collector_status():
+    """采集器数据状态"""
+    from ..services.media_collector_store import get_collector_status
+    return get_collector_status()
+
+
+@router.get("/hot")
+def hot_items(limit: int = 50):
+    """获取热榜数据"""
+    from ..services.media_collector_store import list_hot_items
+    return list_hot_items(limit=limit)
+
+
+@router.get("/search")
+def search_items(keyword: str = "", limit: int = 50):
+    """获取搜索结果"""
+    from ..services.media_collector_store import list_search_items
+    return list_search_items(limit=limit, keyword=keyword or None)
+
+
+@router.get("/authors/items")
+def author_items(author: str = "", limit: int = 50):
+    """获取作者搜索结果"""
+    from ..services.media_collector_store import list_author_items
+    return list_author_items(limit=limit, author=author or None)
