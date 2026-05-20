@@ -158,7 +158,7 @@ bash scripts/deploy-0913.sh /opt/0913
 cat >> ~/.hermes/.env <<'EOF'
 API_SERVER_ENABLED=true
 API_SERVER_PORT=8642
-API_SERVER_KEY=0913-wechat-gateway-bridge-key-v1
+API_SERVER_KEY=<your-hermes-api-server-key>
 HERMES_MINIMAX_CN_API_KEY=<你的MiniMax API Key>
 EOF
 
@@ -375,7 +375,7 @@ HERMES_FALLBACK_ENABLED=false   # 生产建议false，避免静默降级
 ```bash
 API_SERVER_ENABLED=true
 API_SERVER_PORT=8642
-API_SERVER_KEY=0913-wechat-gateway-bridge-key-v1
+API_SERVER_KEY=<your-hermes-api-server-key>
 HERMES_MINIMAX_CN_API_KEY=<MiniMax key>
 DEEPSEEK_API_KEY=<DeepSeek key>  # 主对话模型
 ```

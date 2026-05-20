@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ── Hermes API Server 配置 ──────────────────────────────────────────
 HERMES_API_BASE = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642")
-HERMES_API_KEY = os.getenv("HERMES_API_KEY", "0913-wechat-gateway-bridge-key-v1")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_SESSION_ID = "wechat_gateway_default"  # fallback when chat_id is empty
 HERMES_CHAT_URL = f"{HERMES_API_BASE.rstrip('/')}/v1/chat/completions"
 TIMEOUT = 180  # agent loop 可能较慢（tool calls, wiki 搜索等）

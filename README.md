@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="static/assets/deepseek-brand-logo.webp" alt="Deepseek 深瞳 logo" width="520">
+  <img src="static/assets/deepsee-brand-logo.webp" alt="Deepsee 深瞳 logo" width="520">
 </p>
 
-<h1 align="center">Deepsee<span style="color:#9ca3af">k</span></h1>
+<h1 align="center">Deepsee</h1>
 
 <p align="center">
   <strong>深瞳：全领域个人信息流 API 平台</strong>
@@ -28,7 +28,7 @@
 
 ## 核心定位
 
-Deepseek / 深瞳不是单一消息工具，而是一套面向个人与团队 Agent 的信息流操作系统：
+Deepsee / 深瞳不是单一消息工具，而是一套面向个人与团队 Agent 的信息流操作系统：
 
 - **统一接入**：汇聚微信、邮件、会议纪要、新闻、自媒体、公众号等高频信息源。
 - **结构化沉淀**：将分散内容转为消息、联系人、主题、观点、资产、摘要、评分等可复用数据。
@@ -53,7 +53,7 @@ Deepseek / 深瞳不是单一消息工具，而是一套面向个人与团队 Ag
 
 ## Agent API
 
-Deepseek 适合作为 Agent 的个人信息流工具层。Agent 可以围绕这些能力构建自动化工作流：
+Deepsee 适合作为 Agent 的个人信息流工具层。Agent 可以围绕这些能力构建自动化工作流：
 
 | 能力 | 示例用途 |
 |------|----------|
@@ -80,8 +80,8 @@ Deepseek 适合作为 Agent 的个人信息流工具层。Agent 可以围绕这�
 ## 安装
 
 ```bash
-git clone git@github.com:leecyno1/wechat-chatlog-analysis-v0.8.git deepseek
-cd deepseek
+git clone https://github.com/leecyno1/Deepsee.git
+cd Deepsee
 bash scripts/manage.sh install
 bash scripts/manage.sh start
 ```
@@ -96,7 +96,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ## WeChat API 对接
 
-Deepseek 可通过 wechatapi.net 的 iPad 协议接入微信，也可在云服务器侧与龙虾、Hermes 等服务组合部署。配置要求：
+Deepsee 可通过 wechatapi.net 的 iPad 协议接入微信，也可在云服务器侧与龙虾、Hermes 等服务组合部署。配置要求：
 
 1. wechatapi token + app_id（从 [wechatapi 控制台](https://wechatapi.net/) 获取）
 2. 回调公网 URL（可使用 natapp/ngrok/frp 或云服务器反向代理）
@@ -113,4 +113,4 @@ bash scripts/manage.sh dev
 
 ## 许可证
 
-Private — leecyno1
+Apache-2.0 — see `LICENSE`.

@@ -120,7 +120,7 @@
 ## 6) 备份与发布记录（v0.8.0）
 
 ### GitHub 仓库（新建）
-- Repo：`https://github.com/leecyno1/wechat-chatlog-analysis-v0.8`（Private）
+- Repo：`https://github.com/leecyno1/Deepsee`（Public）
 - Release Tag：`v0.8.0`
 - Release Commit：`653724debf4a738730368106d939dcaf072ce8b0`
 

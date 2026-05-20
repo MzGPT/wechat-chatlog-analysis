@@ -4,13 +4,16 @@
 输出每一步的耗时、工具调用、wiki 搜索、最终回复
 """
 
-import json, time, sys
+import json, os, time, sys
 import requests
 
 # ── 配置 ──
 HERMES_URL = "http://127.0.0.1:8642/v1/chat/completions"
-API_KEY = "0913-wechat-gateway-bridge-key-v1"
+API_KEY = os.getenv("HERMES_API_KEY", "")
 SESSION_ID = "wechat_gateway_e2e_test"
+
+if not API_KEY:
+    raise SystemExit("请先设置 HERMES_API_KEY 环境变量后再运行端到端测试。")
 
 # ── 模拟 0913 回调发来的微信消息 ──
 TEST_CASES = [
