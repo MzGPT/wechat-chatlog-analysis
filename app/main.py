@@ -19,7 +19,10 @@ import os
 
 
 def _api_token_auth_enabled() -> bool:
-    return bool(_configured_api_tokens())
+    # Deepsee is now deployed as a private workspace app without a project-level
+    # login gate. Keep token helpers for downstream integrations, but do not
+    # block the UI/API behind API_TOKEN.
+    return False
 
 
 def _configured_api_tokens() -> set[str]:

@@ -32,6 +32,7 @@ from .market_data import (
 
 
 EXTRACTOR_VERSION = "contact-score-v1"
+SCORING_VERSION = "contact-score-calibrated-v2"
 DEFAULT_HORIZON_FLAGS = {"1m": True, "3m": True, "1y": True}
 HORIZON_DAYS = {"1m": 30, "3m": 90, "1y": 365}
 DEFAULT_BENCHMARK = DEFAULT_BENCHMARK_CODE
@@ -121,13 +122,35 @@ BEARISH_PATTERNS = [
     r"做空",
 ]
 
-ACCURACY_WEIGHT = 0.6
-SERVICE_VALUE_WEIGHT = 0.4
+ACCURACY_WEIGHT = 0.72
+SERVICE_VALUE_WEIGHT = 0.28
 DEFAULT_SERVICE_VALUE_SCORE = 50.0
+HIT_RATE_PRIOR_STRENGTH = 4.0
+HIT_RATE_PRIOR = 0.5
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, float(value)))
+
+
+def _sample_confidence(sample_size: int | float, *, mature_sample: int = 24) -> float:
+    """Evidence confidence used to avoid over-scoring 1-3 lucky samples."""
+    size = max(0.0, float(sample_size or 0))
+    if size <= 0:
+        return 0.0
+    return _clamp(math.log1p(size) / math.log1p(max(1, mature_sample)), 0.0, 1.0)
+
+
+def _shrink_score(score: float, confidence: float, *, midpoint: float = 50.0) -> float:
+    return _clamp(midpoint + (float(score or midpoint) - midpoint) * _clamp(confidence, 0.0, 1.0))
+
+
+def _bayesian_rate(hits: float, samples: float) -> float:
+    samples = max(0.0, float(samples or 0))
+    hits = max(0.0, float(hits or 0))
+    if samples <= 0:
+        return HIT_RATE_PRIOR
+    return (hits + HIT_RATE_PRIOR * HIT_RATE_PRIOR_STRENGTH) / (samples + HIT_RATE_PRIOR_STRENGTH)
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -452,6 +475,7 @@ def _compute_service_value_breakdown(
     }
 
     total_clusters = max(len(deduped_events), 1)
+    evidence_confidence = _sample_confidence(total_clusters, mature_sample=20)
     topic_keys = {str(item.get("topic_key") or "").strip() for item in deduped_events if str(item.get("topic_key") or "").strip()}
     asset_codes = {str(item.get("asset_code") or "").strip() for item in deduped_events if str(item.get("asset_code") or "").strip()}
 
@@ -485,26 +509,16 @@ def _compute_service_value_breakdown(
     else:
         avg_age = 180.0
 
-    roadshow_value_score = round(
-        _clamp(46.0 + min(26.0, roadshow_count * 16.0) + min(14.0, exchange_count * 4.0)),
-        2,
-    )
-    exchange_value_score = round(
-        _clamp(48.0 + min(24.0, exchange_count * 10.0) + min(8.0, len(topic_keys) * 2.0)),
-        2,
-    )
-    timeliness_score = round(
-        _clamp(42.0 + recent_ratio * 36.0 + max(0.0, 18.0 - min(avg_age, 180.0) / 10.0)),
-        2,
-    )
-    coverage_depth_score = round(
-        _clamp(44.0 + min(28.0, len(topic_keys) * 9.0) + min(18.0, len(asset_codes) * 6.0)),
-        2,
-    )
-    signal_cleanliness_score = round(
-        _clamp(40.0 + avg_strength * 28.0 + strong_ratio * 16.0 + evaluated_ratio * 16.0),
-        2,
-    )
+    raw_roadshow_value_score = _clamp(43.0 + min(22.0, roadshow_count * 10.0) + min(10.0, exchange_count * 2.5))
+    raw_exchange_value_score = _clamp(45.0 + min(20.0, exchange_count * 5.5) + min(7.0, len(topic_keys) * 1.4))
+    raw_timeliness_score = _clamp(42.0 + recent_ratio * 30.0 + max(0.0, 14.0 - min(avg_age, 180.0) / 12.0))
+    raw_coverage_depth_score = _clamp(43.0 + min(22.0, len(topic_keys) * 5.5) + min(12.0, len(asset_codes) * 3.5))
+    raw_signal_cleanliness_score = _clamp(40.0 + avg_strength * 24.0 + strong_ratio * 12.0 + evaluated_ratio * 12.0)
+    roadshow_value_score = round(_shrink_score(raw_roadshow_value_score, evidence_confidence), 2)
+    exchange_value_score = round(_shrink_score(raw_exchange_value_score, evidence_confidence), 2)
+    timeliness_score = round(_shrink_score(raw_timeliness_score, evidence_confidence), 2)
+    coverage_depth_score = round(_shrink_score(raw_coverage_depth_score, evidence_confidence), 2)
+    signal_cleanliness_score = round(_shrink_score(raw_signal_cleanliness_score, evidence_confidence), 2)
     return {
         "roadshow_value_score": roadshow_value_score,
         "exchange_value_score": exchange_value_score,
@@ -1026,39 +1040,46 @@ def summarize_contact_score(
         }
 
     hit_values = [1.0 if bool(item.get("direction_hit")) else 0.0 for item in rows]
-    hit_rate_overall = sum(hit_values) / sample_size
+    raw_hit_rate_overall = sum(hit_values) / sample_size
+    hit_rate_overall = _bayesian_rate(sum(hit_values), sample_size)
     accuracy_by_horizon: dict[str, float] = {}
     for horizon_code in HORIZON_DAYS:
         horizon_hits = [1.0 if bool(item.get("direction_hit")) else 0.0 for item in rows if item.get("horizon_code") == horizon_code]
-        accuracy_by_horizon[horizon_code] = (sum(horizon_hits) / len(horizon_hits)) if horizon_hits else 0.0
+        accuracy_by_horizon[horizon_code] = _bayesian_rate(sum(horizon_hits), len(horizon_hits)) if horizon_hits else 0.0
 
     excess_values = [float(item.get("excess_return") or 0.0) for item in rows]
     excess_mean = sum(excess_values) / len(excess_values)
     score_values = [float(item.get("event_score") or 50.0) for item in rows]
     volatility = pstdev(score_values) if len(score_values) > 1 else 0.0
     stability_score = round(_clamp(100.0 - volatility * 1.6), 2)
-    frequency_penalty = round(max(0.0, (sample_size - 24) * 0.6), 2)
+    frequency_penalty = round(max(0.0, (sample_size - 12) * 0.45) + max(0.0, (sample_size - 36) * 0.35), 2)
     risk_rows = [row for row in rows if str(row.get("event_kind") or "") == "risk_alert"]
     risk_hits = [1.0 if bool(item.get("direction_hit")) else 0.0 for item in risk_rows]
 
     direction_accuracy_score = round(_clamp(hit_rate_overall * 100.0), 2)
-    excess_return_score = round(_clamp(50.0 + 50.0 * max(-1.0, min(1.0, excess_mean / 0.12))), 2)
-    risk_alert_score = round(_clamp((sum(risk_hits) / len(risk_hits)) * 100.0), 2) if risk_hits else 50.0
+    excess_return_score = round(_clamp(50.0 + 50.0 * max(-1.0, min(1.0, excess_mean / 0.10))), 2)
+    risk_alert_score = round(_clamp(_bayesian_rate(sum(risk_hits), len(risk_hits)) * 100.0), 2) if risk_hits else 50.0
     consistency_score = stability_score
-    sample_bonus = 6.0 * min(1.0, sample_size / 12.0)
-    accuracy_score = round(
+    evidence_confidence = _sample_confidence(sample_size, mature_sample=24)
+    raw_accuracy_score = _clamp(
+        direction_accuracy_score * 0.48
+        + excess_return_score * 0.28
+        + risk_alert_score * 0.12
+        + consistency_score * 0.12
+        - frequency_penalty
+    )
+    accuracy_score = round(_shrink_score(raw_accuracy_score, evidence_confidence), 2)
+    service_value_score = round(_shrink_score(service_value_score, min(1.0, 0.25 + evidence_confidence * 0.75)), 2)
+    raw_final_rating = _clamp(accuracy_score * ACCURACY_WEIGHT + service_value_score * SERVICE_VALUE_WEIGHT)
+    final_confidence = min(1.0, 0.2 + evidence_confidence * 0.8)
+    final_rating = round(
         _clamp(
-            direction_accuracy_score * 0.4167
-            + excess_return_score * 0.25
-            + risk_alert_score * 0.1667
-            + consistency_score * 0.1666
-            + sample_bonus
-            - frequency_penalty
+            _shrink_score(raw_final_rating, final_confidence)
+            + max(-6.0, min(6.0, (raw_hit_rate_overall - 0.5) * 10.0 * evidence_confidence))
         ),
         2,
     )
     auto_rating = accuracy_score
-    final_rating = round(_clamp(accuracy_score * ACCURACY_WEIGHT + service_value_score * SERVICE_VALUE_WEIGHT), 2)
     return {
         "contact_id": contact_id,
         "manual_rating": round(_clamp(manual_rating), 2),
@@ -1544,6 +1565,7 @@ def recompute_contact_scores(db: Session, *, contact_ids: set[str] | None = None
                 "stability_score": summary["stability_score"],
                 "frequency_penalty": summary["frequency_penalty"],
                 "last_scored_at": as_of.isoformat(),
+                "scoring_version": SCORING_VERSION,
             }
         )
         contact.stats = stats

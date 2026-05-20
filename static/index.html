@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deepsee - 深瞳：全面洞察自己的消息流管理引擎</title>
+    <title>Deepseek - 深瞳：全面洞察自己的消息流管理引擎</title>
     <link rel="icon" type="image/png" href="/static/assets/dasheng-brandmark.png">
     <!-- ECharts: 用于仪表盘可视化（包含词云扩展） -->
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
@@ -157,203 +157,6 @@
             font-size: 12px;
         }
 
-        .access-gate {
-            position: fixed;
-            inset: 0;
-            z-index: 10000;
-            display: none;
-            align-items: baseline;
-            justify-content: center;
-            padding: 16px;
-            background: rgba(2, 8, 23, 0.52);
-            backdrop-filter: blur(2px);
-        }
-
-        .access-gate.active {
-            display: flex;
-        }
-
-        .access-card {
-            width: min(920px, 100%);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            background: var(--surface-elevated);
-            box-shadow: var(--shadow);
-            padding: 16px;
-            color: var(--text-primary);
-        }
-
-        .access-layout {
-            display: grid;
-            grid-template-columns: minmax(280px, 1fr) minmax(320px, 360px);
-            gap: 10px;
-            align-items: stretch;
-        }
-
-        .access-main {
-            min-width: 0;
-        }
-
-        .access-company {
-            border: 1px solid var(--border-color);
-            border-radius: 10px;
-            background: var(--panel-muted);
-            padding: 10px;
-            display: flex;
-            flex-direction: column;
-            gap: 18px;
-        }
-
-        .access-company-title {
-            font-size: 15px;
-            font-weight: 800;
-            color: var(--title-accent);
-            letter-spacing: 0.02em;
-        }
-
-        .access-company-desc {
-            margin: 0;
-            color: var(--text-secondary);
-            line-height: 1.45;
-            font-size: 12px;
-        }
-
-        .access-contact-list {
-            display: grid;
-            gap: 6px;
-            margin: 4px 0 2px;
-            font-size: 12px;
-        }
-
-        .access-contact-list .item {
-            display: grid;
-            grid-template-columns: 52px 1fr;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .access-contact-list .label {
-            color: var(--text-muted);
-            font-weight: 700;
-        }
-
-        .access-contact-list .value {
-            color: var(--text-primary);
-            font-weight: 600;
-            word-break: break-all;
-        }
-
-        @media (max-width: 860px) {
-            .access-layout {
-                grid-template-columns: 1fr;
-            }
-            .access-company {
-                order: 2;
-            }
-        }
-
-        .access-card h2 {
-            margin: 0 0 8px;
-            font-size: 16px;
-            font-weight: 800;
-        }
-
-        .access-card p {
-            margin: 0 0 12px;
-            color: var(--text-secondary);
-            line-height: 1.45;
-        }
-
-        .access-row {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            margin-top: 10px;
-        }
-
-        .access-token-input {
-            width: 100%;
-            min-height: 32px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            background: var(--panel-muted);
-            color: var(--text-primary);
-            padding: 6px 10px;
-            outline: none;
-        }
-
-        .access-token-input:focus {
-            border-color: var(--focus);
-            box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.24);
-        }
-
-        .access-msg {
-            min-height: 18px;
-            margin-top: 10px;
-            color: var(--text-secondary);
-            font-size: 12px;
-        }
-
-        .access-msg.error {
-            color: #dc2626;
-        }
-
-        .tab.guest-hidden {
-            display: none !important;
-        }
-
-        .module-panel.guest-hidden-panel {
-            display: none !important;
-        }
-
-        body.guest-readonly #ai-summary .analysis-toolbar,
-        body.guest-readonly #ai-summary .summary-header-actions,
-        body.guest-readonly #dashboard .filters {
-            pointer-events: none;
-            opacity: 0.6;
-        }
-
-        body.guest-readonly .module-tabs .tab {
-            pointer-events: auto;
-            opacity: 1;
-        }
-
-        body.guest-readonly .module-tabs .tab.guest-disabled-tab {
-            opacity: 0.65;
-            cursor: pointer;
-        }
-
-        body.guest-readonly .module-panel.guest-blur-panel {
-            position: relative;
-            isolation: isolate;
-        }
-
-        body.guest-readonly .module-panel.guest-blur-panel > * {
-            filter: blur(6px) saturate(0.8);
-            pointer-events: none !important;
-            user-select: none;
-        }
-
-        body.guest-readonly .module-panel.guest-blur-panel::after {
-            content: '游客演示模式：内容已模糊，仅用于展示';
-            position: absolute;
-            inset: 12px 12px auto 12px;
-            z-index: 8;
-            display: block;
-            padding: 10px 12px;
-            border-radius: 10px;
-            border: 1px solid var(--border-color);
-            background: var(--panel-muted);
-            color: var(--text-secondary);
-            font-size: 12px;
-            font-weight: 700;
-            letter-spacing: .01em;
-            pointer-events: none;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        
         .container {
             max-width: 1900px;
             margin: 0 auto;
@@ -469,7 +272,13 @@
             color: #000;
             letter-spacing: 0;
         }
-        .brand-soft-letter { color: #b8bec8; }
+        .brand-soft-letter {
+            color: #b8bec8;
+            -webkit-text-stroke: 0;
+            text-shadow: none;
+            text-decoration: underline;
+            text-decoration-color: #b8bec8;
+        }
         body.theme-hacker .brand-name { color: #f8fafc; background: none; -webkit-background-clip: initial; background-clip: initial; }
         body.theme-hacker .brand-tagline { color: #94a3b8; }
 
@@ -4937,6 +4746,22 @@
             background: var(--surface-elevated);
             padding: 2px;
         }
+        .contact-score-panel.is-blue {
+            background: linear-gradient(135deg, rgba(10,132,255,.10), var(--surface-elevated) 58%);
+            border-color: color-mix(in srgb, #0a84ff 28%, var(--border-color));
+        }
+        .contact-score-panel.is-orange {
+            background: linear-gradient(135deg, rgba(245,158,11,.12), var(--surface-elevated) 58%);
+            border-color: color-mix(in srgb, #f59e0b 28%, var(--border-color));
+        }
+        .contact-score-panel.is-green {
+            background: linear-gradient(135deg, rgba(22,163,74,.10), var(--surface-elevated) 58%);
+            border-color: color-mix(in srgb, #16a34a 24%, var(--border-color));
+        }
+        .contact-score-panel.is-red {
+            background: linear-gradient(135deg, rgba(239,68,68,.10), var(--surface-elevated) 58%);
+            border-color: color-mix(in srgb, #ef4444 24%, var(--border-color));
+        }
         .contact-score-panel.compact {
             padding: 2px;
         }
@@ -4979,7 +4804,19 @@
             content: '收起';
         }
         .contact-score-fold-body {
-            padding: 2px;
+            padding: 0;
+            display: grid;
+            gap: 1px;
+            align-items: start;
+            min-height: 0;
+            line-height: 1.1;
+        }
+        .contact-score-fold-body:empty {
+            display: none;
+        }
+        .contact-score-fold-body > * {
+            margin-top: 0 !important;
+            margin-bottom: 0 !important;
         }
         .contact-score-panel h5 {
             margin: 0 0 2px;
@@ -5034,14 +4871,14 @@
         .contact-score-asset-list,
         .contact-score-event-list {
             display: grid;
-            gap: 2px;
+            gap: 1px;
         }
         .contact-score-asset-item,
         .contact-score-event-item {
             border: 1px solid var(--border-color);
             border-radius: 7px;
             background: var(--panel-muted);
-            padding: 3px 5px;
+            padding: 2px 5px;
         }
         .contact-score-asset-head,
         .contact-score-event-head {
@@ -5096,11 +4933,11 @@
         }
         .contact-score-event-item.single-line {
             display: grid;
-            grid-template-columns: 84px minmax(92px, .8fr) 54px minmax(120px, 1fr) minmax(160px, 1.6fr);
+            grid-template-columns: 84px minmax(96px, .8fr) 54px 70px minmax(160px, 1.8fr);
             gap: 6px;
             align-items: center;
-            padding: 4px 6px;
-            min-height: 28px;
+            padding: 2px 6px;
+            min-height: 22px;
         }
         .contact-score-event-item.single-line > span {
             min-width: 0;
@@ -5240,7 +5077,7 @@
             display: block;
         }
         .contact-score-trend-chart.multi {
-            height: 236px;
+            height: 360px;
         }
         .contact-score-legend {
             display: flex;
@@ -5312,13 +5149,13 @@
         }
         .contact-score-radar-wrap {
             display: grid;
-            grid-template-columns: 126px 1fr;
-            gap: 6px;
+            grid-template-columns: 164px 1fr;
+            gap: 8px;
             align-items: center;
         }
         .contact-score-radar {
-            width: 126px;
-            height: 104px;
+            width: 164px;
+            height: 140px;
             display: block;
         }
         .contact-score-radar-list {
@@ -5340,7 +5177,7 @@
         }
         .contact-score-overview {
             display: grid;
-            grid-template-columns: minmax(380px, 2.05fr) repeat(8, minmax(76px, .48fr));
+            grid-template-columns: minmax(270px, .9fr) minmax(0, 2fr);
             gap: 3px;
             align-items: stretch;
         }
@@ -5354,9 +5191,14 @@
             align-content: center;
             gap: 3px;
         }
+        .contact-score-summary-board {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 3px;
+        }
         .contact-score-identity h3 {
             margin: 0;
-            font-size: 16px;
+            font-size: 15px;
             line-height: 1.15;
             white-space: nowrap;
             overflow: hidden;
@@ -5377,10 +5219,26 @@
         .contact-score-overview-item {
             border: 1px solid var(--border-color);
             border-radius: 9px;
-            background: var(--panel-muted);
+            background: linear-gradient(135deg, rgba(10,132,255,.08), var(--panel-muted));
             padding: 3px 6px;
             min-width: 0;
-            min-height: 46px;
+            min-height: 34px;
+        }
+        .contact-score-overview-item.is-score {
+            background: linear-gradient(135deg, rgba(239,68,68,.14), rgba(245,158,11,.08));
+            border-color: color-mix(in srgb, #ef4444 25%, var(--border-color));
+        }
+        .contact-score-overview-item.is-accuracy {
+            background: linear-gradient(135deg, rgba(10,132,255,.14), rgba(14,165,233,.06));
+            border-color: color-mix(in srgb, #0a84ff 24%, var(--border-color));
+        }
+        .contact-score-overview-item.is-value {
+            background: linear-gradient(135deg, rgba(22,163,74,.14), rgba(34,197,94,.06));
+            border-color: color-mix(in srgb, #16a34a 24%, var(--border-color));
+        }
+        .contact-score-overview-item.is-risk {
+            background: linear-gradient(135deg, rgba(245,158,11,.14), rgba(251,191,36,.06));
+            border-color: color-mix(in srgb, #f59e0b 24%, var(--border-color));
         }
         .contact-score-overview-item.is-secondary {
             background: color-mix(in srgb, var(--panel-muted) 58%, var(--surface-elevated));
@@ -5408,7 +5266,7 @@
         }
         .contact-score-chart-row {
             display: grid;
-            grid-template-columns: minmax(0, 1.75fr) minmax(330px, .48fr);
+            grid-template-columns: minmax(0, 1.58fr) minmax(360px, .62fr);
             gap: 3px;
         }
         .contact-score-insight-strip {
@@ -5473,6 +5331,14 @@
         .contact-score-terminal tbody tr:hover td {
             background: color-mix(in srgb, var(--brand-blue) 10%, var(--surface-elevated));
         }
+        .contact-score-terminal tbody tr[data-msg-id] {
+            cursor: pointer;
+        }
+        .contact-score-terminal tbody tr[data-msg-id]:hover td:last-child {
+            color: var(--brand-blue);
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
         .contact-score-terminal .is-good {
             color: #dc2626;
             font-weight: 800;
@@ -5482,12 +5348,12 @@
             font-weight: 800;
         }
         .contact-score-terminal-scroll {
-            max-height: 318px;
+            max-height: min(238px, 34vh);
             overflow: auto;
             border-radius: 8px;
         }
         .contact-score-terminal-scroll.is-tall {
-            max-height: 360px;
+            max-height: min(238px, 34vh);
         }
         .contact-score-fold[open] > .contact-score-fold-body .contact-score-terminal-scroll {
             margin: 0;
@@ -5552,10 +5418,10 @@
             display: flex;
             align-items: center;
             gap: 6px;
-            min-height: 18px;
-            margin-bottom: 2px;
+            min-height: 14px;
+            margin-bottom: 0;
             color: var(--text-muted);
-            font-size: 10.5px;
+            font-size: 10px;
         }
         .contact-score-filter-chip {
             display: inline-flex;
@@ -5581,6 +5447,16 @@
             display: grid;
             gap: 3px;
             align-content: start;
+        }
+        .contact-score-dynamic-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 3px;
+            align-items: start;
+        }
+        .contact-score-one-line-list {
+            display: grid;
+            gap: 1px;
         }
         .contact-table .contact-source,
         .contact-table .contact-auto-score,
@@ -7658,35 +7534,11 @@
     </script>
 </head>
 <body>
-    <div id="accessGate" class="access-gate" aria-hidden="true">
-        <div class="access-card" role="dialog" aria-modal="true" aria-labelledby="accessGateTitle">
-            <div class="access-layout">
-                <div class="access-main">
-                    <h2 id="accessGateTitle">API Token 登录</h2>
-                    <p>请选择进入方式。游客浏览会显示并可进入全部标签；除“数据看板/AI总结”外，其余模块仅模糊展示且不可操作。</p>
-                    <input id="accessTokenInput" class="access-token-input" type="password" placeholder="请输入密码">
-                    <div class="access-row">
-                        <button id="accessConfirmBtn" class="analysis-btn">确认登录</button>
-                        <button id="accessGuestBtn" class="analysis-btn secondary">游客浏览</button>
-                    </div>
-                    <div id="accessGateMsg" class="access-msg"></div>
-                </div>
-                <aside class="access-company" aria-label="公司信息与联系方式">
-                    <div class="access-company-title">Deepsee</div>
-                    <p class="access-company-desc">深瞳 · 全面洞察自己的消息流管理引擎</p>
-                    <div class="access-contact-list">
-                        <div class="item"><span class="label">邮箱</span><span class="value">tianzisheng100@gmail.com</span></div>
-                        <div class="item"><span class="label">电话</span><span class="value">15601206220</span></div>
-                    </div>
-                </aside>
-            </div>
-        </div>
-    </div>
     <div class="container">
         
         <div class="header">
             <div class="progress"><div class="bar" id="globalProgressBar"></div></div>
-		            <h1 aria-label="Deepsee，深瞳：全面洞察自己的消息流管理引擎">
+		            <h1 aria-label="Deepseek，深瞳：全面洞察自己的消息流管理引擎">
 		                <span class="brand-badge">
 		                    <span class="lemon-logo" aria-hidden="true">
 		                        <img src="/static/assets/dasheng-brandmark.png" alt="深瞳 Logo">
@@ -10039,26 +9891,20 @@
         let defaultOnepagePrompt = { system: '', user: '' };
         let currentPromptScope = 'module';
         const GENERIC_STOPWORDS = new Set(['流通','总股本','总','行业','公司','市场','我们','他们','自己','情况','方面','一个','目前','相关','以及','需要','可能','建议','关注','投资','主要','影响','继续','发生','变化','预计','今年','明年','分析','数据','板块','上涨','下跌','走势','风险','机会']);
-        const GUEST_CLEAR_MODULES = new Set(['dashboard', 'ai-summary']);
         const ACCESS_TOKEN_STORAGE_KEY = 'dl_api_token';
-        let currentAccessMode = 'pending'; // pending | confirmed | guest
-        let accessGuardBound = false;
+        let currentAccessMode = 'confirmed';
         let accessBootstrapped = false;
-        let accessWarnAt = 0;
-        let guestRestrictTabs = true;
 
         function canAccessModule(moduleId) {
             return true;
         }
 
         function isGuestBlurModule(moduleId) {
-            if (currentAccessMode !== 'guest') return false;
-            if (!guestRestrictTabs) return false;
-            return !GUEST_CLEAR_MODULES.has(String(moduleId || '').trim());
+            return false;
         }
 
         function guestUseCacheOnly() {
-            return currentAccessMode === 'guest' && !String(window.__apiToken || '').trim();
+            return false;
         }
 
         function shouldSkipGuestModuleLoad(moduleId) {
@@ -10070,14 +9916,7 @@
         }
 
         function isGuestAllowedApiPath(urlLike) {
-            try {
-                const absolute = new URL(String(urlLike || ''), window.location.origin);
-                if (absolute.origin !== window.location.origin) return true;
-                const path = absolute.pathname || '';
-                return path === '/api/health' || path === '/api/ready' || path === '/api/access/verify';
-            } catch (_) {
-                return false;
-            }
+            return true;
         }
 
         function setApiToken(token) {
@@ -10122,32 +9961,20 @@
         }
 
         function setAccessGateMessage(text, isError = false) {
-            const msg = document.getElementById('accessGateMsg');
-            if (!msg) return;
-            msg.textContent = String(text || '');
-            msg.classList.toggle('error', !!isError);
         }
 
         function showGuestReadonlyHint() {
-            const now = Date.now();
-            if (now - accessWarnAt < 900) return;
-            accessWarnAt = now;
-            setAnalysisStatus('游客浏览模式：全部标签可浏览；除数据看板/AI总结外均为模糊只读展示');
         }
 
         function applyAccessModeUi() {
-            const isGuest = currentAccessMode === 'guest';
-            document.body.classList.toggle('guest-readonly', isGuest);
+            document.body.classList.remove('guest-readonly');
             document.querySelectorAll('.module-tabs .tab[data-module]').forEach((tab) => {
-                const moduleId = String(tab.dataset.module || '').trim();
-                const blur = isGuest && guestRestrictTabs && isGuestBlurModule(moduleId);
-                // 游客模式：标签全部可见，并允许切换到各模块；敏感模块内容模糊展示。
                 tab.classList.remove('guest-hidden');
-                tab.classList.toggle('guest-disabled-tab', blur);
+                tab.classList.remove('guest-disabled-tab');
             });
             document.querySelectorAll('.module-panel[id]').forEach((panel) => {
                 panel.classList.remove('guest-hidden-panel');
-                panel.classList.toggle('guest-blur-panel', isGuest && guestRestrictTabs && isGuestBlurModule(panel.id));
+                panel.classList.remove('guest-blur-panel');
             });
         }
 
@@ -10163,40 +9990,12 @@
         }
 
         function bindGuestReadOnlyGuard() {
-            if (accessGuardBound) return;
-            accessGuardBound = true;
-            const block = (event) => {
-                if (currentAccessMode !== 'guest') return;
-                const t = event.target;
-                if (!(t instanceof Element)) return;
-                if (guestActionAllowed(t)) return;
-                const interactive = t.closest('button,a,input,select,textarea,label,.action-btn,.analysis-btn,.pagination-btn,.time-tab,.prompt-tab,.prompt-scope-tab,.list-tab,.save-btn,[onclick]');
-                if (!interactive) return;
-                event.preventDefault();
-                event.stopPropagation();
-                showGuestReadonlyHint();
-            };
-            document.addEventListener('click', block, true);
-            document.addEventListener('change', block, true);
-            document.addEventListener('submit', block, true);
         }
 
         function hideAccessGate() {
-            const gate = document.getElementById('accessGate');
-            if (!gate) return;
-            try {
-                if (gate.contains(document.activeElement)) document.activeElement.blur();
-            } catch (_) { /* ignore */ }
-            gate.classList.remove('active');
-            gate.setAttribute('aria-hidden', 'true');
         }
 
         function showAccessGate(message = '') {
-            const gate = document.getElementById('accessGate');
-            if (!gate) return;
-            gate.classList.add('active');
-            gate.setAttribute('aria-hidden', 'false');
-            if (message) setAccessGateMessage(message, false);
         }
 
         function ensureBootstrapAfterAccess() {
@@ -10218,69 +10017,12 @@
         }
 
         function initAccessGate() {
-            const gate = document.getElementById('accessGate');
-            const tokenInput = document.getElementById('accessTokenInput');
-            const confirmBtn = document.getElementById('accessConfirmBtn');
-            const guestBtn = document.getElementById('accessGuestBtn');
-            if (!gate || !confirmBtn || !guestBtn || !tokenInput) {
-                ensureBootstrapAfterAccess();
-                return;
-            }
             const stored = getStoredApiToken();
-            if (stored) tokenInput.value = stored;
+            if (stored) setApiToken(stored);
+            currentAccessMode = 'confirmed';
             installApiFetchAuthBridge();
-            bindGuestReadOnlyGuard();
-
-            if (!confirmBtn._boundAccess) {
-                confirmBtn._boundAccess = true;
-                confirmBtn.addEventListener('click', async () => {
-                    const token = String(tokenInput.value || '').trim();
-                    if (!token) {
-                        setAccessGateMessage('请输入密码', true);
-                        return;
-                    }
-                    confirmBtn.disabled = true;
-                    guestBtn.disabled = true;
-                    setAccessGateMessage('正在验证 Token...', false);
-                    try {
-                        await verifyTokenWithHealth(token);
-                        setApiToken(token);
-                        currentAccessMode = 'confirmed';
-                        applyAccessModeUi();
-                        hideAccessGate();
-                        ensureBootstrapAfterAccess();
-                    } catch (error) {
-                        setAccessGateMessage(`Token 验证失败：${error?.message || error}`, true);
-                    } finally {
-                        confirmBtn.disabled = false;
-                        guestBtn.disabled = false;
-                    }
-                });
-            }
-            if (!tokenInput._boundAccessEnter) {
-                tokenInput._boundAccessEnter = true;
-                tokenInput.addEventListener('keydown', (event) => {
-                    if (event.key === 'Enter') {
-                        event.preventDefault();
-                        confirmBtn.click();
-                    }
-                });
-            }
-            if (!guestBtn._boundAccess) {
-                guestBtn._boundAccess = true;
-                guestBtn.addEventListener('click', () => {
-                    // 游客模式禁止使用 token，确保只读且不触发隐私接口。
-                    window.__apiToken = '';
-                    currentAccessMode = 'guest';
-                    guestRestrictTabs = true;
-                    applyAccessModeUi();
-                    setAccessGateMessage('游客模式：全部标签可浏览；非看板/AI总结模块为模糊只读展示。', false);
-                    hideAccessGate();
-                    ensureBootstrapAfterAccess();
-                    try { ensureAiFeaturesInitialized(); } catch (_) { }
-                });
-            }
-            showAccessGate();
+            applyAccessModeUi();
+            ensureBootstrapAfterAccess();
         }
 
         function escapeHtml(value) {
@@ -12689,6 +12431,7 @@
                         `<div class="link" data-jump-id="${esc(String(m.id))}">在消息列表中查看</div>`;
                 }catch(e){ console.warn('popover error', e); }
             }
+            window.showMessagePopover = showMessagePopover;
             async function showNewsPopover(target, newsId){
                 try{
                     closePopover(); if (!newsId) return;
@@ -17602,7 +17345,12 @@
                 ['覆盖', values.coverage_depth_score],
                 ['纯度', values.signal_cleanliness_score],
             ];
-            return `<div class="contact-score-matrix">${rows.map(([label, value]) => contactScoreMatrixRow(label, value)).join('')}</div>`;
+            return renderContactSubScores({
+                recommendation_accuracy: { score: data.recommendation_accuracy?.score, recent_90d_score: data.recommendation_accuracy?.recent_90d_score, recent_90d_samples: data.recommendation_accuracy?.recent_90d_samples },
+                risk_alert_effectiveness: { score: data.risk_alert_effectiveness?.score, recent_90d_score: data.risk_alert_effectiveness?.recent_90d_score, recent_90d_samples: data.risk_alert_effectiveness?.recent_90d_samples },
+                exchange_activity: { score: data.exchange_activity?.score ?? values.exchange_value_score, recent_90d_score: data.exchange_activity?.recent_90d_score ?? values.exchange_value_score, recent_90d_samples: data.exchange_activity?.recent_90d_samples },
+                roadshow_value: { score: data.roadshow_value?.score ?? values.roadshow_value_score, recent_90d_score: data.roadshow_value?.recent_90d_score ?? values.roadshow_value_score, recent_90d_samples: data.roadshow_value?.recent_90d_samples },
+            }) + `<div class="contact-score-matrix">${rows.slice(4).map(([label, value]) => contactScoreMatrixRow(label, value)).join('')}</div>`;
         }
 
         function filterContactScorecardRows(asset, dateText){
@@ -17633,7 +17381,7 @@
             const table = document.querySelector('.contact-score-terminal[data-scorecard-table="predictions"]');
             if (table) table.querySelectorAll('tbody tr').forEach(row => { row.style.display = ''; });
             const filterBox = document.getElementById('contactScorecardFilter');
-            if (filterBox) filterBox.innerHTML = '<span>点击走势图锚点可筛选对应观点</span>';
+            if (filterBox) filterBox.innerHTML = '';
         }
 
         function renderContactClusterTopics(items){
@@ -17692,18 +17440,12 @@
                 const misses = Array.isArray(group.misses) ? group.misses : [];
                 const renderSide = (rows, toneClass, toneText) => rows.length
                     ? rows.slice(0, 3).map(item => `
-                        <div class="contact-score-event-item">
-                            <div class="contact-score-event-head">
-                                <div>
-                                    <div class="contact-score-event-title">${escapeHtml(item.asset_name || item.asset_code || '—')}</div>
-                                    <div class="contact-score-event-meta">${escapeHtml(formatContactTimestamp(item.source_time))} · ${escapeHtml(contactDirectionLabel(item.direction))}</div>
-                                </div>
-                                <div class="contact-score-chip ${toneClass}">${escapeHtml(toneText)}</div>
-                            </div>
-                            <div class="contact-score-chip-row">
-                                <span class="contact-score-chip">得分 ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
-                                <span class="contact-score-chip">${escapeHtml(formatSignedPercent(item.excess_return))}</span>
-                            </div>
+                        <div class="contact-score-event-item single-line" title="${escapeHtml((item.normalized_text || '').replace(/\s+/g, ' '))}">
+                            <span>${escapeHtml(formatContactTimestamp(item.source_time))}</span>
+                            <span>${escapeHtml(item.asset_name || item.asset_code || '—')}</span>
+                            <span class="${String(item.direction || '') === 'bearish' ? 'is-bad' : 'is-good'}">${escapeHtml(contactDirectionLabel(item.direction))}</span>
+                            <span class="${toneClass}">${escapeHtml(toneText)} ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
+                            <span>${escapeHtml(formatSignedPercent(item.excess_return))}</span>
                         </div>
                     `).join('')
                     : '<div class="contact-score-note">暂无样本</div>';
@@ -17791,21 +17533,12 @@
                 </div>
             `).join('') : '<div class="contact-score-note">暂无标的验证榜单</div>';
             const eventCard = (item, toneClass, toneText) => `
-                <div class="contact-score-event-item">
-                    <div class="contact-score-event-head">
-                        <div>
-                            <div class="contact-score-event-title">${escapeHtml(item.asset_name || item.asset_code || '—')} · ${escapeHtml(contactDirectionLabel(item.direction))}</div>
-                            <div class="contact-score-event-meta">${escapeHtml(formatContactTimestamp(item.source_time))} · ${escapeHtml(item.horizon_code || '待验证')}</div>
-                        </div>
-                        <div class="contact-score-chip ${toneClass}">${escapeHtml(toneText)}</div>
-                    </div>
-                    <div class="contact-score-chip-row">
-                        <span class="contact-score-chip">得分 ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
-                        <span class="contact-score-chip">${escapeHtml(formatSignedPercent(item.excess_return))}</span>
-                        <span class="contact-score-chip">置信 ${escapeHtml(String(Number(item.confidence || 0).toFixed(2)))}</span>
-                        ${item.is_actionable === false ? '<span class="contact-score-chip">服务事件</span>' : ''}
-                    </div>
-                    <div class="contact-score-event-body">${escapeHtml((item.normalized_text || '').slice(0, 120) || '—')}</div>
+                <div class="contact-score-event-item single-line ${toneClass}" title="${escapeHtml((item.normalized_text || '').replace(/\s+/g, ' '))}">
+                    <span>${escapeHtml(formatContactTimestamp(item.source_time))}</span>
+                    <span>${escapeHtml(item.asset_name || item.asset_code || '—')}</span>
+                    <span class="${String(item.direction || '') === 'bearish' ? 'is-bad' : 'is-good'}">${escapeHtml(contactDirectionLabel(item.direction))}</span>
+                    <span>${escapeHtml(toneText)} ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
+                    <span>${escapeHtml(formatSignedPercent(item.excess_return))} · ${escapeHtml((item.normalized_text || '').replace(/\s+/g, ' ').slice(0, 120) || '—')}</span>
                 </div>
             `;
             const recentHitsHtml = recentHits.length ? recentHits.map(item => eventCard(item, 'is-good', '命中')).join('') : '<div class="contact-score-note">暂无命中事件</div>';
@@ -17817,16 +17550,13 @@
             const subScoresHtml = renderContactSubScores(subScores);
             const clusterTopicsHtml = renderContactClusterTopics(clusterTopics);
             const actionHtml = renderContactActionRecommendation(recommendedAction);
-            const pendingHtml = pendingItems.length ? pendingItems.slice(0, 4).map(item => `
-                <div class="contact-score-event-item">
-                    <div class="contact-score-event-head">
-                        <div>
-                            <div class="contact-score-event-title">${escapeHtml(item.asset_name || item.asset_code || '—')} · ${escapeHtml(contactDirectionLabel(item.direction))}</div>
-                            <div class="contact-score-event-meta">${escapeHtml(formatContactTimestamp(item.source_time))} · 待验证</div>
-                        </div>
-                        <div class="contact-score-chip">置信 ${escapeHtml(String(Number(item.confidence || 0).toFixed(2)))}</div>
-                    </div>
-                    <div class="contact-score-event-body">${escapeHtml((item.normalized_text || '').slice(0, 120) || '—')}</div>
+            const pendingHtml = pendingItems.length ? pendingItems.slice(0, 6).map(item => `
+                <div class="contact-score-event-item single-line" title="${escapeHtml((item.normalized_text || '').replace(/\s+/g, ' '))}">
+                    <span>${escapeHtml(formatContactTimestamp(item.source_time))}</span>
+                    <span>${escapeHtml(item.asset_name || item.asset_code || '—')}</span>
+                    <span class="${String(item.direction || '') === 'bearish' ? 'is-bad' : 'is-good'}">${escapeHtml(contactDirectionLabel(item.direction))}</span>
+                    <span>置信 ${escapeHtml(String(Number(item.confidence || 0).toFixed(2)))}</span>
+                    <span>${escapeHtml((item.normalized_text || '').replace(/\s+/g, ' ').slice(0, 120) || '—')}</span>
                 </div>
             `).join('') : '<div class="contact-score-note">当前没有待验证的新观点</div>';
             const timelineRows = timeline.length ? timeline.slice(-12).reverse().map(item => `
@@ -17840,22 +17570,12 @@
                 </tr>
             `).join('') : '<tr><td colspan="6" class="contact-score-note">暂无历史评分快照</td></tr>';
             const caseCardsHtml = caseCards.length ? caseCards.map(item => `
-                <div class="contact-score-event-item">
-                    <div class="contact-score-event-head">
-                        <div>
-                            <div class="contact-score-event-title">${escapeHtml(item.title || item.asset_name || item.asset_code || '观点案例')}</div>
-                            <div class="contact-score-event-meta">${escapeHtml(formatContactTimestamp(item.source_time))} · ${escapeHtml(contactEventKindLabel(item.event_kind))} · ${escapeHtml(contactDirectionLabel(item.direction))}</div>
-                        </div>
-                        <div class="contact-score-chip ${item.case_type === 'hit' ? 'is-good' : 'is-bad'}">${escapeHtml(item.case_type === 'hit' ? '命中' : '失误')}</div>
-                    </div>
-                    <div class="contact-score-chip-row">
-                        <span class="contact-score-chip">${escapeHtml(contactThesisStatusLabel(item.thesis_status || 'pending'))}</span>
-                        <span class="contact-score-chip">${escapeHtml(String(item.horizon_code || '待验证').toUpperCase())}</span>
-                        <span class="contact-score-chip">得分 ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
-                        <span class="contact-score-chip">${escapeHtml(formatSignedPercent(item.excess_return))}</span>
-                        ${item.event_kind === 'roadshow_invite' || item.event_kind === 'strategy_exchange' ? '<span class="contact-score-chip">不计准确率</span>' : ''}
-                    </div>
-                    <div class="contact-score-event-body">${escapeHtml(item.summary || '—')}</div>
+                <div class="contact-score-event-item single-line" title="${escapeHtml(item.summary || item.title || '')}">
+                    <span>${escapeHtml(formatContactTimestamp(item.source_time))}</span>
+                    <span>${escapeHtml(item.title || item.asset_name || item.asset_code || '观点案例')}</span>
+                    <span class="${item.case_type === 'hit' ? 'is-good' : 'is-bad'}">${escapeHtml(item.case_type === 'hit' ? '命中' : '失误')}</span>
+                    <span>${escapeHtml(String(item.horizon_code || '待验证').toUpperCase())} ${escapeHtml(String(Number(item.event_score || 0).toFixed(0)))}</span>
+                    <span>${escapeHtml(formatSignedPercent(item.excess_return))} · ${escapeHtml(item.summary || '—')}</span>
                 </div>
             `).join('') : '<div class="contact-score-note">暂无观点归因卡片</div>';
             const annualHitRows = annualHitList.length ? annualHitList.map(item => `
@@ -17909,7 +17629,19 @@
                 </div>
             `;
             const scoreMatrixHtml = renderContactScoreMatrix(subScores, score?.value_breakdown || {});
-            const predictionRows = predictions.length ? predictions.slice(0, 20).map(item => {
+            const summaryBoardHtml = `
+                <div class="contact-score-summary-board">
+                    <div class="contact-score-overview-item is-score"><div class="contact-score-overview-label">综合分</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.final_rating || contact.rating || 0).toFixed(1)))}</div></div>
+                    <div class="contact-score-overview-item is-accuracy"><div class="contact-score-overview-label">准确度</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.accuracy_score || 0).toFixed(1)))}</div></div>
+                    <div class="contact-score-overview-item is-value"><div class="contact-score-overview-label">业务价值</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.service_value_score || 0).toFixed(1)))}</div></div>
+                    <div class="contact-score-overview-item is-risk"><div class="contact-score-overview-label">样本</div><div class="contact-score-overview-value">${escapeHtml(String(score.sample_size || 0))}</div></div>
+                    <div class="contact-score-overview-item is-accuracy"><div class="contact-score-overview-label">命中率</div><div class="contact-score-overview-value">${escapeHtml(formatContactHitRate(score.hit_rate_overall))}</div></div>
+                    <div class="contact-score-overview-item is-value"><div class="contact-score-overview-label">平均超额</div><div class="contact-score-overview-value">${escapeHtml(`${(Number(score.excess_mean || 0) * 100).toFixed(1)}%`)}</div></div>
+                    <div class="contact-score-overview-item is-risk"><div class="contact-score-overview-label">待验证</div><div class="contact-score-overview-value">${escapeHtml(String(analytics.pending_predictions ?? 0))}</div></div>
+                    <div class="contact-score-overview-item is-score"><div class="contact-score-overview-label">多/空</div><div class="contact-score-overview-value">${escapeHtml(`${analytics.bullish_predictions ?? 0}/${analytics.bearish_predictions ?? 0}`)}</div></div>
+                </div>
+            `;
+            const predictionRows = predictions.length ? predictions.slice(0, 12).map(item => {
                 const evals = Array.isArray(item.evaluations) ? item.evaluations : [];
                 const bestEval = evals.slice().sort((left, right) => Number(right.event_score || 0) - Number(left.event_score || 0))[0] || null;
                 const evalText = evals.length ? evals.map(ev => {
@@ -17932,8 +17664,9 @@
                 const excessText = bestEval ? formatSignedPercent(bestEval.excess_return) : (Number.isFinite(Number(thesisCard.latest_excess_return)) ? formatSignedPercent(thesisCard.latest_excess_return) : '—');
                 const assetName = item.asset_name || item.asset_code || '—';
                 const rowDate = String(item.source_time || '').slice(0, 10);
+                const sourceMsgId = String(item.source_message_id || '').trim();
                 return `
-                    <tr data-asset="${escapeHtml(assetName)}" data-date="${escapeHtml(rowDate)}" title="${escapeHtml(`${formatContactTimestamp(item.source_time)} · ${assetName} · ${contactDirectionLabel(item.direction)} · ${evalText} · ${rawText}`)}">
+                    <tr data-asset="${escapeHtml(assetName)}" data-date="${escapeHtml(rowDate)}"${sourceMsgId ? ` data-msg-id="${escapeHtml(sourceMsgId)}"` : ''} title="${escapeHtml(`${formatContactTimestamp(item.source_time)} · ${assetName} · ${contactDirectionLabel(item.direction)} · ${evalText} · ${sourceMsgId ? `消息#${sourceMsgId} · ` : ''}${rawText}`)}">
                         <td>${escapeHtml(formatContactTimestamp(item.source_time))}</td>
                         <td>${escapeHtml(assetName)}</td>
                         <td class="${String(item.direction || '') === 'bearish' ? 'is-bad' : 'is-good'}">${escapeHtml(contactDirectionLabel(item.direction))}</td>
@@ -17946,7 +17679,7 @@
                 `;
             }).join('') : '';
             const predictionTableHtml = predictionRows ? `
-                <div class="contact-score-table-filter" id="contactScorecardFilter"><span>点击走势图锚点可筛选对应观点</span></div>
+                <div class="contact-score-table-filter" id="contactScorecardFilter"></div>
                 <div class="contact-score-terminal-scroll is-tall">
                     <table class="contact-score-terminal" data-scorecard-table="predictions">
                         <colgroup>
@@ -17972,24 +17705,17 @@
                             <div class="contact-score-identity-meta">${escapeHtml(contact.id || '')}${badgeHtml ? ` · ${badgeHtml.replace(/<[^>]+>/g, ' ')}` : ''}</div>
                             ${insightStripHtml}
                         </div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">综合分</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.final_rating || contact.rating || 0).toFixed(1)))}</div></div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">准确度</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.accuracy_score || 0).toFixed(1)))}</div></div>
-                        <div class="contact-score-overview-item is-secondary"><div class="contact-score-overview-label">业务价值</div><div class="contact-score-overview-value">${escapeHtml(String(Number(score.service_value_score || 0).toFixed(1)))}</div></div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">样本</div><div class="contact-score-overview-value">${escapeHtml(String(score.sample_size || 0))}</div></div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">命中率</div><div class="contact-score-overview-value">${escapeHtml(formatContactHitRate(score.hit_rate_overall))}</div></div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">平均超额</div><div class="contact-score-overview-value">${escapeHtml(`${(Number(score.excess_mean || 0) * 100).toFixed(1)}%`)}</div></div>
-                        <div class="contact-score-overview-item"><div class="contact-score-overview-label">待验证</div><div class="contact-score-overview-value">${escapeHtml(String(analytics.pending_predictions ?? 0))}</div></div>
-                        <div class="contact-score-overview-item is-secondary"><div class="contact-score-overview-label">方向</div><div class="contact-score-overview-value">${escapeHtml(`${analytics.bullish_predictions ?? 0}/${analytics.bearish_predictions ?? 0}`)}</div></div>
+                        ${summaryBoardHtml}
                     </div>
                     <div class="contact-score-chart-row contact-scorecard-shell">
                         <div class="contact-scorecard-primary">
-                            <div class="contact-score-panel contact-score-trend-panel compact">
+                            <div class="contact-score-panel contact-score-trend-panel compact is-blue">
                                 <h5>核心标的动态 · 点击锚点联动历史观点</h5>
                                 ${marketCurveHtml}
                             </div>
                         </div>
                         <div class="contact-scorecard-secondary contact-score-side-stack">
-                            <div class="contact-score-panel compact">
+                            <div class="contact-score-panel compact is-orange">
                                 <h5>评分矩阵</h5>
                                 ${scoreMatrixHtml}
                             </div>
@@ -18005,18 +17731,18 @@
                         <summary>操作建议与趋势</summary>
                         <div class="contact-score-fold-body">
                             ${actionHtml}
-                            <div class="contact-score-panel contact-score-trend-panel compact"><h5>评分趋势</h5>${trendHtml}</div>
+                            <div class="contact-score-panel contact-score-trend-panel compact is-blue"><h5>评分趋势</h5>${trendHtml}</div>
                         </div>
                     </details>
                     <details class="contact-score-fold">
                         <summary>期限、待验证与标的榜</summary>
                         <div class="contact-score-fold-body">
-                            <div class="contact-score-analytics-grid">
+                            <div class="contact-score-dynamic-grid">
                                 <div class="contact-score-subgrid">
-                                    <div class="contact-score-panel compact"><h5>期限命中画像</h5><div class="contact-score-bars">${horizonHtml}</div></div>
-                                    <div class="contact-score-panel compact"><h5>待验证观点</h5><div class="contact-score-event-list">${pendingHtml}</div></div>
+                                    <div class="contact-score-panel compact is-blue"><h5>期限命中画像</h5><div class="contact-score-bars">${horizonHtml}</div></div>
+                                    <div class="contact-score-panel compact is-orange"><h5>待验证观点</h5><div class="contact-score-one-line-list">${pendingHtml}</div></div>
                                 </div>
-                                <div class="contact-score-panel compact"><h5>标的表现榜</h5><div class="contact-score-asset-list">${assetHtml}</div></div>
+                                <div class="contact-score-panel compact is-green"><h5>标的表现榜</h5><div class="contact-score-asset-list">${assetHtml}</div></div>
                             </div>
                         </div>
                     </details>
@@ -18024,11 +17750,11 @@
                         <summary>案例、收益与事件</summary>
                         <div class="contact-score-fold-body">
                             <div class="contact-score-kpi-combo">${ribbonHtml}${returnDistributionHtml}</div>
-                            <div class="contact-score-analytics-grid">
-                                <div class="contact-score-panel compact"><h5>高光案例</h5><div class="contact-score-event-list">${topHits.length ? topHits.map(item => eventCard(item, 'is-good', '命中')).join('') : recentHitsHtml}</div></div>
-                                <div class="contact-score-panel compact"><h5>失误案例</h5><div class="contact-score-event-list">${topMisses.length ? topMisses.map(item => eventCard(item, 'is-bad', '失误')).join('') : recentMissesHtml}</div></div>
+                            <div class="contact-score-dynamic-grid">
+                                <div class="contact-score-panel compact is-red"><h5>高光案例</h5><div class="contact-score-one-line-list">${topHits.length ? topHits.map(item => eventCard(item, 'is-good', '命中')).join('') : recentHitsHtml}</div></div>
+                                <div class="contact-score-panel compact is-green"><h5>失误案例</h5><div class="contact-score-one-line-list">${topMisses.length ? topMisses.map(item => eventCard(item, 'is-bad', '失误')).join('') : recentMissesHtml}</div></div>
                             </div>
-                            <div class="contact-score-section"><h4>观点归因卡片</h4><div class="contact-score-event-list">${caseCardsHtml}</div></div>
+                            <div class="contact-score-section"><h4>观点归因卡片</h4><div class="contact-score-one-line-list">${caseCardsHtml}</div></div>
                             <div class="contact-score-section"><h4>事件流</h4><div class="contact-score-event-list">${eventTimelineHtml}</div></div>
                         </div>
                     </details>
@@ -18066,11 +17792,50 @@
                 modalBody.classList.add('summary-detail-mode');
                 modalTitle.textContent = `${payload?.contact?.alias || payload?.contact?.name || contactId} · 评分卡`;
                 modalBody.innerHTML = renderContactScorecard(payload);
+                bindContactScorecardInteractions(modalBody);
                 try{ modalBody.dataset.key = `contact-scorecard:${contactId}`; }catch(_){ }
                 modal.style.display = 'block';
             }catch(err){
                 alert('加载评分卡失败: ' + (err?.message || err));
             }
+        }
+
+        function bindContactScorecardInteractions(root){
+            const scope = root || document;
+            scope.querySelectorAll('.contact-score-terminal[data-scorecard-table="predictions"] tbody tr[data-msg-id]').forEach(row => {
+                if (row.dataset.scorecardBound === '1') return;
+                row.dataset.scorecardBound = '1';
+                row.setAttribute('tabindex', '0');
+                row.setAttribute('role', 'button');
+                row.addEventListener('click', (event) => {
+                    if (event.target.closest('button,a,input,select,textarea')) return;
+                    const msgId = row.dataset.msgId;
+                    if (!msgId) return;
+                    if (typeof window.showMessagePopover === 'function') {
+                        window.showMessagePopover(row, msgId);
+                    }
+                });
+                row.addEventListener('dblclick', () => {
+                    const msgId = row.dataset.msgId;
+                    if (!msgId) return;
+                    const tab = document.querySelector('.tab[data-module="message-list"]');
+                    if (tab) tab.click();
+                    setTimeout(() => {
+                        const escaped = (window.CSS && CSS.escape) ? CSS.escape(msgId) : msgId.replace(/"/g, '\\"');
+                        const target = document.querySelector(`#messageTable tbody tr[data-db-id="${escaped}"]`) || document.querySelector(`#messageTable tbody tr#message-${escaped}`);
+                        if (target) {
+                            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            target.style.outline = '2px solid #0a84ff';
+                            setTimeout(() => { target.style.outline = ''; }, 1600);
+                        }
+                    }, 120);
+                });
+                row.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    row.click();
+                });
+            });
         }
 
         async function resetAllScores(){
