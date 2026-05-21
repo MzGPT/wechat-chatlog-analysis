@@ -6,7 +6,12 @@
 - `scripts/`: Helper scripts; entry `scripts/manage.sh`.
 - `static/`: Minimal UI served at `/` and `/static/*`.
 - `docs/`, `n8n/`: Reference docs and sample n8n workflows.
+  - `docs/wechatapi-docs/`: WeChatAPI iPad protocol docs (142 pages, full mirror)
 - `tests/`: Put tests under `tests/test_*.py`.
+
+## Agent Companion Package
+For Hermes/Agent-side skills, API docs, and cloud deployment scripts, see:
+**https://github.com/leecyno1/wx-auto** (Agent Skill + WeChatAPI reference + deploy tools)
 
 ## Build, Test, and Development Commands
 - First install: `cp .env.example .env && bash scripts/manage.sh install`

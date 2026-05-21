@@ -96,13 +96,20 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ## WeChat API 对接
 
-Deepsee 可通过 wechatapi.net 的 iPad 协议接入微信，也可在云服务器侧与龙虾、Hermes 等服务组合部署。配置要求：
+Deepsee 可通过 wechatapi.net 的 iPad 协议接入微信，也可在云服务器侧与 Hermes 等服务组合部署。配置要求：
 
 1. wechatapi token + app_id（从 [wechatapi 控制台](https://wechatapi.net/) 获取）
-2. 回调公网 URL（可使用 natapp/ngrok/frp 或云服务器反向代理）
+2. 回调公网 URL（云服务器直接 IP 或域名，无需隧道）
 3. AI 模型路由配置（用于自动摘要、分析与回复）
+4. Agent 端配置（见下方 wx-auto 配套包）
 
-详细对接方案见 [wechat-automation](https://github.com/leecyno1/wechat-automation) 仓库。
+### Agent 配套包
+
+**https://github.com/leecyno1/wx-auto** 提供 Hermes/Agent 侧的：
+- 完整 WeChatAPI 协议文档（7 个模块，100+ 端点）
+- 云服务器一键部署脚本
+- Hermes Skill 模板
+- 新环境安装指引
 
 ## 开发
 
