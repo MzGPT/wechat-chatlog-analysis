@@ -8991,12 +8991,35 @@
 
             <div class="settings-section" id="settings-wechat-engine" data-nav-title="微信引擎">
                 <h3>微信引擎</h3>
-                <p class="ai-config-hint" style="margin-bottom:10px;">管理微信消息同步、显示规则与微信消息的 AI 辅助整理。网关连接和触发策略请在“运营控制”中维护。</p>
+                <p class="ai-config-hint" style="margin-bottom:10px;">微信引擎采用双轨：wechatapi 负责实时回调与发送，chatlog 读取本地聊天记录作为历史补齐和兜底。</p>
+                <div class="wechat-track-grid" style="display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-bottom:10px;">
+                    <div class="wechat-settings-card" style="margin:0;">
+                        <h4 style="margin-bottom:6px;">轨道 A：wechatapi 实时更新</h4>
+                        <div class="wechat-card-desc">主轨道。适合云端部署、实时消息、自动回复和出站发送；需要在“网关配置”中完成 wechatapi Token、AppId 与回调地址配置。</div>
+                        <div id="wechatApiTrackStatus" class="source-info">等待检测</div>
+                    </div>
+                    <div class="wechat-settings-card" style="margin:0;">
+                        <h4 style="margin-bottom:6px;">轨道 B：chatlog 本地兜底</h4>
+                        <div class="wechat-card-desc">兜底轨道。必须在本机已开启微信电脑版，并启动 chatlog 服务后使用；用于读取本地聊天记录，补齐历史消息或网关异常期间的缺口。</div>
+                        <div id="chatlogTrackStatus" class="source-info">等待检测</div>
+                    </div>
+                </div>
+                <div class="settings-group">
+                    <label>双轨策略:</label>
+                    <select id="wechatDualTrackMode" style="max-width:260px;">
+                        <option value="wechatapi_primary_chatlog_fallback">wechatapi 优先，chatlog 兜底</option>
+                        <option value="chatlog_only">仅 chatlog 本地读取</option>
+                        <option value="wechatapi_only">仅 wechatapi 实时回调</option>
+                    </select>
+                    <label style="display:inline-flex; align-items:center; gap:6px; margin-left:8px;"><input type="checkbox" id="wechatDualFallbackUnhealthy">API 异常时兜底</label>
+                    <label style="display:inline-flex; align-items:center; gap:6px; margin-left:8px;"><input type="checkbox" id="wechatDualFallbackNoNew">手动同步时补齐本地记录</label>
+                    <button id="btnSaveWechatDualPolicy" class="test-btn" style="margin-left:8px">保存策略</button>
+                </div>
                 <div class="settings-group">
                     <label>同步管理:</label>
                     <input type="number" id="syncDays" value="7" min="1" max="90" style="width:80px"> 天
-                    <button id="btnSyncFull" class="test-btn" style="margin-left:8px">拉取近N天</button>
-                    <button id="btnSyncState" class="test-btn" style="margin-left:8px">查看同步状态</button>
+                    <button id="btnSyncFull" class="test-btn" style="margin-left:8px">双轨同步</button>
+                    <button id="btnSyncState" class="test-btn" style="margin-left:8px">查看双轨状态</button>
                     <span id="syncStatus" style="margin-left:8px;color:#6b7280"></span>
                 </div>
                 <div class="settings-group">
@@ -19808,8 +19831,8 @@
                 const rows = Object.entries(runtime).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
                 const renderName = (name) => {
                     const map = {
-                        chatlog_sync: '微信消息同步',
-                        wechat8061_sync: '微信网关同步',
+                        chatlog_sync: '微信本地兜底同步',
+                        wechat8061_sync: '微信备用网关同步',
                         email_sync: '邮件同步',
                         news_refresh: '新闻刷新',
                         news_snapshot: '新闻情绪快照',
@@ -20380,6 +20403,91 @@
                 if (msg) msg.textContent = '回调已绑定：' + String(res?.callback_url || callbackUrl);
             }catch(e){
                 if (msg) msg.textContent = '绑定失败：' + String(e?.message || e);
+            }
+        }
+        function renderWechatDualTrackState(data){
+            const policy = data?.policy || {};
+            const tracks = data?.tracks || {};
+            const api = tracks.wechatapi || {};
+            const chatlog = tracks.chatlog || {};
+            const apiEl = document.getElementById('wechatApiTrackStatus');
+            const chatlogEl = document.getElementById('chatlogTrackStatus');
+            const syncEl = document.getElementById('syncStatus');
+            const modeEl = document.getElementById('wechatDualTrackMode');
+            const fallbackUnhealthy = document.getElementById('wechatDualFallbackUnhealthy');
+            const fallbackNoNew = document.getElementById('wechatDualFallbackNoNew');
+            if (modeEl) modeEl.value = policy.mode || 'wechatapi_primary_chatlog_fallback';
+            if (fallbackUnhealthy) fallbackUnhealthy.checked = policy.fallback_when_api_unhealthy !== false;
+            if (fallbackNoNew) fallbackNoNew.checked = policy.fallback_when_no_new_messages !== false;
+            const badge = (ok)=> ok ? '🟢' : '🔴';
+            if (apiEl) apiEl.textContent = `${badge(api.healthy)} ${api.message || (api.configured ? '已配置' : '未配置')}`;
+            if (chatlogEl) chatlogEl.textContent = `${badge(chatlog.healthy)} ${chatlog.message || '未检测'}`;
+            if (syncEl && data?.active_track) syncEl.textContent = `当前轨道：${data.active_track}`;
+        }
+        async function loadWechatDualTrackState(silent = false){
+            try{
+                const data = await requestJson('/api/sync/wechat/dual-track/state');
+                renderWechatDualTrackState(data);
+                return data;
+            }catch(e){
+                if (!silent) {
+                    const syncEl = document.getElementById('syncStatus');
+                    if (syncEl) syncEl.textContent = `双轨状态读取失败：${e?.message || e}`;
+                }
+                throw e;
+            }
+        }
+        async function saveWechatDualTrackPolicy(){
+            const syncEl = document.getElementById('syncStatus');
+            const days = parseInt(document.getElementById('syncDays')?.value || '1', 10) || 1;
+            const payload = {
+                mode: document.getElementById('wechatDualTrackMode')?.value || 'wechatapi_primary_chatlog_fallback',
+                fallback_when_api_unhealthy: !!document.getElementById('wechatDualFallbackUnhealthy')?.checked,
+                fallback_when_no_new_messages: !!document.getElementById('wechatDualFallbackNoNew')?.checked,
+                chatlog_window_days: Math.max(1, Math.min(90, days)),
+            };
+            try{
+                if (syncEl) syncEl.textContent = '保存双轨策略…';
+                const res = await requestJson('/api/sync/wechat/dual-track/policy', {
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                if (syncEl) syncEl.textContent = '双轨策略已保存';
+                await loadWechatDualTrackState(true);
+                return res.policy || payload;
+            }catch(e){
+                if (syncEl) syncEl.textContent = `保存失败：${e?.message || e}`;
+                throw e;
+            }
+        }
+        async function runWechatDualTrackSync(days){
+            const syncEl = document.getElementById('syncStatus');
+            const n = Math.max(1, Math.min(90, parseInt(days || document.getElementById('syncDays')?.value || '1', 10) || 1));
+            const op = ensurePullOperation(null, `微信双轨同步近${n}天...`);
+            if (!op) { if (syncEl) syncEl.textContent = '有任务正在执行'; return; }
+            try{
+                if (syncEl) syncEl.textContent = '双轨同步中…';
+                await saveWechatDualTrackPolicy();
+                const res = await fetchWithPullControl(`/api/sync/wechat/dual-track?days=${n}`, { method:'POST' }, op, 90000);
+                const data = await res.json();
+                renderWechatDualTrackState(data);
+                const actions = Array.isArray(data.actions) ? data.actions : [];
+                const chatlogAction = actions.find(item => item.track === 'chatlog') || {};
+                const inserted = Number(chatlogAction.inserted || data?.chatlog?.inserted || 0);
+                const fetched = Number(chatlogAction.fetched || data?.chatlog?.fetched || 0);
+                if (syncEl) syncEl.textContent = data.status === 'ok'
+                    ? `双轨完成：fetched=${fetched}, inserted=${inserted}`
+                    : `双轨异常：${actions.map(x=>x.reason).filter(Boolean).join('；') || '请检查配置'}`;
+                try{ await loadRecentMessagesFromBackend(n, false, op); }catch(_){ }
+            }catch(e){
+                if (isPullAbortError(e)) {
+                    if (syncEl) syncEl.textContent = '已取消';
+                } else if (syncEl) {
+                    syncEl.textContent = `双轨同步失败：${e?.message || e}`;
+                }
+            } finally {
+                finishPullOperation(op);
             }
         }
         async function loadWechatTriggerRules(silent = false){
@@ -23131,20 +23239,7 @@
             const btnFull = document.getElementById('btnSyncFull');
             if (btnFull) btnFull.addEventListener('click', async function(){
                 const days = parseInt(document.getElementById('syncDays').value||'7');
-                const el = document.getElementById('syncStatus');
-                el.textContent = '导入中...';
-                const op = ensurePullOperation(null, `导入近${days}天...`);
-                if (!op) { el.textContent = '有任务正在执行'; return; }
-                try{
-                    const res = await fetchWithPullControl(`/api/sync/chatlog/full?days=${days}`, {method:'POST'}, op, 90000);
-                    const data = await res.json();
-                    el.textContent = `完成: fetched=${data.fetched||0}, inserted=${data.inserted||0}`;
-                }catch(err){
-                    if (isPullAbortError(err)) el.textContent = '已取消';
-                    else el.textContent = `失败: ${err}`;
-                } finally {
-                    finishPullOperation(op);
-                }
+                await runWechatDualTrackSync(days);
             });
             const btnBatchWX = document.getElementById('batchSendWX');
             if (btnBatchWX) btnBatchWX.addEventListener('click', async function(){
@@ -23179,8 +23274,17 @@
             const btnState = document.getElementById('btnSyncState');
             if (btnState) btnState.addEventListener('click', async function(){
                 const el = document.getElementById('syncStatus');
-                try{ const res = await fetch('/api/sync/state'); const data = await res.json(); el.textContent = `last_sync=${data.last_sync||'null'}`; }catch(err){ el.textContent = `失败: ${err}`; }
+                try{
+                    const data = await loadWechatDualTrackState(false);
+                    const last = await requestJson('/api/sync/state').catch(()=>({}));
+                    if (el) el.textContent = `当前轨道：${data.active_track || 'none'}；last_sync=${last.last_sync || 'null'}`;
+                }catch(err){ if (el) el.textContent = `失败: ${err}`; }
             });
+            const btnSaveWechatDualPolicy = document.getElementById('btnSaveWechatDualPolicy');
+            if (btnSaveWechatDualPolicy) btnSaveWechatDualPolicy.addEventListener('click', saveWechatDualTrackPolicy);
+            if (document.getElementById('settings-wechat-engine')) {
+                loadWechatDualTrackState(true).catch(()=>{});
+            }
             const btnSavePolicy = document.getElementById('btnSaveSyncPolicy');
             if (btnSavePolicy) btnSavePolicy.addEventListener('click', saveSyncPolicy);
         }

@@ -110,3 +110,33 @@ def test_normalize_chatlog_sync_policy_bounds():
     p = sync_runtime.normalize_chatlog_sync_policy({"max_attempts": 99, "sleep_seconds": -5})
     assert p["max_attempts"] == 5
     assert p["sleep_seconds"] == 0.0
+
+
+def test_wechat_dual_track_policy_defaults_and_bounds():
+    import app.routers.sync as sync_router
+
+    db = _DB()
+    policy = sync_router._dual_track_policy(db)
+    assert policy["mode"] == "wechatapi_primary_chatlog_fallback"
+    assert policy["fallback_when_api_unhealthy"] is True
+    assert policy["fallback_when_no_new_messages"] is True
+    assert policy["chatlog_window_days"] == 1
+
+    db = _DB(
+        {
+            "wechat_dual_track_policy": json.dumps(
+                {
+                    "mode": "bad-mode",
+                    "fallback_when_api_unhealthy": False,
+                    "fallback_when_no_new_messages": False,
+                    "chatlog_window_days": 999,
+                },
+                ensure_ascii=False,
+            )
+        }
+    )
+    policy = sync_router._dual_track_policy(db)
+    assert policy["mode"] == "wechatapi_primary_chatlog_fallback"
+    assert policy["fallback_when_api_unhealthy"] is False
+    assert policy["fallback_when_no_new_messages"] is False
+    assert policy["chatlog_window_days"] == 90
